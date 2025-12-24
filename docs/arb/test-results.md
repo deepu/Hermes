@@ -26,7 +26,7 @@ Node.js:         v22.x (with experimental ESM support)
 Network:         Polygon Mainnet
 RPC URL:         https://polygon-rpc.com
 
-Test Wallet:     0xed1050F19F2D5890FF29c2f7416de97e68069171
+Test Wallet Balances (Initial):
 USDC.e Balance:  $1.99 (insufficient for $5 test amount)
 Native USDC:     $4.26
 MATIC (gas):     94.69

@@ -2,6 +2,9 @@
 
 Unified SDK for Polymarket APIs - Data API, Gamma API, CLOB API, and WebSocket real-time updates.
 
+**Builder**: [@hhhx402](https://x.com/hhhx402)
+**Project**: [Catalyst.fun](https://x.com/catalystdotfun)
+
 ## Installation
 
 ```bash
