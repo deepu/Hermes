@@ -189,18 +189,11 @@ if (arb) {
 ```typescript
 import { PolymarketSDK } from '@catalyst-team/poly-sdk';
 
-const sdk = new PolymarketSDK({
+// Recommended: Use static factory method (one line to get started)
+const sdk = await PolymarketSDK.create({
   privateKey: process.env.POLYMARKET_PRIVATE_KEY!,
-  // Optional: API credentials for higher rate limits
-  creds: {
-    key: process.env.POLY_API_KEY!,
-    secret: process.env.POLY_API_SECRET!,
-    passphrase: process.env.POLY_PASSPHRASE!,
-  },
 });
-
-// Initialize for trading (derives API creds from private key)
-await sdk.initialize();
+// Ready to trade - SDK is initialized and WebSocket connected
 
 // Place a limit order
 const order = await sdk.tradingService.createLimitOrder({
@@ -215,6 +208,9 @@ console.log(`Order placed: ${order.id}`);
 // Get open orders
 const openOrders = await sdk.tradingService.getOpenOrders();
 console.log(`Open orders: ${openOrders.length}`);
+
+// Clean up when done
+sdk.stop();
 ```
 
 ---
@@ -228,11 +224,22 @@ The main SDK class that integrates all services.
 ```typescript
 import { PolymarketSDK } from '@catalyst-team/poly-sdk';
 
-const sdk = new PolymarketSDK({
+// ===== Method 1: Static Factory (Recommended) =====
+// One line: new + initialize + connect + waitForConnection
+const sdk = await PolymarketSDK.create({
   privateKey: '0x...', // Optional: for trading
   chainId: 137,        // Optional: Polygon mainnet (default)
-  cache: customCache,  // Optional: custom cache adapter
 });
+
+// ===== Method 2: Using start() =====
+// const sdk = new PolymarketSDK({ privateKey: '0x...' });
+// await sdk.start();  // initialize + connect + waitForConnection
+
+// ===== Method 3: Manual Step-by-Step (Full Control) =====
+// const sdk = new PolymarketSDK({ privateKey: '0x...' });
+// await sdk.initialize();       // Initialize trading service
+// sdk.connect();                // Connect WebSocket
+// await sdk.waitForConnection(); // Wait for connection
 
 // Access services
 sdk.tradingService  // Trading operations
@@ -249,10 +256,8 @@ await sdk.getMarket(identifier);        // Get unified market
 await sdk.getOrderbook(conditionId);    // Get processed orderbook
 await sdk.detectArbitrage(conditionId); // Detect arb opportunity
 
-// WebSocket connection (for smart money tracking)
-sdk.connect();                          // Connect WebSocket
-await sdk.waitForConnection();          // Wait for connection
-sdk.disconnect();                       // Disconnect all services
+// Clean up
+sdk.stop();  // Disconnect all services
 ```
 
 ---
@@ -512,12 +517,9 @@ Smart money detection and **real-time auto copy trading**.
 ```typescript
 import { PolymarketSDK } from '@catalyst-team/poly-sdk';
 
-const sdk = new PolymarketSDK({ privateKey: '0x...' });
-await sdk.initialize();
-
-// Connect WebSocket for real-time monitoring
-sdk.connect();
-await sdk.waitForConnection();
+// One line to get started (recommended)
+const sdk = await PolymarketSDK.create({ privateKey: '0x...' });
+// SDK is initialized and WebSocket connected
 
 // Get smart money wallets
 const wallets = await sdk.smartMoney.getSmartMoneyList(50);
@@ -569,7 +571,7 @@ console.log(`Detected: ${stats.tradesDetected}, Executed: ${stats.tradesExecuted
 
 // Stop
 subscription.stop();
-sdk.disconnect();
+sdk.stop();
 ```
 
 > **Note**: Polymarket minimum order size is **$1**. Orders below $1 will be automatically skipped.

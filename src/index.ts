@@ -365,6 +365,25 @@ export class PolymarketSDK {
     );
   }
 
+  // ===== Static Factory Methods =====
+
+  /**
+   * Create and initialize SDK in one call
+   *
+   * @example
+   * ```typescript
+   * const sdk = await PolymarketSDK.create({ privateKey: '...' });
+   * // Ready to trade and track smart money
+   * ```
+   */
+  static async create(config: PolymarketSDKConfig = {}): Promise<PolymarketSDK> {
+    const sdk = new PolymarketSDK(config);
+    await sdk.start();
+    return sdk;
+  }
+
+  // ===== Lifecycle Methods =====
+
   /**
    * Initialize the SDK (required for trading operations)
    */
@@ -382,6 +401,27 @@ export class PolymarketSDK {
   }
 
   /**
+   * Start SDK - initialize trading + connect WebSocket
+   *
+   * One method to do everything:
+   * - Initialize trading service (derive API credentials)
+   * - Connect WebSocket
+   * - Wait for connection
+   *
+   * @example
+   * ```typescript
+   * const sdk = new PolymarketSDK({ privateKey: '...' });
+   * await sdk.start();
+   * // Ready to use
+   * ```
+   */
+  async start(options: { timeout?: number } = {}): Promise<void> {
+    await this.initialize();
+    this.connect();
+    await this.waitForConnection(options.timeout ?? 10000);
+  }
+
+  /**
    * Connect to realtime WebSocket (required for smart money tracking)
    */
   connect(): void {
@@ -392,6 +432,11 @@ export class PolymarketSDK {
    * Wait for WebSocket connection
    */
   async waitForConnection(timeoutMs: number = 10000): Promise<void> {
+    // Already connected
+    if (this.realtime.isConnected?.()) {
+      return;
+    }
+
     return new Promise((resolve, reject) => {
       const timeout = setTimeout(() => reject(new Error('Connection timeout')), timeoutMs);
       this.realtime.once('connected', () => {
@@ -402,11 +447,19 @@ export class PolymarketSDK {
   }
 
   /**
-   * Disconnect all services and clean up
+   * Stop SDK - disconnect all services and clean up
    */
-  disconnect(): void {
+  stop(): void {
     this.smartMoney.disconnect();
     this.realtime.disconnect();
+  }
+
+  /**
+   * Disconnect all services and clean up
+   * @deprecated Use stop() instead
+   */
+  disconnect(): void {
+    this.stop();
   }
 
   // ===== Unified Market Access =====

@@ -189,18 +189,11 @@ if (arb) {
 ```typescript
 import { PolymarketSDK } from '@catalyst-team/poly-sdk';
 
-const sdk = new PolymarketSDK({
+// 推荐: 使用静态工厂方法（一行代码启动）
+const sdk = await PolymarketSDK.create({
   privateKey: process.env.POLYMARKET_PRIVATE_KEY!,
-  // 可选: API 凭证用于更高速率限制
-  creds: {
-    key: process.env.POLY_API_KEY!,
-    secret: process.env.POLY_API_SECRET!,
-    passphrase: process.env.POLY_PASSPHRASE!,
-  },
 });
-
-// 初始化用于交易（从私钥派生 API 凭证）
-await sdk.initialize();
+// 准备好交易 - SDK 已初始化并连接 WebSocket
 
 // 下限价单
 const order = await sdk.tradingService.createLimitOrder({
@@ -215,6 +208,9 @@ console.log(`订单已下: ${order.id}`);
 // 获取未成交订单
 const openOrders = await sdk.tradingService.getOpenOrders();
 console.log(`未成交订单: ${openOrders.length}`);
+
+// 完成后清理
+sdk.stop();
 ```
 
 ---
@@ -228,11 +224,22 @@ console.log(`未成交订单: ${openOrders.length}`);
 ```typescript
 import { PolymarketSDK } from '@catalyst-team/poly-sdk';
 
-const sdk = new PolymarketSDK({
+// ===== 方式 1: 静态工厂方法（推荐）=====
+// 一行搞定: new + initialize + connect + waitForConnection
+const sdk = await PolymarketSDK.create({
   privateKey: '0x...', // 可选: 用于交易
   chainId: 137,        // 可选: Polygon 主网（默认）
-  cache: customCache,  // 可选: 自定义缓存适配器
 });
+
+// ===== 方式 2: 使用 start() =====
+// const sdk = new PolymarketSDK({ privateKey: '0x...' });
+// await sdk.start();  // initialize + connect + waitForConnection
+
+// ===== 方式 3: 手动分步（完全控制）=====
+// const sdk = new PolymarketSDK({ privateKey: '0x...' });
+// await sdk.initialize();       // 初始化交易服务
+// sdk.connect();                // 连接 WebSocket
+// await sdk.waitForConnection(); // 等待连接完成
 
 // 访问服务
 sdk.tradingService  // 交易操作
@@ -249,10 +256,8 @@ await sdk.getMarket(identifier);        // 获取统一市场
 await sdk.getOrderbook(conditionId);    // 获取处理后的订单簿
 await sdk.detectArbitrage(conditionId); // 检测套利机会
 
-// WebSocket 连接（用于聪明钱跟踪）
-sdk.connect();                          // 连接 WebSocket
-await sdk.waitForConnection();          // 等待连接完成
-sdk.disconnect();                       // 断开所有服务
+// 清理
+sdk.stop();  // 断开所有服务
 ```
 
 ---
@@ -512,26 +517,8 @@ const groupSell = await sdk.wallets.trackGroupSellRatio(
 ```typescript
 import { PolymarketSDK } from '@catalyst-team/poly-sdk';
 
-const sdk = new PolymarketSDK({ privateKey: '0x...' });
-await sdk.initialize();
-
-// 连接 WebSocket 进行实时监控
-sdk.connect();
-await sdk.waitForConnection();
-
-// 获取聪明钱钱包列表
-const wallets = await sdk.smartMoney.getSmartMoneyList(50);
-
-// 检查地址是否是聪明钱
-const isSmartMoney = await sdk.smartMoney.isSmartMoney('0x...');
-
-// 订阅聪明钱交易
-const sub = sdk.smartMoney.subscribeSmartMoneyTrades(
-  (trade) => {
-    console.log(`${trade.traderName} ${trade.side} ${trade.outcome} @ $${trade.price}`);
-  },
-  { filterAddresses: ['0x...'], minSize: 10 }
-);
+// 一行代码启动（推荐）
+const sdk = await PolymarketSDK.create({ privateKey: '0x...' });
 
 // ===== 自动跟单交易 =====
 // 实时跟单 - 聪明钱一旦交易，立即跟单
@@ -560,6 +547,9 @@ const subscription = await sdk.smartMoney.startAutoCopyTrading({
   },
   onError: (error) => console.error(error),
 });
+// 停止
+subscription.stop();
+sdk.stop();
 
 console.log(`正在跟踪 ${subscription.targetAddresses.length} 个钱包`);
 
@@ -569,7 +559,7 @@ console.log(`检测: ${stats.tradesDetected}, 执行: ${stats.tradesExecuted}`);
 
 // 停止
 subscription.stop();
-sdk.disconnect();
+sdk.stop();
 ```
 
 > **注意**: Polymarket 最小订单金额为 **$1**。低于 $1 的订单会被自动跳过。

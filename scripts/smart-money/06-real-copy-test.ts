@@ -31,17 +31,10 @@ async function main() {
     process.exit(1);
   }
 
-  const sdk = new PolymarketSDK({ privateKey });
-
-  // 初始化 Trading Service (需要 API credentials)
-  console.log('\n[Init] 初始化交易服务...');
-  await sdk.initialize();
-  console.log('  ✅ Trading service initialized');
-
-  console.log('\n[WebSocket] 连接中...');
-  sdk.connect();
-  await sdk.waitForConnection();
-  console.log('  ✅ Connected');
+  // 使用静态工厂方法一步启动（推荐）
+  console.log('\n[Init] 初始化 SDK...');
+  const sdk = await PolymarketSDK.create({ privateKey });
+  console.log('  ✅ SDK ready (initialized + WebSocket connected)');
 
   const subscription = await sdk.smartMoney.startAutoCopyTrading({
     topN: TOP_N,
@@ -83,7 +76,7 @@ async function main() {
   console.log(`  总花费: $${stats.totalUsdcSpent.toFixed(2)}`);
 
   subscription.stop();
-  sdk.disconnect();
+  sdk.stop();
 
   console.log('\n✅ Done');
 }

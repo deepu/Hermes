@@ -960,39 +960,55 @@ Copy Trading 是否有价值？
 ### 9.3 使用示例
 
 ```typescript
-import { SmartMoneyService } from '@catalyst-team/poly-sdk';
+import { PolymarketSDK } from '@catalyst-team/poly-sdk';
 
-// 初始化服务
-const smartMoney = new SmartMoneyService(walletService, realtimeService, tradingService);
+// 一行代码启动 SDK（推荐）
+const sdk = await PolymarketSDK.create({ privateKey: '0x...' });
+// SDK 已初始化并连接 WebSocket
 
-// 1. 跟成交场景 - 实时跟单
-const subscription = smartMoney.subscribeSmartMoneyTrades((trade) => {
-  console.log(`Smart Money ${trade.traderAddress} ${trade.side} ${trade.size} @ ${trade.price}`);
+// ===== 自动跟单交易 =====
+// 实时跟单 - 聪明钱一旦交易，立即跟单
 
-  // 快速跟单 - 使用 Market Order
-  smartMoney.executeCopyTrade(
-    { ...signal, contributingTrades: [trade] },
-    {
-      executionMode: 'market',     // 使用 Market Order
-      marketOrderType: 'FOK',       // 全部成交或取消
-      maxSlippage: 0.03,            // 3% 滑点容忍
-      sizeScale: 0.1,               // 跟 10%
-      maxSize: 50,                  // 最大 $50
-    }
-  );
+const subscription = await sdk.smartMoney.startAutoCopyTrading({
+  // 目标选择
+  topN: 50,                    // 跟踪排行榜前 50 名
+  // targetAddresses: ['0x...'], // 或直接指定地址
+
+  // 订单设置
+  sizeScale: 0.1,              // 跟单 10% 的交易量
+  maxSizePerTrade: 10,         // 每笔最多 $10
+  maxSlippage: 0.03,           // 3% 滑点容忍度
+  orderType: 'FOK',            // FOK 或 FAK
+
+  // 过滤
+  minTradeSize: 5,             // 只跟单 > $5 的交易
+
+  // 测试模式
+  dryRun: true,                // 设为 false 执行真实交易
+
+  // 回调
+  onTrade: (trade, result) => {
+    console.log(`跟单 ${trade.traderName}: ${result.success ? '✅' : '❌'}`);
+  },
 });
 
-// 2. 跟持仓场景 - 定期同步
-const snapshots = await smartMoney.syncPositions(['0x1234...', '0x5678...']);
-for (const snapshot of snapshots) {
-  // 分析持仓变化，使用 Limit Order 跟单
-  smartMoney.executeCopyTrade(signal, {
-    executionMode: 'limit',        // 使用 Limit Order
-    limitOrderType: 'GTC',          // 挂单等待成交
-    sizeScale: 0.2,                 // 跟 20%
-  });
-}
+console.log(`正在跟踪 ${subscription.targetAddresses.length} 个钱包`);
+
+// 获取统计
+const stats = subscription.getStats();
+console.log(`检测: ${stats.tradesDetected}, 执行: ${stats.tradesExecuted}`);
+
+// 停止
+subscription.stop();
+sdk.stop();
 ```
+
+> **注意**: Polymarket 最小订单金额为 **$1**。低于 $1 的订单会被自动跳过。
+
+📁 **完整示例**: 查看 [../../scripts/smart-money/](../../scripts/smart-money/) 获取完整可运行的脚本：
+- `04-auto-copy-trading.ts` - 完整功能的自动跟单
+- `05-auto-copy-simple.ts` - 简化的 SDK 用法（三种初始化方式对比）
+- `06-real-copy-test.ts` - 真实交易测试
 
 ---
 
