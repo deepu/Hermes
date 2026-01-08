@@ -13,6 +13,21 @@ import { readFile } from 'node:fs/promises';
 import { Crypto15LRModel, type ModelConfig } from './crypto15-lr-model.js';
 
 // ============================================================================
+// Constants
+// ============================================================================
+
+/** Default version when not specified in model file */
+const DEFAULT_MODEL_VERSION = '1.0.0';
+
+/**
+ * Quote currencies to strip when extracting asset from symbol.
+ * IMPORTANT: Order matters - longer suffixes must come first to avoid
+ * partial matches (e.g., 'USDT' before 'USD', otherwise 'BTCUSDT' would
+ * incorrectly extract 'BTCUS' instead of 'BTC').
+ */
+const QUOTE_CURRENCIES = ['USDT', 'BUSD', 'USDC', 'USD'] as const;
+
+// ============================================================================
 // Types - Model JSON Format (matches Argus export)
 // ============================================================================
 
@@ -46,22 +61,65 @@ export interface ModelFile {
 export type ImputationFile = Record<string, Record<string, number>>;
 
 // ============================================================================
-// Validation Helpers
+// Helper Functions
 // ============================================================================
+
+/**
+ * Safely extract error message from unknown caught value
+ */
+function getErrorMessage(error: unknown): string {
+  if (error instanceof Error) {
+    return error.message;
+  }
+  return String(error);
+}
+
+/**
+ * Read and parse a JSON file with proper error handling
+ */
+async function readJsonFile(path: string, description: string): Promise<unknown> {
+  const content = await readFile(path, 'utf-8');
+  try {
+    return JSON.parse(content);
+  } catch (e) {
+    throw new Error(`Failed to parse ${description} JSON: ${getErrorMessage(e)}`);
+  }
+}
 
 /**
  * Extract asset from symbol (e.g., "BTCUSDT" -> "BTC")
  */
 function extractAsset(symbol: string): string {
-  // Common quote currencies to strip
-  const quoteCurrencies = ['USDT', 'BUSD', 'USD', 'USDC'];
-  for (const quote of quoteCurrencies) {
+  for (const quote of QUOTE_CURRENCIES) {
     if (symbol.endsWith(quote)) {
       return symbol.slice(0, -quote.length);
     }
   }
   return symbol;
 }
+
+/**
+ * Create a Crypto15LRModel from a symbol entry and optional medians
+ */
+function createModel(
+  symbolEntry: ModelFileSymbol,
+  version: string,
+  medians: Record<string, number> = {}
+): Crypto15LRModel {
+  const config: ModelConfig = {
+    version,
+    asset: extractAsset(symbolEntry.symbol),
+    featureColumns: symbolEntry.feature_columns,
+    coefficients: symbolEntry.coefficients,
+    intercept: symbolEntry.intercept,
+    featureMedians: medians,
+  };
+  return new Crypto15LRModel(config);
+}
+
+// ============================================================================
+// Validation Helpers
+// ============================================================================
 
 /**
  * Validate model file structure
@@ -173,40 +231,22 @@ function validateImputationFile(data: unknown): asserts data is ImputationFile {
 /**
  * Load models from a JSON file
  *
+ * Note: Models loaded this way have empty featureMedians. Use
+ * loadModelsWithImputations() for production use with imputation support.
+ *
  * @param path - Path to the model JSON file
  * @returns Map of symbol to Crypto15LRModel instance
  * @throws Error if file cannot be read or JSON is malformed
  */
 export async function loadModels(path: string): Promise<Map<string, Crypto15LRModel>> {
-  const content = await readFile(path, 'utf-8');
-  let data: unknown;
-
-  try {
-    data = JSON.parse(content);
-  } catch (e) {
-    throw new Error(`Failed to parse model JSON: ${(e as Error).message}`);
-  }
-
+  const data = await readJsonFile(path, 'model');
   validateModelFile(data);
 
+  const version = data.version ?? DEFAULT_MODEL_VERSION;
   const models = new Map<string, Crypto15LRModel>();
 
   for (const symbolEntry of data.symbols) {
-    const asset = extractAsset(symbolEntry.symbol);
-
-    const config: ModelConfig = {
-      version: data.version ?? '1.0.0',
-      asset,
-      featureColumns: symbolEntry.feature_columns,
-      coefficients: symbolEntry.coefficients,
-      intercept: symbolEntry.intercept,
-      // Feature medians will be set later via loadImputations
-      // For now, use empty object - caller should merge imputation data
-      featureMedians: {},
-    };
-
-    const model = new Crypto15LRModel(config);
-    models.set(symbolEntry.symbol, model);
+    models.set(symbolEntry.symbol, createModel(symbolEntry, version));
   }
 
   return models;
@@ -214,6 +254,9 @@ export async function loadModels(path: string): Promise<Map<string, Crypto15LRMo
 
 /**
  * Load models from a JSON file with imputation values merged in
+ *
+ * This is the recommended loader for production use as it ensures
+ * models have median values for feature imputation.
  *
  * @param modelPath - Path to the model JSON file
  * @param imputationPath - Path to the imputation JSON file
@@ -224,50 +267,25 @@ export async function loadModelsWithImputations(
   modelPath: string,
   imputationPath: string
 ): Promise<Map<string, Crypto15LRModel>> {
-  const [modelContent, imputationContent] = await Promise.all([
-    readFile(modelPath, 'utf-8'),
-    readFile(imputationPath, 'utf-8'),
+  const [modelData, imputationData] = await Promise.all([
+    readJsonFile(modelPath, 'model'),
+    readJsonFile(imputationPath, 'imputation'),
   ]);
-
-  let modelData: unknown;
-  let imputationData: unknown;
-
-  try {
-    modelData = JSON.parse(modelContent);
-  } catch (e) {
-    throw new Error(`Failed to parse model JSON: ${(e as Error).message}`);
-  }
-
-  try {
-    imputationData = JSON.parse(imputationContent);
-  } catch (e) {
-    throw new Error(`Failed to parse imputation JSON: ${(e as Error).message}`);
-  }
 
   validateModelFile(modelData);
   validateImputationFile(imputationData);
 
+  const version = modelData.version ?? DEFAULT_MODEL_VERSION;
   const models = new Map<string, Crypto15LRModel>();
 
   for (const symbolEntry of modelData.symbols) {
-    const asset = extractAsset(symbolEntry.symbol);
     const medians = imputationData[symbolEntry.symbol];
 
     if (!medians) {
       throw new Error(`No imputation values found for symbol "${symbolEntry.symbol}"`);
     }
 
-    const config: ModelConfig = {
-      version: modelData.version ?? '1.0.0',
-      asset,
-      featureColumns: symbolEntry.feature_columns,
-      coefficients: symbolEntry.coefficients,
-      intercept: symbolEntry.intercept,
-      featureMedians: medians,
-    };
-
-    const model = new Crypto15LRModel(config);
-    models.set(symbolEntry.symbol, model);
+    models.set(symbolEntry.symbol, createModel(symbolEntry, version, medians));
   }
 
   return models;
@@ -276,26 +294,22 @@ export async function loadModelsWithImputations(
 /**
  * Load imputation values from a JSON file
  *
+ * Useful when you need to load imputations separately from models,
+ * e.g., for inspection or when combining with models loaded elsewhere.
+ *
  * @param path - Path to the imputation JSON file
  * @returns Map of symbol to feature medians record
  * @throws Error if file cannot be read or JSON is malformed
  */
 export async function loadImputations(path: string): Promise<Map<string, Record<string, number>>> {
-  const content = await readFile(path, 'utf-8');
-  let data: unknown;
-
-  try {
-    data = JSON.parse(content);
-  } catch (e) {
-    throw new Error(`Failed to parse imputation JSON: ${(e as Error).message}`);
-  }
-
+  const data = await readJsonFile(path, 'imputation');
   validateImputationFile(data);
 
   const imputations = new Map<string, Record<string, number>>();
 
   for (const [symbol, medians] of Object.entries(data)) {
-    imputations.set(symbol, { ...medians });
+    // Store reference directly - data is freshly parsed and won't be reused
+    imputations.set(symbol, medians);
   }
 
   return imputations;

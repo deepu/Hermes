@@ -7,7 +7,7 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { writeFile, mkdir, rm } from 'node:fs/promises';
+import { writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
 import { loadModels, loadImputations, loadModelsWithImputations } from './model-loader.js';
@@ -16,9 +16,8 @@ describe('Model Loader', () => {
   let testDir: string;
 
   beforeEach(async () => {
-    // Create unique temp directory for each test
-    testDir = join(tmpdir(), `model-loader-test-${Date.now()}-${Math.random().toString(36).slice(2)}`);
-    await mkdir(testDir, { recursive: true });
+    // Create unique temp directory for each test using mkdtemp (guarantees uniqueness)
+    testDir = await mkdtemp(join(tmpdir(), 'model-loader-test-'));
   });
 
   afterEach(async () => {
@@ -128,20 +127,10 @@ describe('Model Loader', () => {
         ],
       };
 
-      // Need to add imputation file for these symbols since model requires featureMedians
-      const imputations = {
-        BTCUSDT: { test: 0 },
-        ETHBUSD: { test: 0 },
-        SOLUSD: { test: 0 },
-        XRPUSDC: { test: 0 },
-      };
-
       const modelPath = join(testDir, 'models.json');
-      const imputationPath = join(testDir, 'imputations.json');
       await writeFile(modelPath, JSON.stringify(multiFormatFile));
-      await writeFile(imputationPath, JSON.stringify(imputations));
 
-      const models = await loadModelsWithImputations(modelPath, imputationPath);
+      const models = await loadModels(modelPath);
 
       expect(models.get('BTCUSDT')!.getAsset()).toBe('BTC');
       expect(models.get('ETHBUSD')!.getAsset()).toBe('ETH');
@@ -246,7 +235,7 @@ describe('Model Loader', () => {
       expect(btcImputations.rsi_14).toBe(50.0);
     });
 
-    it('should return copy of imputation values', async () => {
+    it('should return fresh data on each load', async () => {
       const filePath = join(testDir, 'imputations.json');
       await writeFile(filePath, JSON.stringify(sampleImputationFile));
 
@@ -256,7 +245,7 @@ describe('Model Loader', () => {
       // Modify returned object
       btcImputations.volatility_5m = 999;
 
-      // Load again and verify original values
+      // Load again - should return fresh parsed data
       const imputations2 = await loadImputations(filePath);
       expect(imputations2.get('BTCUSDT')!.volatility_5m).toBe(0.0012);
     });
