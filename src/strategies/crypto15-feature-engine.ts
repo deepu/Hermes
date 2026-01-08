@@ -174,7 +174,7 @@ export class Crypto15FeatureEngine {
 
     // Check for window transition
     if (this.windowState === null || this.isNewWindow(timestamp)) {
-      this.handleWindowTransition(price, timestamp, windowIndex);
+      this.handleWindowTransition(price, timestamp);
     }
 
     // Update window state with current price (track max run-up/down)
@@ -272,11 +272,7 @@ export class Crypto15FeatureEngine {
   /**
    * Handle transition to a new window
    */
-  private handleWindowTransition(
-    price: number,
-    timestamp: number,
-    windowIndex: number
-  ): void {
+  private handleWindowTransition(price: number, timestamp: number): void {
     // Initialize new window state
     this.windowState = {
       openPrice: price,
@@ -439,10 +435,10 @@ export class Crypto15FeatureEngine {
       return NaN;
     }
 
-    // Calculate standard deviation
+    // Calculate sample standard deviation (n-1 for unbiased estimate)
     const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
     const squaredDiffs = returns.map((r) => Math.pow(r - mean, 2));
-    const variance = squaredDiffs.reduce((a, b) => a + b, 0) / returns.length;
+    const variance = squaredDiffs.reduce((a, b) => a + b, 0) / (returns.length - 1);
 
     return Math.sqrt(variance);
   }
