@@ -64,13 +64,6 @@ export interface PredictionResult {
 const SIGMOID_UPPER_BOUND = 20;
 const SIGMOID_LOWER_BOUND = -20;
 
-/**
- * Default value used when a feature is missing and no median is available.
- * Using 0 is a neutral choice for centered/standardized features, as it
- * represents the mean of a standard normal distribution.
- */
-const DEFAULT_MISSING_FEATURE_VALUE = 0;
-
 // ============================================================================
 // Crypto15LRModel Implementation
 // ============================================================================
@@ -86,7 +79,15 @@ export class Crypto15LRModel {
    */
   constructor(config: ModelConfig) {
     this.validateConfig(config);
-    this.config = config;
+    // Deep copy to prevent external mutation of internal state
+    this.config = {
+      version: config.version,
+      asset: config.asset,
+      featureColumns: [...config.featureColumns],
+      coefficients: [...config.coefficients],
+      intercept: config.intercept,
+      featureMedians: { ...config.featureMedians },
+    };
   }
 
   /**
@@ -114,7 +115,10 @@ export class Crypto15LRModel {
       // Handle missing or NaN values via imputation
       if (rawValue === undefined || this.isNaNValue(rawValue)) {
         const median = featureMedians[column];
-        featureValue = median !== undefined ? median : DEFAULT_MISSING_FEATURE_VALUE;
+        if (median === undefined) {
+          throw new Error(`Missing median for feature '${column}' during imputation`);
+        }
+        featureValue = median;
         imputedCount++;
       } else {
         // Convert boolean to number, pass through numeric values
