@@ -457,60 +457,77 @@ describe('Crypto15FeatureEngine', () => {
   });
 
   describe('edge cases', () => {
+    // Constants for test readability
+    const WINDOW_MS = 15 * 60 * 1000;
+    const MINUTE_MS = 60000;
+    const TEST_EPOCH = 1700000000000;
+    const alignToWindowStart = (ts: number) => Math.floor(ts / WINDOW_MS) * WINDOW_MS;
+    const BUFFER_BUILD_COUNT = 10;
+
     it('should handle first market scenario (no price history)', () => {
       // Edge case: First market ever - no prior price data
       // All lookback features should be NaN
       const engine = new Crypto15FeatureEngine('BTC');
-      const windowStart = Math.floor(1700000000000 / (15 * 60 * 1000)) * (15 * 60 * 1000);
+      const windowStart = alignToWindowStart(TEST_EPOCH);
 
       const result = engine.ingestPrice(50000, windowStart);
 
+      // Verify we got a result
+      expect(result).not.toBeNull();
+
       // Time features should be valid
-      expect(result?.stateMinute).toBe(0);
-      expect(result?.minutesRemaining).toBe(15);
+      expect(result!.stateMinute).toBe(0);
+      expect(result!.minutesRemaining).toBe(15);
 
       // Return features should be NaN (insufficient history)
-      expect(result?.return1m).toBeNaN();
-      expect(result?.return3m).toBeNaN();
-      expect(result?.return5m).toBeNaN();
-      expect(result?.volatility5m).toBeNaN();
+      expect(result!.return1m).toBeNaN();
+      expect(result!.return3m).toBeNaN();
+      expect(result!.return5m).toBeNaN();
+      expect(result!.volatility5m).toBeNaN();
 
-      // Window-relative features should be valid
-      expect(result?.returnSinceOpen).toBe(0);
-      expect(result?.maxRunUp).toBe(0);
-      expect(result?.maxRunDown).toBe(0);
+      // Window-relative features should be valid (use toBeCloseTo for floats)
+      expect(result!.returnSinceOpen).toBeCloseTo(0);
+      expect(result!.maxRunUp).toBeCloseTo(0);
+      expect(result!.maxRunDown).toBeCloseTo(0);
     });
 
-    it('should handle early state minutes (0, 1, 2) with buffer from previous window', () => {
+    it('should handle early state minutes (0, 1, 2) with lookback from previous window', () => {
       // Simulates real scenario: buffer built up, now at minute 0-2 of new window
       const engine = new Crypto15FeatureEngine('BTC');
 
-      // Build buffer in first window
-      const window1Start = Math.floor(1700000000000 / (15 * 60 * 1000)) * (15 * 60 * 1000);
-      for (let i = 0; i < 10; i++) {
-        engine.ingestPrice(50000 + i * 10, window1Start + i * 60000);
+      // Build buffer in first window: prices at minutes 0-9
+      // minute 0: 50000, 1: 50010, 2: 50020, ..., 9: 50090
+      const window1Start = alignToWindowStart(TEST_EPOCH);
+      for (let i = 0; i < BUFFER_BUILD_COUNT; i++) {
+        engine.ingestPrice(50000 + i * 10, window1Start + i * MINUTE_MS);
       }
 
-      // New window starts
-      const window2Start = window1Start + 15 * 60000;
+      // New window starts at minute 15
+      const window2Start = window1Start + WINDOW_MS;
 
-      // Minute 0 of new window - should have lookback from previous window
+      // Minute 0 of new window (price 50100) - lookback to minute 9 (50090)
       const result0 = engine.ingestPrice(50100, window2Start);
-      expect(result0?.stateMinute).toBe(0);
-      expect(result0?.return1m).not.toBeNaN(); // Has buffer from prev window
+      expect(result0).not.toBeNull();
+      expect(result0!.stateMinute).toBe(0);
+      // return1m: (50100 - 50090) / 50090
+      expect(result0!.return1m).toBeCloseTo((50100 - 50090) / 50090, 6);
 
-      // Minute 1 of new window
-      const result1 = engine.ingestPrice(50150, window2Start + 60000);
-      expect(result1?.stateMinute).toBe(1);
-      expect(result1?.return1m).not.toBeNaN();
-      expect(result1?.return3m).not.toBeNaN();
+      // Minute 1 of new window (price 50150)
+      // 1m ago: 50100, 3m ago: minute 8 = 50080
+      const result1 = engine.ingestPrice(50150, window2Start + MINUTE_MS);
+      expect(result1).not.toBeNull();
+      expect(result1!.stateMinute).toBe(1);
+      expect(result1!.return1m).toBeCloseTo((50150 - 50100) / 50100, 6);
+      expect(result1!.return3m).toBeCloseTo((50150 - 50080) / 50080, 6);
 
-      // Minute 2 of new window - entry window boundary
-      const result2 = engine.ingestPrice(50200, window2Start + 2 * 60000);
-      expect(result2?.stateMinute).toBe(2);
-      expect(result2?.return1m).not.toBeNaN();
-      expect(result2?.return3m).not.toBeNaN();
-      expect(result2?.return5m).not.toBeNaN();
+      // Minute 2 of new window (price 50200) - entry window boundary
+      // 1m ago: 50150, 3m ago: minute 9 = 50090, 5m ago: minute 7 = 50070
+      const result2 = engine.ingestPrice(50200, window2Start + 2 * MINUTE_MS);
+      expect(result2).not.toBeNull();
+      expect(result2!.stateMinute).toBe(2);
+      expect(result2!.return1m).toBeCloseTo((50200 - 50150) / 50150, 6);
+      expect(result2!.return3m).toBeCloseTo((50200 - 50090) / 50090, 6);
+      expect(result2!.return5m).toBeCloseTo((50200 - 50070) / 50070, 6);
     });
 
     it('should handle price of 0', () => {
@@ -541,33 +558,29 @@ describe('Crypto15FeatureEngine', () => {
   });
 
   describe('issue specification example', () => {
+    /**
+     * Tests the example from issue #4 spec.
+     * Note: Actual API uses (asset) constructor; BTC has 0.0008 threshold.
+     */
     it('should match the example from issue #4 spec', () => {
-      // Test case from issue specification:
-      // const engine = new Crypto15FeatureEngine(15, 0.0008);
-      // const features = engine.ingestPrice(98500, new Date('2024-01-08T14:00:00Z'));
-      // expect(features).toBeNull(); // First price initializes
-      //
-      // Note: The spec shows constructor with (windowMinutes, threshold) but actual
-      // implementation uses (asset). We use BTC which has 0.0008 threshold.
-
       const engine = new Crypto15FeatureEngine('BTC');
 
-      // First price at minute boundary - should return features (not null)
-      // because minute 0 is a valid feature computation point
+      // First price at minute boundary - returns features (minute 0 is valid)
       const timestamp1 = new Date('2024-01-08T14:00:00Z').getTime();
       const features1 = engine.ingestPrice(98500, timestamp1);
       expect(features1).not.toBeNull();
-      expect(features1?.stateMinute).toBe(0);
-      expect(features1?.returnSinceOpen).toBeCloseTo(0, 10);
+      expect(features1!.stateMinute).toBe(0);
+      expect(features1!.returnSinceOpen).toBeCloseTo(0, 10);
 
       // Second price at next minute
       const timestamp2 = new Date('2024-01-08T14:01:00Z').getTime();
       const features2 = engine.ingestPrice(98550, timestamp2);
       expect(features2).not.toBeNull();
-      expect(features2?.stateMinute).toBe(1);
+      expect(features2!.stateMinute).toBe(1);
 
-      // returnSinceOpen: (98550 - 98500) / 98500 = 0.0005076...
-      expect(features2?.returnSinceOpen).toBeCloseTo(0.0005076, 6);
+      // Expected: (98550 - 98500) / 98500 = 50 / 98500 ≈ 0.0005076
+      const expectedReturn = (98550 - 98500) / 98500;
+      expect(features2!.returnSinceOpen).toBeCloseTo(expectedReturn, 6);
     });
   });
 
