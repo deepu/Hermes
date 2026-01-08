@@ -122,14 +122,34 @@ interface WindowState {
 // Constants
 // ============================================================================
 
+/** Window duration in minutes, matching Crypto15 strategy interval */
+const WINDOW_MINUTES = 15;
+
 /** 15-minute window in milliseconds */
-const WINDOW_MS = 15 * 60 * 1000;
+const WINDOW_MS = WINDOW_MINUTES * 60 * 1000;
 
 /** Price history buffer size (32 minutes worth of closes) */
 const BUFFER_SIZE = 32;
 
 /** Milliseconds per minute */
 const MINUTE_MS = 60 * 1000;
+
+/** Milliseconds per hour */
+const HOUR_MS = 60 * MINUTE_MS;
+
+/** Milliseconds per day */
+const DAY_MS = 24 * HOUR_MS;
+
+/** 5-minute volatility requires 6 data points (5 returns between 6 prices) */
+const VOLATILITY_MIN_POINTS = 6;
+
+/** Asset to numeric encoding for ML model */
+const ASSET_TO_NUMBER: Record<CryptoAsset, number> = {
+  BTC: 0,
+  ETH: 1,
+  SOL: 2,
+  XRP: 3,
+};
 
 // ============================================================================
 // Crypto15FeatureEngine Implementation
@@ -148,10 +168,10 @@ export class Crypto15FeatureEngine {
   /** Last minute we computed features for (to detect minute boundaries) */
   private lastMinuteComputed: number = -1;
 
-  /** Last price ingested (for tracking within-minute price movements) */
-  private lastPrice: number | null = null;
-
   constructor(asset: CryptoAsset) {
+    if (!(asset in ASSET_THRESHOLDS)) {
+      throw new Error(`Invalid asset: ${asset}`);
+    }
     this.asset = asset;
     this.threshold = ASSET_THRESHOLDS[asset];
   }
@@ -160,17 +180,23 @@ export class Crypto15FeatureEngine {
    * Ingest a price update. Returns FeatureVector if at a minute boundary,
    * otherwise returns null.
    *
-   * @param price - Current asset price
-   * @param timestamp - Unix timestamp in milliseconds
+   * @param price - Current asset price (must be positive finite number)
+   * @param timestamp - Unix timestamp in milliseconds (must be non-negative finite number)
    * @returns FeatureVector if at minute boundary, null otherwise
+   * @throws Error if price or timestamp is invalid
    */
   ingestPrice(price: number, timestamp: number): FeatureVector | null {
-    // Track last price for within-minute updates
-    this.lastPrice = price;
+    // Validate inputs
+    if (!Number.isFinite(price) || price <= 0) {
+      throw new Error('Invalid price: must be a positive finite number');
+    }
+    if (!Number.isFinite(timestamp) || timestamp < 0) {
+      throw new Error('Invalid timestamp: must be a non-negative finite number');
+    }
 
     // Calculate current minute within a 15-minute window
     const currentMinute = Math.floor(timestamp / MINUTE_MS);
-    const windowIndex = currentMinute % 15;
+    const windowIndex = currentMinute % WINDOW_MINUTES;
 
     // Check for window transition
     if (this.windowState === null || this.isNewWindow(timestamp)) {
@@ -245,7 +271,6 @@ export class Crypto15FeatureEngine {
     this.closeBuffer = [];
     this.windowState = null;
     this.lastMinuteComputed = -1;
-    this.lastPrice = null;
   }
 
   // ============================================================================
@@ -324,9 +349,9 @@ export class Crypto15FeatureEngine {
   private addToBuffer(price: number, timestamp: number): void {
     this.closeBuffer.push({ price, timestamp });
 
-    // Maintain buffer size
-    while (this.closeBuffer.length > BUFFER_SIZE) {
-      this.closeBuffer.shift();
+    // Maintain buffer size - use slice for O(1) amortized instead of O(n) shift
+    if (this.closeBuffer.length > BUFFER_SIZE) {
+      this.closeBuffer = this.closeBuffer.slice(-BUFFER_SIZE);
     }
   }
 
@@ -338,7 +363,10 @@ export class Crypto15FeatureEngine {
     timestamp: number,
     windowIndex: number
   ): FeatureVector {
-    const date = new Date(timestamp);
+    // Extract UTC time components directly from timestamp (avoid Date allocation)
+    // Jan 1, 1970 was Thursday (day 4), so we offset by 4
+    const hourOfDay = Math.floor((timestamp % DAY_MS) / HOUR_MS);
+    const dayOfWeek = (Math.floor(timestamp / DAY_MS) + 4) % 7;
 
     // Calculate lagged returns
     const return1m = this.getLaggedReturn(1);
@@ -356,9 +384,9 @@ export class Crypto15FeatureEngine {
     return {
       // Time features
       stateMinute: windowIndex,
-      minutesRemaining: 15 - windowIndex,
-      hourOfDay: date.getUTCHours(),
-      dayOfWeek: date.getUTCDay(),
+      minutesRemaining: WINDOW_MINUTES - windowIndex,
+      hourOfDay,
+      dayOfWeek,
 
       // Return features
       returnSinceOpen,
@@ -410,35 +438,39 @@ export class Crypto15FeatureEngine {
 
   /**
    * Calculate 5-minute rolling volatility (standard deviation of returns)
+   * Uses single-pass algorithm to avoid intermediate array allocations
    */
   private calculateVolatility5m(): number {
     const bufferLen = this.closeBuffer.length;
 
     // Need at least 6 prices for 5 returns
-    if (bufferLen < 6) {
+    if (bufferLen < VOLATILITY_MIN_POINTS) {
       return NaN;
     }
 
-    // Calculate minute-over-minute returns for last 5 minutes
-    const returns: number[] = [];
+    // Single-pass variance calculation (avoids intermediate arrays)
+    let sum = 0;
+    let sumSq = 0;
+    let count = 0;
+
     for (let i = bufferLen - 5; i < bufferLen; i++) {
       const ret = this.calculateReturn(
         this.closeBuffer[i].price,
         this.closeBuffer[i - 1].price
       );
       if (!Number.isNaN(ret)) {
-        returns.push(ret);
+        sum += ret;
+        sumSq += ret * ret;
+        count++;
       }
     }
 
-    if (returns.length < 2) {
+    if (count < 2) {
       return NaN;
     }
 
-    // Calculate sample standard deviation (n-1 for unbiased estimate)
-    const mean = returns.reduce((a, b) => a + b, 0) / returns.length;
-    const squaredDiffs = returns.map((r) => Math.pow(r - mean, 2));
-    const variance = squaredDiffs.reduce((a, b) => a + b, 0) / (returns.length - 1);
+    // Sample variance using computational formula: Var = (SumSq - Sum^2/n) / (n-1)
+    const variance = (sumSq - (sum * sum) / count) / (count - 1);
 
     return Math.sqrt(variance);
   }
@@ -447,12 +479,6 @@ export class Crypto15FeatureEngine {
    * Convert asset to numeric encoding for model
    */
   private static assetToNumber(asset: CryptoAsset): number {
-    const mapping: Record<CryptoAsset, number> = {
-      BTC: 0,
-      ETH: 1,
-      SOL: 2,
-      XRP: 3,
-    };
-    return mapping[asset];
+    return ASSET_TO_NUMBER[asset];
   }
 }
