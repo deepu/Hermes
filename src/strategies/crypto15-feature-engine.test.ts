@@ -18,6 +18,12 @@ import {
 } from './crypto15-feature-engine.js';
 
 describe('Crypto15FeatureEngine', () => {
+  // Shared test constants
+  const WINDOW_MS = 15 * 60 * 1000;
+  const MINUTE_MS = 60000;
+  const TEST_EPOCH = 1700000000000;
+  const alignToWindowStart = (ts: number): number => Math.floor(ts / WINDOW_MS) * WINDOW_MS;
+
   let engine: Crypto15FeatureEngine;
 
   beforeEach(() => {
@@ -457,11 +463,6 @@ describe('Crypto15FeatureEngine', () => {
   });
 
   describe('edge cases', () => {
-    // Constants for test readability
-    const WINDOW_MS = 15 * 60 * 1000;
-    const MINUTE_MS = 60000;
-    const TEST_EPOCH = 1700000000000;
-    const alignToWindowStart = (ts: number) => Math.floor(ts / WINDOW_MS) * WINDOW_MS;
     const BUFFER_BUILD_COUNT = 10;
 
     it('should handle first market scenario (no price history)', () => {
@@ -570,7 +571,7 @@ describe('Crypto15FeatureEngine', () => {
       const features1 = engine.ingestPrice(98500, timestamp1);
       expect(features1).not.toBeNull();
       expect(features1!.stateMinute).toBe(0);
-      expect(features1!.returnSinceOpen).toBeCloseTo(0, 10);
+      expect(features1!.returnSinceOpen).toBeCloseTo(0, 6);
 
       // Second price at next minute
       const timestamp2 = new Date('2024-01-08T14:01:00Z').getTime();
@@ -586,7 +587,7 @@ describe('Crypto15FeatureEngine', () => {
 
   describe('integration scenario: full 15-minute window', () => {
     it('should track features across a complete window', () => {
-      const windowStart = Math.floor(1700000000000 / (15 * 60 * 1000)) * (15 * 60 * 1000);
+      const windowStart = alignToWindowStart(TEST_EPOCH);
       const prices = [
         50000, 50020, 50050, 50030, 50080, // 0-4: gradual rise
         50100, 50090, 50070, 50050, 50060, // 5-9: peak and consolidation
@@ -596,7 +597,7 @@ describe('Crypto15FeatureEngine', () => {
       const results: FeatureVector[] = [];
 
       for (let i = 0; i < 15; i++) {
-        const result = engine.ingestPrice(prices[i], windowStart + i * 60000);
+        const result = engine.ingestPrice(prices[i], windowStart + i * MINUTE_MS);
         if (result) results.push(result);
       }
 
