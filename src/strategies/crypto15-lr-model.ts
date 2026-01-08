@@ -13,11 +13,15 @@
  * - Numerical stability (handle z > 20 and z < -20)
  */
 
-import { FeatureMap } from './crypto15-feature-engine.js';
-
 // ============================================================================
 // Types
 // ============================================================================
+
+/**
+ * Feature map format for model consumption.
+ * Defined locally to decouple model from feature engine implementation.
+ */
+export type FeatureMap = Record<string, number | boolean>;
 
 /**
  * Model configuration loaded from JSON artifact
@@ -60,6 +64,13 @@ export interface PredictionResult {
 const SIGMOID_UPPER_BOUND = 20;
 const SIGMOID_LOWER_BOUND = -20;
 
+/**
+ * Default value used when a feature is missing and no median is available.
+ * Using 0 is a neutral choice for centered/standardized features, as it
+ * represents the mean of a standard normal distribution.
+ */
+const DEFAULT_MISSING_FEATURE_VALUE = 0;
+
 // ============================================================================
 // Crypto15LRModel Implementation
 // ============================================================================
@@ -85,29 +96,32 @@ export class Crypto15LRModel {
    * @returns Prediction result with probability and imputation count
    */
   predict(features: FeatureMap): PredictionResult {
-    let z = this.config.intercept;
+    // Cache config properties to avoid repeated property chain lookups in hot path
+    const { featureColumns, coefficients, featureMedians, intercept } = this.config;
+
+    let z = intercept;
     let imputedCount = 0;
 
-    for (let i = 0; i < this.config.featureColumns.length; i++) {
-      const column = this.config.featureColumns[i];
-      const coefficient = this.config.coefficients[i];
-      let value = features[column];
+    for (let i = 0; i < featureColumns.length; i++) {
+      const column = featureColumns[i];
+      const coefficient = coefficients[i];
+
+      // Use Object.hasOwn to protect against prototype pollution
+      const rawValue = Object.hasOwn(features, column) ? features[column] : undefined;
+
+      let featureValue: number;
 
       // Handle missing or NaN values via imputation
-      if (value === undefined || value === null || this.isNaNValue(value)) {
-        const median = this.config.featureMedians[column];
-        if (median === undefined) {
-          // No median available, use 0 as fallback
-          value = 0;
-        } else {
-          value = median;
-        }
+      if (rawValue === undefined || this.isNaNValue(rawValue)) {
+        const median = featureMedians[column];
+        featureValue = median !== undefined ? median : DEFAULT_MISSING_FEATURE_VALUE;
         imputedCount++;
+      } else {
+        // Convert boolean to number, pass through numeric values
+        featureValue = typeof rawValue === 'boolean' ? (rawValue ? 1 : 0) : rawValue;
       }
 
-      // Ensure value is a number for computation
-      const numValue = typeof value === 'boolean' ? (value ? 1 : 0) : value;
-      z += coefficient * numValue;
+      z += coefficient * featureValue;
     }
 
     const probability = this.sigmoid(z);
@@ -120,10 +134,16 @@ export class Crypto15LRModel {
   }
 
   /**
-   * Get the model configuration
+   * Get a copy of the model configuration.
+   * Returns a deep copy to prevent external mutation of internal state.
    */
-  getConfig(): ModelConfig {
-    return this.config;
+  getConfig(): Readonly<ModelConfig> {
+    return {
+      ...this.config,
+      featureColumns: [...this.config.featureColumns],
+      coefficients: [...this.config.coefficients],
+      featureMedians: { ...this.config.featureMedians },
+    };
   }
 
   /**
@@ -154,21 +174,10 @@ export class Crypto15LRModel {
       throw new Error('Model config is required');
     }
 
-    if (!config.version || typeof config.version !== 'string') {
-      throw new Error('Model config must have a version string');
-    }
-
-    if (!config.asset || typeof config.asset !== 'string') {
-      throw new Error('Model config must have an asset string');
-    }
-
-    if (!Array.isArray(config.featureColumns) || config.featureColumns.length === 0) {
-      throw new Error('Model config must have non-empty featureColumns array');
-    }
-
-    if (!Array.isArray(config.coefficients) || config.coefficients.length === 0) {
-      throw new Error('Model config must have non-empty coefficients array');
-    }
+    this.assertNonEmptyString(config.version, 'version');
+    this.assertNonEmptyString(config.asset, 'asset');
+    this.assertNonEmptyArray(config.featureColumns, 'featureColumns');
+    this.assertNonEmptyArray(config.coefficients, 'coefficients');
 
     if (config.featureColumns.length !== config.coefficients.length) {
       throw new Error(
@@ -176,9 +185,7 @@ export class Crypto15LRModel {
       );
     }
 
-    if (typeof config.intercept !== 'number' || !Number.isFinite(config.intercept)) {
-      throw new Error('Model config must have a finite intercept number');
-    }
+    this.assertFiniteNumber(config.intercept, 'intercept');
 
     if (!config.featureMedians || typeof config.featureMedians !== 'object') {
       throw new Error('Model config must have featureMedians object');
@@ -186,23 +193,44 @@ export class Crypto15LRModel {
 
     // Validate all coefficients are finite numbers
     for (let i = 0; i < config.coefficients.length; i++) {
-      if (typeof config.coefficients[i] !== 'number' || !Number.isFinite(config.coefficients[i])) {
-        throw new Error(`Coefficient at index ${i} must be a finite number`);
-      }
+      this.assertFiniteNumber(config.coefficients[i], `coefficient at index ${i}`);
     }
 
     // Validate all feature column names are non-empty strings
     for (let i = 0; i < config.featureColumns.length; i++) {
-      if (typeof config.featureColumns[i] !== 'string' || config.featureColumns[i].length === 0) {
-        throw new Error(`Feature column at index ${i} must be a non-empty string`);
-      }
+      this.assertNonEmptyString(config.featureColumns[i], `feature column at index ${i}`);
     }
 
     // Validate all medians are finite numbers
     for (const [key, value] of Object.entries(config.featureMedians)) {
-      if (typeof value !== 'number' || !Number.isFinite(value)) {
-        throw new Error(`Feature median for '${key}' must be a finite number`);
-      }
+      this.assertFiniteNumber(value, `feature median for '${key}'`);
+    }
+  }
+
+  /**
+   * Assert that a value is a non-empty string
+   */
+  private assertNonEmptyString(value: unknown, fieldName: string): void {
+    if (typeof value !== 'string' || value.length === 0) {
+      throw new Error(`Model config must have a non-empty ${fieldName} string`);
+    }
+  }
+
+  /**
+   * Assert that a value is a non-empty array
+   */
+  private assertNonEmptyArray(value: unknown, fieldName: string): void {
+    if (!Array.isArray(value) || value.length === 0) {
+      throw new Error(`Model config must have non-empty ${fieldName} array`);
+    }
+  }
+
+  /**
+   * Assert that a value is a finite number
+   */
+  private assertFiniteNumber(value: unknown, fieldName: string): void {
+    if (typeof value !== 'number' || !Number.isFinite(value)) {
+      throw new Error(`Model config ${fieldName} must be a finite number`);
     }
   }
 
@@ -227,7 +255,7 @@ export class Crypto15LRModel {
   }
 
   /**
-   * Check if a value is NaN (handles both number NaN and NaN-like values)
+   * Check if a value is NaN (handles both number NaN and boolean values)
    */
   private isNaNValue(value: number | boolean): boolean {
     if (typeof value === 'boolean') {
