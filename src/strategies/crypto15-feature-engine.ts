@@ -140,6 +140,13 @@ const HOUR_MS = 60 * MINUTE_MS;
 /** Milliseconds per day */
 const DAY_MS = 24 * HOUR_MS;
 
+/**
+ * Unix epoch day-of-week offset.
+ * Jan 1, 1970 was a Thursday (day 4 in 0=Sunday notation).
+ * Used to calculate day-of-week from timestamp without Date object allocation.
+ */
+const EPOCH_DAY_OF_WEEK = 4;
+
 /** 5-minute volatility requires 6 data points (5 returns between 6 prices) */
 const VOLATILITY_MIN_POINTS = 6;
 
@@ -364,9 +371,8 @@ export class Crypto15FeatureEngine {
     windowIndex: number
   ): FeatureVector {
     // Extract UTC time components directly from timestamp (avoid Date allocation)
-    // Jan 1, 1970 was Thursday (day 4), so we offset by 4
     const hourOfDay = Math.floor((timestamp % DAY_MS) / HOUR_MS);
-    const dayOfWeek = (Math.floor(timestamp / DAY_MS) + 4) % 7;
+    const dayOfWeek = (Math.floor(timestamp / DAY_MS) + EPOCH_DAY_OF_WEEK) % 7;
 
     // Calculate lagged returns
     const return1m = this.getLaggedReturn(1);
@@ -470,9 +476,10 @@ export class Crypto15FeatureEngine {
     }
 
     // Sample variance using computational formula: Var = (SumSq - Sum^2/n) / (n-1)
+    // Guard against floating-point precision issues that could produce tiny negative values
     const variance = (sumSq - (sum * sum) / count) / (count - 1);
 
-    return Math.sqrt(variance);
+    return variance <= 0 ? 0 : Math.sqrt(variance);
   }
 
   /**
