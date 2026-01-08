@@ -6,6 +6,10 @@
  * - Model coefficients, intercepts, and feature columns (per-symbol)
  * - Imputation values (median values for NaN features per symbol)
  *
+ * Security Note: These loader functions accept file paths directly. Ensure paths
+ * come from trusted configuration sources, not user input, to prevent path
+ * traversal attacks.
+ *
  * Part of #3
  */
 
@@ -17,15 +21,50 @@ import { Crypto15LRModel, type ModelConfig } from './crypto15-lr-model.js';
 // ============================================================================
 
 /** Default version when not specified in model file */
-const DEFAULT_MODEL_VERSION = '1.0.0';
+export const DEFAULT_MODEL_VERSION = '1.0.0';
 
 /**
  * Quote currencies to strip when extracting asset from symbol.
  * IMPORTANT: Order matters - longer suffixes must come first to avoid
  * partial matches (e.g., 'USDT' before 'USD', otherwise 'BTCUSDT' would
  * incorrectly extract 'BTCUS' instead of 'BTC').
+ *
+ * Exported to allow customization if needed for other quote currencies.
  */
-const QUOTE_CURRENCIES = ['USDT', 'BUSD', 'USDC', 'USD'] as const;
+export const QUOTE_CURRENCIES = ['USDT', 'BUSD', 'USDC', 'USD'] as const;
+
+// ============================================================================
+// Error Types
+// ============================================================================
+
+/** Error codes for ModelLoaderError */
+export enum ModelLoaderErrorCode {
+  /** File could not be read from disk */
+  FILE_READ_ERROR = 'FILE_READ_ERROR',
+  /** JSON parsing failed */
+  JSON_PARSE_ERROR = 'JSON_PARSE_ERROR',
+  /** Model file structure is invalid */
+  MODEL_VALIDATION_ERROR = 'MODEL_VALIDATION_ERROR',
+  /** Imputation file structure is invalid */
+  IMPUTATION_VALIDATION_ERROR = 'IMPUTATION_VALIDATION_ERROR',
+  /** Symbol in model has no matching imputation data */
+  MISSING_IMPUTATION_ERROR = 'MISSING_IMPUTATION_ERROR',
+}
+
+/**
+ * Typed error for model loader operations.
+ * Allows callers to programmatically distinguish error types.
+ */
+export class ModelLoaderError extends Error {
+  constructor(
+    message: string,
+    public readonly code: ModelLoaderErrorCode,
+    public readonly cause?: unknown
+  ) {
+    super(message);
+    this.name = 'ModelLoaderError';
+  }
+}
 
 // ============================================================================
 // Types - Model JSON Format (matches Argus export)
@@ -36,13 +75,13 @@ const QUOTE_CURRENCIES = ['USDT', 'BUSD', 'USDC', 'USD'] as const;
  */
 export interface ModelFileSymbol {
   /** Trading pair symbol (e.g., "BTCUSDT") */
-  symbol: string;
+  readonly symbol: string;
   /** Model coefficients in feature column order */
-  coefficients: number[];
+  readonly coefficients: readonly number[];
   /** Model intercept (bias term) */
-  intercept: number;
+  readonly intercept: number;
   /** Feature column names in order */
-  feature_columns: string[];
+  readonly feature_columns: readonly string[];
 }
 
 /**
@@ -50,15 +89,15 @@ export interface ModelFileSymbol {
  */
 export interface ModelFile {
   /** Model version identifier */
-  version?: string;
+  readonly version?: string;
   /** Array of per-symbol model configurations */
-  symbols: ModelFileSymbol[];
+  readonly symbols: readonly ModelFileSymbol[];
 }
 
 /**
  * Imputation values format - maps symbol to feature medians
  */
-export type ImputationFile = Record<string, Record<string, number>>;
+export type ImputationFile = Readonly<Record<string, Readonly<Record<string, number>>>>;
 
 // ============================================================================
 // Helper Functions
@@ -78,19 +117,39 @@ function getErrorMessage(error: unknown): string {
  * Read and parse a JSON file with proper error handling
  */
 async function readJsonFile(path: string, description: string): Promise<unknown> {
-  const content = await readFile(path, 'utf-8');
+  let content: string;
+  try {
+    content = await readFile(path, 'utf-8');
+  } catch (e) {
+    throw new ModelLoaderError(
+      `Failed to read ${description} file: ${getErrorMessage(e)}`,
+      ModelLoaderErrorCode.FILE_READ_ERROR,
+      e
+    );
+  }
+
   try {
     return JSON.parse(content);
   } catch (e) {
-    throw new Error(`Failed to parse ${description} JSON: ${getErrorMessage(e)}`);
+    throw new ModelLoaderError(
+      `Failed to parse ${description} JSON: ${getErrorMessage(e)}`,
+      ModelLoaderErrorCode.JSON_PARSE_ERROR,
+      e
+    );
   }
 }
 
 /**
  * Extract asset from symbol (e.g., "BTCUSDT" -> "BTC")
+ *
+ * @param symbol - Trading pair symbol
+ * @param quoteCurrencies - Quote currencies to strip (defaults to QUOTE_CURRENCIES)
  */
-function extractAsset(symbol: string): string {
-  for (const quote of QUOTE_CURRENCIES) {
+function extractAsset(
+  symbol: string,
+  quoteCurrencies: readonly string[] = QUOTE_CURRENCIES
+): string {
+  for (const quote of quoteCurrencies) {
     if (symbol.endsWith(quote)) {
       return symbol.slice(0, -quote.length);
     }
@@ -109,8 +168,8 @@ function createModel(
   const config: ModelConfig = {
     version,
     asset: extractAsset(symbolEntry.symbol),
-    featureColumns: symbolEntry.feature_columns,
-    coefficients: symbolEntry.coefficients,
+    featureColumns: [...symbolEntry.feature_columns],
+    coefficients: [...symbolEntry.coefficients],
     intercept: symbolEntry.intercept,
     featureMedians: medians,
   };
@@ -123,21 +182,30 @@ function createModel(
 
 /**
  * Validate model file structure
- * @throws Error if structure is invalid
+ * @throws ModelLoaderError if structure is invalid
  */
 function validateModelFile(data: unknown): asserts data is ModelFile {
   if (!data || typeof data !== 'object') {
-    throw new Error('Model file must be a JSON object');
+    throw new ModelLoaderError(
+      'Model file must be a JSON object',
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
+    );
   }
 
   const file = data as Record<string, unknown>;
 
   if (!Array.isArray(file.symbols)) {
-    throw new Error('Model file must have a "symbols" array');
+    throw new ModelLoaderError(
+      'Model file must have a "symbols" array',
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
+    );
   }
 
   if (file.symbols.length === 0) {
-    throw new Error('Model file "symbols" array cannot be empty');
+    throw new ModelLoaderError(
+      'Model file "symbols" array cannot be empty',
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
+    );
   }
 
   for (let i = 0; i < file.symbols.length; i++) {
@@ -150,45 +218,63 @@ function validateModelFile(data: unknown): asserts data is ModelFile {
  */
 function validateModelSymbol(entry: unknown, index: number): asserts entry is ModelFileSymbol {
   if (!entry || typeof entry !== 'object') {
-    throw new Error(`Symbol entry at index ${index} must be an object`);
+    throw new ModelLoaderError(
+      `Symbol entry at index ${index} must be an object`,
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
+    );
   }
 
   const symbol = entry as Record<string, unknown>;
 
   if (typeof symbol.symbol !== 'string' || symbol.symbol.length === 0) {
-    throw new Error(`Symbol entry at index ${index} must have a non-empty "symbol" string`);
+    throw new ModelLoaderError(
+      `Symbol entry at index ${index} must have a non-empty "symbol" string`,
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
+    );
   }
 
   if (!Array.isArray(symbol.coefficients) || symbol.coefficients.length === 0) {
-    throw new Error(`Symbol "${symbol.symbol}" must have a non-empty "coefficients" array`);
+    throw new ModelLoaderError(
+      `Symbol "${symbol.symbol}" must have a non-empty "coefficients" array`,
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
+    );
   }
 
   for (let j = 0; j < symbol.coefficients.length; j++) {
     if (typeof symbol.coefficients[j] !== 'number' || !Number.isFinite(symbol.coefficients[j])) {
-      throw new Error(
-        `Symbol "${symbol.symbol}" coefficient at index ${j} must be a finite number`
+      throw new ModelLoaderError(
+        `Symbol "${symbol.symbol}" coefficient at index ${j} must be a finite number`,
+        ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
       );
     }
   }
 
   if (typeof symbol.intercept !== 'number' || !Number.isFinite(symbol.intercept)) {
-    throw new Error(`Symbol "${symbol.symbol}" must have a finite "intercept" number`);
+    throw new ModelLoaderError(
+      `Symbol "${symbol.symbol}" must have a finite "intercept" number`,
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
+    );
   }
 
   if (!Array.isArray(symbol.feature_columns) || symbol.feature_columns.length === 0) {
-    throw new Error(`Symbol "${symbol.symbol}" must have a non-empty "feature_columns" array`);
+    throw new ModelLoaderError(
+      `Symbol "${symbol.symbol}" must have a non-empty "feature_columns" array`,
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
+    );
   }
 
   if (symbol.coefficients.length !== symbol.feature_columns.length) {
-    throw new Error(
-      `Symbol "${symbol.symbol}" coefficients length (${symbol.coefficients.length}) must match feature_columns length (${symbol.feature_columns.length})`
+    throw new ModelLoaderError(
+      `Symbol "${symbol.symbol}" coefficients length (${symbol.coefficients.length}) must match feature_columns length (${symbol.feature_columns.length})`,
+      ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
     );
   }
 
   for (let j = 0; j < symbol.feature_columns.length; j++) {
     if (typeof symbol.feature_columns[j] !== 'string' || symbol.feature_columns[j].length === 0) {
-      throw new Error(
-        `Symbol "${symbol.symbol}" feature_column at index ${j} must be a non-empty string`
+      throw new ModelLoaderError(
+        `Symbol "${symbol.symbol}" feature_column at index ${j} must be a non-empty string`,
+        ModelLoaderErrorCode.MODEL_VALIDATION_ERROR
       );
     }
   }
@@ -196,28 +282,38 @@ function validateModelSymbol(entry: unknown, index: number): asserts entry is Mo
 
 /**
  * Validate imputation file structure
- * @throws Error if structure is invalid
+ * @throws ModelLoaderError if structure is invalid
  */
 function validateImputationFile(data: unknown): asserts data is ImputationFile {
   if (!data || typeof data !== 'object') {
-    throw new Error('Imputation file must be a JSON object');
+    throw new ModelLoaderError(
+      'Imputation file must be a JSON object',
+      ModelLoaderErrorCode.IMPUTATION_VALIDATION_ERROR
+    );
   }
 
   const file = data as Record<string, unknown>;
 
   if (Object.keys(file).length === 0) {
-    throw new Error('Imputation file cannot be empty');
+    throw new ModelLoaderError(
+      'Imputation file cannot be empty',
+      ModelLoaderErrorCode.IMPUTATION_VALIDATION_ERROR
+    );
   }
 
   for (const [symbol, medians] of Object.entries(file)) {
     if (!medians || typeof medians !== 'object') {
-      throw new Error(`Imputation for symbol "${symbol}" must be an object`);
+      throw new ModelLoaderError(
+        `Imputation for symbol "${symbol}" must be an object`,
+        ModelLoaderErrorCode.IMPUTATION_VALIDATION_ERROR
+      );
     }
 
     for (const [feature, value] of Object.entries(medians as Record<string, unknown>)) {
       if (typeof value !== 'number' || !Number.isFinite(value)) {
-        throw new Error(
-          `Imputation value for "${symbol}.${feature}" must be a finite number, got ${value}`
+        throw new ModelLoaderError(
+          `Imputation value for "${symbol}.${feature}" must be a finite number, got ${value}`,
+          ModelLoaderErrorCode.IMPUTATION_VALIDATION_ERROR
         );
       }
     }
@@ -234,9 +330,9 @@ function validateImputationFile(data: unknown): asserts data is ImputationFile {
  * Note: Models loaded this way have empty featureMedians. Use
  * loadModelsWithImputations() for production use with imputation support.
  *
- * @param path - Path to the model JSON file
+ * @param path - Path to the model JSON file (must be from trusted source)
  * @returns Map of symbol to Crypto15LRModel instance
- * @throws Error if file cannot be read or JSON is malformed
+ * @throws ModelLoaderError if file cannot be read or JSON is malformed
  */
 export async function loadModels(path: string): Promise<Map<string, Crypto15LRModel>> {
   const data = await readJsonFile(path, 'model');
@@ -258,10 +354,10 @@ export async function loadModels(path: string): Promise<Map<string, Crypto15LRMo
  * This is the recommended loader for production use as it ensures
  * models have median values for feature imputation.
  *
- * @param modelPath - Path to the model JSON file
- * @param imputationPath - Path to the imputation JSON file
+ * @param modelPath - Path to the model JSON file (must be from trusted source)
+ * @param imputationPath - Path to the imputation JSON file (must be from trusted source)
  * @returns Map of symbol to Crypto15LRModel instance with medians populated
- * @throws Error if files cannot be read or JSON is malformed
+ * @throws ModelLoaderError if files cannot be read or JSON is malformed
  */
 export async function loadModelsWithImputations(
   modelPath: string,
@@ -282,10 +378,13 @@ export async function loadModelsWithImputations(
     const medians = imputationData[symbolEntry.symbol];
 
     if (!medians) {
-      throw new Error(`No imputation values found for symbol "${symbolEntry.symbol}"`);
+      throw new ModelLoaderError(
+        `No imputation values found for symbol "${symbolEntry.symbol}"`,
+        ModelLoaderErrorCode.MISSING_IMPUTATION_ERROR
+      );
     }
 
-    models.set(symbolEntry.symbol, createModel(symbolEntry, version, medians));
+    models.set(symbolEntry.symbol, createModel(symbolEntry, version, { ...medians }));
   }
 
   return models;
@@ -297,9 +396,9 @@ export async function loadModelsWithImputations(
  * Useful when you need to load imputations separately from models,
  * e.g., for inspection or when combining with models loaded elsewhere.
  *
- * @param path - Path to the imputation JSON file
+ * @param path - Path to the imputation JSON file (must be from trusted source)
  * @returns Map of symbol to feature medians record
- * @throws Error if file cannot be read or JSON is malformed
+ * @throws ModelLoaderError if file cannot be read or JSON is malformed
  */
 export async function loadImputations(path: string): Promise<Map<string, Record<string, number>>> {
   const data = await readJsonFile(path, 'imputation');

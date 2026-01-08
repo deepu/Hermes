@@ -10,7 +10,14 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { writeFile, mkdtemp, rm } from 'node:fs/promises';
 import { join } from 'node:path';
 import { tmpdir } from 'node:os';
-import { loadModels, loadImputations, loadModelsWithImputations } from './model-loader.js';
+import {
+  loadModels,
+  loadImputations,
+  loadModelsWithImputations,
+  ModelLoaderError,
+  ModelLoaderErrorCode,
+  DEFAULT_MODEL_VERSION,
+} from './model-loader.js';
 
 describe('Model Loader', () => {
   let testDir: string;
@@ -93,7 +100,7 @@ describe('Model Loader', () => {
       const models = await loadModels(filePath);
       const btcModel = models.get('BTCUSDT')!;
 
-      expect(btcModel.getVersion()).toBe('1.0.0');
+      expect(btcModel.getVersion()).toBe(DEFAULT_MODEL_VERSION);
     });
 
     it('should extract asset from various symbol formats', async () => {
@@ -138,15 +145,28 @@ describe('Model Loader', () => {
       expect(models.get('XRPUSDC')!.getAsset()).toBe('XRP');
     });
 
-    it('should throw for non-existent file', async () => {
-      await expect(loadModels('/nonexistent/path.json')).rejects.toThrow();
+    it('should throw FILE_READ_ERROR for non-existent file', async () => {
+      try {
+        await loadModels('/nonexistent/path.json');
+        expect.fail('Should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(ModelLoaderError);
+        expect((e as ModelLoaderError).code).toBe(ModelLoaderErrorCode.FILE_READ_ERROR);
+      }
     });
 
-    it('should throw for invalid JSON', async () => {
+    it('should throw JSON_PARSE_ERROR for invalid JSON', async () => {
       const filePath = join(testDir, 'invalid.json');
       await writeFile(filePath, 'not valid json');
 
-      await expect(loadModels(filePath)).rejects.toThrow('Failed to parse model JSON');
+      try {
+        await loadModels(filePath);
+        expect.fail('Should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(ModelLoaderError);
+        expect((e as ModelLoaderError).code).toBe(ModelLoaderErrorCode.JSON_PARSE_ERROR);
+        expect((e as ModelLoaderError).message).toContain('Failed to parse model JSON');
+      }
     });
 
     it('should throw for missing symbols array', async () => {
@@ -250,18 +270,31 @@ describe('Model Loader', () => {
       expect(imputations2.get('BTCUSDT')!.volatility_5m).toBe(0.0012);
     });
 
-    it('should throw for non-existent file', async () => {
-      await expect(loadImputations('/nonexistent/path.json')).rejects.toThrow();
+    it('should throw FILE_READ_ERROR for non-existent file', async () => {
+      try {
+        await loadImputations('/nonexistent/path.json');
+        expect.fail('Should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(ModelLoaderError);
+        expect((e as ModelLoaderError).code).toBe(ModelLoaderErrorCode.FILE_READ_ERROR);
+      }
     });
 
-    it('should throw for invalid JSON', async () => {
+    it('should throw JSON_PARSE_ERROR for invalid JSON', async () => {
       const filePath = join(testDir, 'invalid.json');
       await writeFile(filePath, 'not valid json');
 
-      await expect(loadImputations(filePath)).rejects.toThrow('Failed to parse imputation JSON');
+      try {
+        await loadImputations(filePath);
+        expect.fail('Should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(ModelLoaderError);
+        expect((e as ModelLoaderError).code).toBe(ModelLoaderErrorCode.JSON_PARSE_ERROR);
+        expect((e as ModelLoaderError).message).toContain('Failed to parse imputation JSON');
+      }
     });
 
-    it('should throw for empty object', async () => {
+    it('should throw IMPUTATION_VALIDATION_ERROR for empty object', async () => {
       const filePath = join(testDir, 'empty.json');
       await writeFile(filePath, JSON.stringify({}));
 
@@ -339,7 +372,7 @@ describe('Model Loader', () => {
       expect(result2.imputedCount).toBe(1);
     });
 
-    it('should throw if imputation missing for symbol', async () => {
+    it('should throw MISSING_IMPUTATION_ERROR if imputation missing for symbol', async () => {
       const modelPath = join(testDir, 'models.json');
       const imputationPath = join(testDir, 'imputations.json');
 
@@ -351,9 +384,14 @@ describe('Model Loader', () => {
       await writeFile(modelPath, JSON.stringify(sampleModelFile));
       await writeFile(imputationPath, JSON.stringify(partialImputations));
 
-      await expect(loadModelsWithImputations(modelPath, imputationPath)).rejects.toThrow(
-        'No imputation values found for symbol "ETHUSDT"'
-      );
+      try {
+        await loadModelsWithImputations(modelPath, imputationPath);
+        expect.fail('Should have thrown');
+      } catch (e) {
+        expect(e).toBeInstanceOf(ModelLoaderError);
+        expect((e as ModelLoaderError).code).toBe(ModelLoaderErrorCode.MISSING_IMPUTATION_ERROR);
+        expect((e as ModelLoaderError).message).toContain('ETHUSDT');
+      }
     });
 
     it('should throw for invalid model file', async () => {
