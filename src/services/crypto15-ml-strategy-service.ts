@@ -151,6 +151,18 @@ export interface PaperSettlement {
 }
 
 /**
+ * Paper trading statistics snapshot
+ */
+export interface PaperTradingStats {
+  /** Number of open paper positions */
+  positionCount: number;
+  /** Cumulative realized P&L in USD */
+  cumulativePnL: number;
+  /** Snapshot of current open positions (copy, not live reference) */
+  positions: PaperPosition[];
+}
+
+/**
  * Market tracker maintaining state for each active market
  */
 interface MarketTracker {
@@ -489,7 +501,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
       this.subscribeToPriceUpdates();
 
       // Subscribe to market resolutions for paper trading (dry-run mode only)
-      this.subscribeToMarketResolutions();
+      if (this.config.dryRun) {
+        this.subscribeToMarketResolutions();
+      }
 
       // Run initial scans
       await this.scanUpcomingMarkets();
@@ -574,8 +588,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     // Log paper trading summary if in dry-run mode (always log, even if no open positions)
     if (this.config.dryRun) {
-      const pnlStr = this.paperPnL >= 0 ? `+$${this.paperPnL.toFixed(2)}` : `-$${Math.abs(this.paperPnL).toFixed(2)}`;
-      this.log(`[DRY-RUN] Final stats: ${this.paperPositions.size} open positions, cumulative P&L: ${pnlStr}`);
+      this.log(`[DRY-RUN] Final stats: ${this.paperPositions.size} open positions, cumulative P&L: ${this.formatPnL(this.paperPnL)}`);
     }
 
     // Unsubscribe from prices
@@ -1281,6 +1294,20 @@ export class Crypto15MLStrategyService extends EventEmitter {
   private static readonly MAX_PAPER_POSITIONS = 1000;
 
   /**
+   * Fields to check for market outcome, in priority order.
+   * 'winner' is the standard field for resolved markets,
+   * 'outcome' and 'winning_outcome' are fallbacks for alternative event formats.
+   */
+  private static readonly OUTCOME_FIELD_NAMES = ['winner', 'outcome', 'winning_outcome'] as const;
+
+  /**
+   * Format P&L value as a display string with +/- prefix
+   */
+  private formatPnL(pnl: number): string {
+    return pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+  }
+
+  /**
    * Determine if a position wins based on side and outcome
    */
   private isWinningPosition(side: 'YES' | 'NO', outcome: 'UP' | 'DOWN'): boolean {
@@ -1382,10 +1409,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
       timestamp: new Date(),
     };
 
-    const pnlStr = pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
     this.log(
       `[DRY-RUN] Settlement: ${won ? 'WIN' : 'LOSS'} | ` +
-      `entry: ${position.entryPrice.toFixed(2)} | pnl: ${pnlStr}`
+      `entry: ${position.entryPrice.toFixed(2)} | pnl: ${this.formatPnL(pnl)}`
     );
 
     this.emit('paperSettlement', settlement);
@@ -1399,12 +1425,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
    *
    * Uses realtimeService to get market lifecycle events.
    * When a market resolves, triggers paper P&L calculation.
+   * Only call this method when dryRun mode is enabled.
    */
   private subscribeToMarketResolutions(): void {
-    if (!this.config.dryRun) {
-      return; // Only needed in dry-run mode
-    }
-
     this.marketEventSubscription = this.realtimeService.subscribeMarketEvents({
       onMarketEvent: (event) => {
         try {
@@ -1461,13 +1484,17 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * from the event data. Uses strict matching to avoid
    * false positives from malformed data.
    */
-  private parseMarketOutcome(event: { data: Record<string, unknown> }): 'UP' | 'DOWN' | null {
+  private parseMarketOutcome(event: { data?: Record<string, unknown> }): 'UP' | 'DOWN' | null {
+    // Guard against malformed events
+    if (!event?.data || typeof event.data !== 'object') {
+      this.log(`[DRY-RUN] Malformed event data, skipping resolution`);
+      return null;
+    }
+
     const data = event.data;
 
     // Check known fields in priority order
-    const fieldsToCheck = ['winner', 'outcome', 'winning_outcome'];
-
-    for (const field of fieldsToCheck) {
+    for (const field of Crypto15MLStrategyService.OUTCOME_FIELD_NAMES) {
       const result = this.parseOutcomeString(data[field]);
       if (result) {
         return result;
@@ -1475,18 +1502,19 @@ export class Crypto15MLStrategyService extends EventEmitter {
     }
 
     // Could not determine outcome - skip this resolution
-    this.log(`Could not parse outcome from event data, skipping resolution`);
+    this.log(`[DRY-RUN] Could not parse outcome from event data, skipping resolution`);
     return null;
   }
 
   /**
    * Get current paper trading statistics
+   *
+   * Returns a snapshot of the current paper trading state.
+   * The positions array is a copy - modifications do not affect internal state.
+   *
+   * @returns Current paper trading statistics snapshot
    */
-  getPaperTradingStats(): {
-    positionCount: number;
-    cumulativePnL: number;
-    positions: PaperPosition[];
-  } {
+  getPaperTradingStats(): PaperTradingStats {
     return {
       positionCount: this.paperPositions.size,
       cumulativePnL: this.paperPnL,
