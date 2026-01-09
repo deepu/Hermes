@@ -38,6 +38,7 @@ import { Crypto15LRModel, type ModelConfig } from '../strategies/crypto15-lr-mod
 
 const WINDOW_MS = 15 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
+const ASYNC_SETTLE_MS = 100;
 
 // Use a fixed timestamp for reproducible tests (2024-01-01 00:00:00 UTC)
 const MOCK_TIME = 1704067200000;
@@ -210,18 +211,15 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
     mockIsConnected,
     mockConnect,
     mockSubscribeCryptoChainlinkPrices,
-    priceHandler: null as CryptoPriceHandlers | null,
+    get priceHandler() {
+      return priceHandler;
+    },
     emitPrice: (price: CryptoPrice) => {
       if (priceHandler?.onPrice) {
         priceHandler.onPrice(price);
       }
     },
   };
-
-  // Update priceHandler accessor
-  Object.defineProperty(mockService, 'priceHandler', {
-    get: () => priceHandler,
-  });
 
   return mockService as unknown as RealtimeServiceV2 & {
     mockIsConnected: Mock;
@@ -230,6 +228,90 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
     emitPrice: (price: CryptoPrice) => void;
     priceHandler: CryptoPriceHandlers | null;
   };
+}
+
+// ============================================================================
+// Test Helpers
+// ============================================================================
+
+// These helpers are initialized in beforeEach and used by helper functions
+let _mockMarketService: ReturnType<typeof createMockMarketService>;
+let _mockTradingService: ReturnType<typeof createMockTradingService>;
+let _mockRealtimeService: ReturnType<typeof createMockRealtimeService>;
+let _service: Crypto15MLStrategyService;
+
+/**
+ * Setup a BTC market for testing with standard configuration.
+ * Reduces boilerplate in individual tests.
+ */
+function setupBtcMarket(
+  conditionId: string,
+  prices: { yes: number; no: number } = { yes: 0.50, no: 0.50 },
+  endTime: number = TEST_END_TIME
+): { slug: string; market: UnifiedMarket } {
+  const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+  const slug = `btc-updown-15m-${windowStartSec}`;
+  const market = createTestMarket(conditionId, slug, endTime, prices);
+  _mockMarketService.mockGetMarket.mockResolvedValue(market);
+  return { slug, market };
+}
+
+/**
+ * Create and start a service with the given config overrides.
+ * Returns the started service.
+ */
+async function createAndStartService(
+  configOverrides: Partial<Crypto15MLConfig> = {}
+): Promise<Crypto15MLStrategyService> {
+  const config = createTestConfig(configOverrides);
+  _service = new Crypto15MLStrategyService(
+    _mockMarketService,
+    _mockTradingService,
+    _mockRealtimeService,
+    config
+  );
+  await _service.start();
+  return _service;
+}
+
+/**
+ * Collect signals emitted by the service.
+ * Returns an array that will be populated as signals are emitted.
+ */
+function collectSignals(service: Crypto15MLStrategyService): Signal[] {
+  const signals: Signal[] = [];
+  service.on('signal', (signal: Signal) => signals.push(signal));
+  return signals;
+}
+
+/**
+ * Collect execution results emitted by the service.
+ */
+function collectExecutions(service: Crypto15MLStrategyService): ExecutionResult[] {
+  const executions: ExecutionResult[] = [];
+  service.on('execution', (exec: ExecutionResult) => executions.push(exec));
+  return executions;
+}
+
+/**
+ * Collect errors emitted by the service.
+ */
+function collectErrors(service: Crypto15MLStrategyService): Error[] {
+  const errors: Error[] = [];
+  service.on('error', (err: Error) => errors.push(err));
+  return errors;
+}
+
+/**
+ * Emit a price update and wait for async processing to settle.
+ */
+async function emitPriceAndSettle(
+  symbol: string = 'BTC/USD',
+  price: number = TEST_BTC_PRICE,
+  timestamp: number = TEST_WINDOW_START
+): Promise<void> {
+  _mockRealtimeService.emitPrice({ symbol, price, timestamp });
+  await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 }
 
 // ============================================================================
@@ -264,6 +346,11 @@ describe('Crypto15MLStrategyService Integration', () => {
     mockMarketService = createMockMarketService();
     mockTradingService = createMockTradingService();
     mockRealtimeService = createMockRealtimeService();
+
+    // Initialize helper variables for test helper functions
+    _mockMarketService = mockMarketService;
+    _mockTradingService = mockTradingService;
+    _mockRealtimeService = mockRealtimeService;
   });
 
   afterEach(() => {
@@ -461,7 +548,7 @@ describe('Crypto15MLStrategyService Integration', () => {
       const initialCount = service.getTrackerCount();
 
       // Simulate another scan attempt (advance time for interval)
-      vi.advanceTimersByTime(10 * 60 * 1000); // 10 minutes
+      await vi.advanceTimersByTimeAsync(10 * 60 * 1000); // 10 minutes
 
       // Count should remain the same for this market
       const trackers = service.getTrackers();
@@ -646,7 +733,7 @@ describe('Crypto15MLStrategyService Integration', () => {
       });
 
       // Wait for async processing
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
       // Verify YES signal was generated
       expect(signals).toHaveLength(1);
@@ -655,6 +742,9 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should include correct signal metadata', async () => {
+      // Set high intercept to guarantee signal generation for metadata validation
+      testModelIntercept = 3.0;
+
       const config = createTestConfig();
       service = new Crypto15MLStrategyService(
         mockMarketService,
@@ -670,36 +760,38 @@ describe('Crypto15MLStrategyService Integration', () => {
       mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
 
       const signals: Signal[] = [];
-      service.on('signal', (signal) => {
-        signals.push(signal);
-        // Verify signal structure
-        expect(signal.conditionId).toBeDefined();
-        expect(signal.slug).toBeDefined();
-        expect(signal.asset).toBe('BTC');
-        expect(['YES', 'NO']).toContain(signal.side);
-        expect(signal.probability).toBeGreaterThanOrEqual(0);
-        expect(signal.probability).toBeLessThanOrEqual(1);
-        expect(signal.stateMinute).toBeGreaterThanOrEqual(0);
-        expect(signal.stateMinute).toBeLessThanOrEqual(14);
-        expect(signal.features).toBeDefined();
-      });
+      service.on('signal', (signal) => signals.push(signal));
 
       await service.start();
 
-      // Emit prices to potentially trigger signal
-      for (let i = 0; i < 3; i++) {
-        mockRealtimeService.emitPrice({
-          symbol: 'BTC/USD',
-          price: 98500 + i * 10,
-          timestamp: TEST_WINDOW_START + i * MINUTE_MS,
-        });
-        await vi.advanceTimersByTimeAsync(MINUTE_MS);
-      }
+      // Emit price at minute boundary to trigger signal
+      mockRealtimeService.emitPrice({
+        symbol: 'BTC/USD',
+        price: TEST_BTC_PRICE,
+        timestamp: TEST_WINDOW_START,
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // Verify signal was generated and has correct structure
+      expect(signals).toHaveLength(1);
+      const signal = signals[0];
+      expect(signal.conditionId).toBeDefined();
+      expect(signal.slug).toBeDefined();
+      expect(signal.asset).toBe('BTC');
+      expect(['YES', 'NO']).toContain(signal.side);
+      expect(signal.probability).toBeGreaterThanOrEqual(0);
+      expect(signal.probability).toBeLessThanOrEqual(1);
+      expect(signal.stateMinute).toBeGreaterThanOrEqual(0);
+      expect(signal.stateMinute).toBeLessThanOrEqual(14);
+      expect(signal.features).toBeDefined();
     });
   });
 
   describe('Signal Generation: NO signal with p <= 0.30', () => {
     it('should generate NO signal when probability is below threshold', async () => {
+      // Set low intercept to produce probability ~0.05 (well below 0.30 threshold)
+      testModelIntercept = -3.0;
+
       const config = createTestConfig();
       service = new Crypto15MLStrategyService(
         mockMarketService,
@@ -710,7 +802,7 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      // Low YES price, low NO price - both below entry cap
+      // NO price below entry cap to allow signal
       const btcMarket = createTestMarket('cond-no-sig', btcSlug, TEST_END_TIME, { yes: 0.60, no: 0.40 });
 
       mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
@@ -720,20 +812,18 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await service.start();
 
-      // Emit prices with declining pattern (to trigger NO signal)
-      for (let i = 0; i < 3; i++) {
-        mockRealtimeService.emitPrice({
-          symbol: 'BTC/USD',
-          price: 98500 - i * 100, // Declining prices
-          timestamp: TEST_WINDOW_START + i * MINUTE_MS,
-        });
-        await vi.advanceTimersByTimeAsync(MINUTE_MS);
-      }
+      // Emit price at minute boundary to trigger signal
+      mockRealtimeService.emitPrice({
+        symbol: 'BTC/USD',
+        price: TEST_BTC_PRICE,
+        timestamp: TEST_WINDOW_START,
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
-      // If signals generated, verify NO signals have correct structure
-      for (const signal of signals.filter(s => s.side === 'NO')) {
-        expect(signal.probability).toBeLessThanOrEqual(0.30);
-      }
+      // Verify NO signal was generated
+      expect(signals).toHaveLength(1);
+      expect(signals[0].side).toBe('NO');
+      expect(signals[0].probability).toBeLessThanOrEqual(0.30);
     });
   });
 
@@ -768,7 +858,7 @@ describe('Crypto15MLStrategyService Integration', () => {
         price: TEST_BTC_PRICE,
         timestamp: TEST_WINDOW_START,
       });
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
       // Signal should not be generated due to price cap
       expect(signals).toHaveLength(0);
@@ -838,7 +928,7 @@ describe('Crypto15MLStrategyService Integration', () => {
         price: 98500,
         timestamp: TEST_WINDOW_START + 5 * MINUTE_MS,
       });
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
       // No signal should be generated at minute 5
       expect(signals.filter(s => s.stateMinute === 5).length).toBe(0);
@@ -897,6 +987,9 @@ describe('Crypto15MLStrategyService Integration', () => {
 
   describe('Order Execution: TradingService integration', () => {
     it('should execute order via TradingService after signal (non-dry-run)', async () => {
+      // Set high intercept to guarantee signal generation
+      testModelIntercept = 3.0;
+
       const config = createTestConfig({ dryRun: false });
       service = new Crypto15MLStrategyService(
         mockMarketService,
@@ -917,28 +1010,27 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       const executions: ExecutionResult[] = [];
       service.on('execution', (exec) => executions.push(exec));
-      service.on('signal', () => {
-        // Signal received, execution should follow
-      });
 
       await service.start();
 
       // Emit price
       mockRealtimeService.emitPrice({
         symbol: 'BTC/USD',
-        price: 98500,
+        price: TEST_BTC_PRICE,
         timestamp: TEST_WINDOW_START,
       });
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
-      // If signal was generated and executed, verify execution
-      if (executions.length > 0) {
-        expect(executions[0].orderResult.success).toBe(true);
-        expect(mockTradingService.mockCreateMarketOrder).toHaveBeenCalled();
-      }
+      // Verify execution occurred
+      expect(executions).toHaveLength(1);
+      expect(executions[0].orderResult.success).toBe(true);
+      expect(mockTradingService.mockCreateMarketOrder).toHaveBeenCalled();
     });
 
     it('should emit execution event in dry-run mode without calling TradingService', async () => {
+      // Set high intercept to guarantee signal generation
+      testModelIntercept = 3.0;
+
       const config = createTestConfig({ dryRun: true });
       service = new Crypto15MLStrategyService(
         mockMarketService,
@@ -949,7 +1041,7 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-dry', btcSlug, TEST_END_TIME);
+      const btcMarket = createTestMarket('cond-dry', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
 
       mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
 
@@ -961,18 +1053,17 @@ describe('Crypto15MLStrategyService Integration', () => {
       // Emit price
       mockRealtimeService.emitPrice({
         symbol: 'BTC/USD',
-        price: 98500,
+        price: TEST_BTC_PRICE,
         timestamp: TEST_WINDOW_START,
       });
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
       // In dry run, TradingService should NOT be called
       expect(mockTradingService.mockCreateMarketOrder).not.toHaveBeenCalled();
 
-      // But execution event should still be emitted for dry-run signals
-      if (executions.length > 0) {
-        expect(executions[0].orderResult.orderId).toContain('dry-run');
-      }
+      // Verify execution event was emitted with dry-run order ID
+      expect(executions).toHaveLength(1);
+      expect(executions[0].orderResult.orderId).toContain('dry-run');
     });
   });
 
@@ -1000,10 +1091,8 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await service.start();
 
-      // Trigger reactive scan
-      vi.advanceTimersByTime(60 * 1000); // 1 minute
-
-      await vi.advanceTimersByTimeAsync(100);
+      // Trigger reactive scan and wait for async processing
+      await vi.advanceTimersByTimeAsync(60 * 1000 + ASYNC_SETTLE_MS);
 
       // Error should be emitted
       expect(errors.some(e => e.message.includes('API connection failed'))).toBe(true);
@@ -1196,7 +1285,7 @@ describe('Crypto15MLStrategyService Integration', () => {
       mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 98510, timestamp: baseTime + 10000 });
       mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 98520, timestamp: baseTime + 30000 });
 
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
       // Only one signal opportunity (at minute boundary)
       expect(signalCount).toBeLessThanOrEqual(1);
@@ -1209,6 +1298,9 @@ describe('Crypto15MLStrategyService Integration', () => {
 
   describe('Error Handling', () => {
     it('should handle trading service errors gracefully', async () => {
+      // Set high intercept to guarantee signal generation
+      testModelIntercept = 3.0;
+
       const config = createTestConfig({ dryRun: false });
       service = new Crypto15MLStrategyService(
         mockMarketService,
@@ -1219,32 +1311,35 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-error', btcSlug, TEST_END_TIME);
+      const btcMarket = createTestMarket('cond-error', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
 
       mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
       mockTradingService.mockCreateMarketOrder.mockRejectedValue(new Error('Order rejected'));
 
       const errors: Error[] = [];
-      const executions: ExecutionResult[] = [];
       service.on('error', (err) => errors.push(err));
-      service.on('execution', (exec) => executions.push(exec));
 
       await service.start();
 
-      // Emit price
+      // Emit price to trigger signal and order attempt
       mockRealtimeService.emitPrice({
         symbol: 'BTC/USD',
-        price: 98500,
+        price: TEST_BTC_PRICE,
         timestamp: TEST_WINDOW_START,
       });
 
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
       // Service should still be running despite trade error
       expect(service.isRunning()).toBe(true);
+      // Verify error was captured
+      expect(errors.some(e => e.message.includes('Order rejected'))).toBe(true);
     });
 
     it('should handle transient errors and allow retry', async () => {
+      // Set high intercept to guarantee signal generation
+      testModelIntercept = 3.0;
+
       const config = createTestConfig({ dryRun: false });
       service = new Crypto15MLStrategyService(
         mockMarketService,
@@ -1255,7 +1350,7 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-transient', btcSlug, TEST_END_TIME);
+      const btcMarket = createTestMarket('cond-transient', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
 
       mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
 
@@ -1269,23 +1364,20 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await service.start();
 
-      // Emit price
+      // Emit price to trigger signal
       mockRealtimeService.emitPrice({
         symbol: 'BTC/USD',
-        price: 98500,
+        price: TEST_BTC_PRICE,
         timestamp: TEST_WINDOW_START,
       });
 
       // Wait for async execution to complete
       await vi.advanceTimersByTimeAsync(500);
 
-      // If an error was caught, verify it was the transient error
-      if (errors.length > 0) {
-        expect(errors.some(e => e.message.includes('timeout'))).toBe(true);
-      }
-
-      // Service should still be running
+      // Service should still be running after transient error
       expect(service.isRunning()).toBe(true);
+      // Verify the timeout error was captured
+      expect(errors.some(e => e.message.includes('timeout'))).toBe(true);
     });
 
     it('should continue running after price handler errors', async () => {
@@ -1309,7 +1401,7 @@ describe('Crypto15MLStrategyService Integration', () => {
         timestamp: TEST_WINDOW_START,
       });
 
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
 
       // Service should continue running
       expect(service.isRunning()).toBe(true);
