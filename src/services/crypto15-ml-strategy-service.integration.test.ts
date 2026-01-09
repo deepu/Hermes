@@ -24,10 +24,12 @@ import {
   type ExecutionResult,
   type MarketAddedEvent,
   type MarketRemovedEvent,
+  type PaperPosition,
+  type PaperSettlement,
 } from './crypto15-ml-strategy-service.js';
 import type { MarketService } from './market-service.js';
 import type { TradingService, OrderResult } from './trading-service.js';
-import type { RealtimeServiceV2, CryptoPrice, Subscription, CryptoPriceHandlers } from './realtime-service-v2.js';
+import type { RealtimeServiceV2, CryptoPrice, Subscription, CryptoPriceHandlers, MarketEvent } from './realtime-service-v2.js';
 import type { UnifiedMarket, MarketToken } from '../core/types.js';
 import type { GammaMarket } from '../clients/gamma-api.js';
 import { Crypto15LRModel, type ModelConfig } from '../strategies/crypto15-lr-model.js';
@@ -185,10 +187,13 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
   mockIsConnected: Mock;
   mockConnect: Mock;
   mockSubscribeCryptoChainlinkPrices: Mock;
+  mockSubscribeMarketEvents: Mock;
   emitPrice: (price: CryptoPrice) => void;
+  emitMarketEvent: (event: MarketEvent) => void;
   priceHandler: CryptoPriceHandlers | null;
 } {
   let priceHandler: CryptoPriceHandlers | null = null;
+  let marketEventHandler: ((event: MarketEvent) => void) | null = null;
   let subscriptionCounter = 0;
 
   const mockIsConnected = vi.fn().mockReturnValue(true);
@@ -203,14 +208,26 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
       unsubscribe: vi.fn(),
     };
   });
+  const mockSubscribeMarketEvents = vi.fn((handlers: { onMarketEvent?: (event: MarketEvent) => void }): Subscription => {
+    marketEventHandler = handlers.onMarketEvent || null;
+    subscriptionCounter++;
+    return {
+      id: `market_event_${subscriptionCounter}`,
+      topic: 'clob_market',
+      type: 'market_resolved',
+      unsubscribe: vi.fn(),
+    };
+  });
 
   const mockService = {
     isConnected: mockIsConnected,
     connect: mockConnect,
     subscribeCryptoChainlinkPrices: mockSubscribeCryptoChainlinkPrices,
+    subscribeMarketEvents: mockSubscribeMarketEvents,
     mockIsConnected,
     mockConnect,
     mockSubscribeCryptoChainlinkPrices,
+    mockSubscribeMarketEvents,
     get priceHandler() {
       return priceHandler;
     },
@@ -219,13 +236,20 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
         priceHandler.onPrice(price);
       }
     },
+    emitMarketEvent: (event: MarketEvent) => {
+      if (marketEventHandler) {
+        marketEventHandler(event);
+      }
+    },
   };
 
   return mockService as unknown as RealtimeServiceV2 & {
     mockIsConnected: Mock;
     mockConnect: Mock;
     mockSubscribeCryptoChainlinkPrices: Mock;
+    mockSubscribeMarketEvents: Mock;
     emitPrice: (price: CryptoPrice) => void;
+    emitMarketEvent: (event: MarketEvent) => void;
     priceHandler: CryptoPriceHandlers | null;
   };
 }
@@ -1462,6 +1486,314 @@ describe('Crypto15MLStrategyService Integration', () => {
         expect(typeof tracker.endTime).toBe('number');
         expect(typeof tracker.traded).toBe('boolean');
       }
+    });
+  });
+
+  // ============================================================================
+  // Paper Trading (Dry-Run Mode) Tests
+  // ============================================================================
+
+  describe('Paper Trading: Dry-Run Mode', () => {
+    // Helper constants for paper trading tests
+    const WINDOW_START_SEC = Math.floor(TEST_WINDOW_START / 1000);
+    const MODEL_INTERCEPT_YES = 3.0;
+    const MODEL_INTERCEPT_NO = -3.0;
+
+    // Helper to create and start service with paper trading enabled
+    async function setupPaperTradingService(
+      conditionId: string,
+      prices: { yes: number; no: number },
+      configOverrides: Partial<Crypto15MLConfig> = {}
+    ): Promise<{ slug: string; market: UnifiedMarket }> {
+      const slug = `btc-updown-15m-${WINDOW_START_SEC}`;
+      const market = createTestMarket(conditionId, slug, TEST_END_TIME, prices);
+
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({ dryRun: true, ...configOverrides });
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config
+      );
+
+      await service.start();
+      return { slug, market };
+    }
+
+    // Helper to trigger a signal by emitting a price
+    async function triggerSignal(): Promise<void> {
+      mockRealtimeService.emitPrice({
+        symbol: 'BTC/USD',
+        price: TEST_BTC_PRICE,
+        timestamp: TEST_WINDOW_START,
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+    }
+
+    it('should emit paperPosition event when signal is generated in dry-run mode', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      const { slug } = await setupPaperTradingService('cond-paper-1', { yes: 0.50, no: 0.50 });
+
+      const paperPositions: PaperPosition[] = [];
+      service.on('paperPosition', (pos) => paperPositions.push(pos));
+
+      await triggerSignal();
+
+      // Verify paperPosition event was emitted
+      expect(paperPositions).toHaveLength(1);
+      expect(paperPositions[0].marketId).toBe('cond-paper-1');
+      expect(paperPositions[0].slug).toBe(slug);
+      expect(paperPositions[0].symbol).toBe('BTC');
+      expect(paperPositions[0].side).toBe('YES');
+      expect(paperPositions[0].entryPrice).toBe(0.50);
+      expect(paperPositions[0].size).toBe(100.0);
+    });
+
+    it('should track paper position correctly after signal', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      await setupPaperTradingService('cond-paper-track', { yes: 0.60, no: 0.40 }, { positionSizeUsd: 50 });
+
+      await triggerSignal();
+
+      // Verify paper trading stats
+      const stats = service.getPaperTradingStats();
+      expect(stats.positionCount).toBe(1);
+      expect(stats.positions[0].size).toBe(50);
+    });
+
+    it('should emit paperSettlement event when market resolves UP with YES position', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      await setupPaperTradingService('cond-settle-up', { yes: 0.60, no: 0.40 });
+
+      const settlements: PaperSettlement[] = [];
+      service.on('paperSettlement', (s) => settlements.push(s));
+
+      await triggerSignal();
+
+      // Simulate market resolution (UP)
+      mockRealtimeService.emitMarketEvent({
+        conditionId: 'cond-settle-up',
+        type: 'resolved',
+        data: { winner: 'Up', outcome: 'UP' },
+        timestamp: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // Verify settlement event
+      expect(settlements).toHaveLength(1);
+      expect(settlements[0].outcome).toBe('UP');
+      expect(settlements[0].won).toBe(true);
+      // P&L = (1.0 - 0.60) * 100 = 40
+      expect(settlements[0].pnl).toBe(40);
+    });
+
+    it('should emit paperSettlement with loss when market resolves opposite to position', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES; // Will generate YES signal
+
+      await setupPaperTradingService('cond-settle-loss', { yes: 0.65, no: 0.35 });
+
+      const settlements: PaperSettlement[] = [];
+      service.on('paperSettlement', (s) => settlements.push(s));
+
+      await triggerSignal();
+
+      // Simulate market resolution (DOWN - opposite to YES position)
+      mockRealtimeService.emitMarketEvent({
+        conditionId: 'cond-settle-loss',
+        type: 'resolved',
+        data: { winner: 'Down' },
+        timestamp: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // Verify settlement event with loss
+      expect(settlements).toHaveLength(1);
+      expect(settlements[0].outcome).toBe('DOWN');
+      expect(settlements[0].won).toBe(false);
+      // P&L = -0.65 * 100 = -65
+      expect(settlements[0].pnl).toBe(-65);
+    });
+
+    it('should calculate NO position P&L correctly on DOWN outcome (win)', async () => {
+      testModelIntercept = MODEL_INTERCEPT_NO; // Will generate NO signal
+
+      await setupPaperTradingService('cond-no-win', { yes: 0.60, no: 0.40 });
+
+      const settlements: PaperSettlement[] = [];
+      service.on('paperSettlement', (s) => settlements.push(s));
+
+      await triggerSignal();
+
+      // Simulate market resolution (DOWN - matches NO position)
+      mockRealtimeService.emitMarketEvent({
+        conditionId: 'cond-no-win',
+        type: 'resolved',
+        data: { outcome: 'down' },
+        timestamp: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // Verify settlement event with win
+      expect(settlements).toHaveLength(1);
+      expect(settlements[0].position.side).toBe('NO');
+      expect(settlements[0].won).toBe(true);
+      // P&L = (1.0 - 0.40) * 100 = 60
+      expect(settlements[0].pnl).toBe(60);
+    });
+
+    it('should track cumulative P&L across multiple settlements', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      const config = createTestConfig({ dryRun: true });
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config
+      );
+
+      // Create two markets
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const btcSlug = `btc-updown-15m-${windowStartSec}`;
+      const ethSlug = `eth-updown-15m-${windowStartSec}`;
+
+      const btcMarket = createTestMarket('cond-cumul-1', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      const ethMarket = createTestMarket('cond-cumul-2', ethSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+
+      mockMarketService.mockGetMarket.mockImplementation(async (id: string) => {
+        if (id === btcSlug) return btcMarket;
+        if (id === ethSlug) return ethMarket;
+        throw new Error('Not found');
+      });
+
+      await service.start();
+
+      // Emit prices to trigger signals for both markets
+      mockRealtimeService.emitPrice({
+        symbol: 'BTC/USD',
+        price: TEST_BTC_PRICE,
+        timestamp: TEST_WINDOW_START,
+      });
+      mockRealtimeService.emitPrice({
+        symbol: 'ETH/USD',
+        price: 3500,
+        timestamp: TEST_WINDOW_START,
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // First settlement (win): P&L = (1 - 0.5) * 100 = 50
+      mockRealtimeService.emitMarketEvent({
+        conditionId: 'cond-cumul-1',
+        type: 'resolved',
+        data: { winner: 'Up' },
+        timestamp: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // Check intermediate stats
+      let stats = service.getPaperTradingStats();
+      expect(stats.cumulativePnL).toBe(50);
+
+      // Second settlement (loss): P&L = -0.5 * 100 = -50
+      mockRealtimeService.emitMarketEvent({
+        conditionId: 'cond-cumul-2',
+        type: 'resolved',
+        data: { winner: 'Down' },
+        timestamp: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // Check final cumulative P&L
+      stats = service.getPaperTradingStats();
+      expect(stats.cumulativePnL).toBe(0); // 50 - 50 = 0
+    });
+
+    it('should subscribe to market events only in dry-run mode', async () => {
+      // Test with dryRun: true
+      const config1 = createTestConfig({ dryRun: true });
+      const service1 = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config1
+      );
+
+      await service1.start();
+      expect(mockRealtimeService.mockSubscribeMarketEvents).toHaveBeenCalled();
+      service1.stop();
+
+      // Reset mock
+      mockRealtimeService.mockSubscribeMarketEvents.mockClear();
+
+      // Test with dryRun: false
+      const config2 = createTestConfig({ dryRun: false });
+      const service2 = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config2
+      );
+
+      await service2.start();
+      expect(mockRealtimeService.mockSubscribeMarketEvents).not.toHaveBeenCalled();
+      service2.stop();
+    });
+
+    it('should not call TradingService in dry-run mode', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      await setupPaperTradingService('cond-no-trade', { yes: 0.50, no: 0.50 });
+
+      await triggerSignal();
+
+      // TradingService should NOT be called
+      expect(mockTradingService.mockCreateMarketOrder).not.toHaveBeenCalled();
+    });
+
+    it('should remove paper position after settlement', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      await setupPaperTradingService('cond-remove', { yes: 0.50, no: 0.50 });
+
+      await triggerSignal();
+
+      // Should have 1 position
+      expect(service.getPaperTradingStats().positionCount).toBe(1);
+
+      // Settle the position
+      mockRealtimeService.emitMarketEvent({
+        conditionId: 'cond-remove',
+        type: 'resolved',
+        data: { winner: 'Up' },
+        timestamp: Date.now(),
+      });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // Position should be removed after settlement
+      expect(service.getPaperTradingStats().positionCount).toBe(0);
+    });
+
+    it('should clear paper trading state on stop()', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      await setupPaperTradingService('cond-clear', { yes: 0.50, no: 0.50 });
+
+      await triggerSignal();
+
+      // Should have 1 position before stop
+      expect(service.getPaperTradingStats().positionCount).toBe(1);
+
+      // Stop the service
+      service.stop();
+
+      // Paper trading state should be cleared
+      expect(service.getPaperTradingStats().positionCount).toBe(0);
+      expect(service.getPaperTradingStats().cumulativePnL).toBe(0);
     });
   });
 });

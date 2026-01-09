@@ -113,6 +113,56 @@ export interface ExecutionResult {
 }
 
 /**
+ * Paper position for dry-run mode tracking
+ */
+export interface PaperPosition {
+  /** Market ID */
+  marketId: string;
+  /** Market slug */
+  slug: string;
+  /** Crypto asset symbol (BTC, ETH, SOL, XRP) */
+  symbol: CryptoAsset;
+  /** Position side */
+  side: 'YES' | 'NO';
+  /** Entry price (0-1) */
+  entryPrice: number;
+  /** Position size in USD */
+  size: number;
+  /** Model confidence (0-1) */
+  confidence: number;
+  /** When position was opened */
+  timestamp: Date;
+}
+
+/**
+ * Paper settlement result when market resolves
+ */
+export interface PaperSettlement {
+  /** The paper position that was settled */
+  position: PaperPosition;
+  /** Market outcome: 'UP' (YES wins) or 'DOWN' (NO wins) */
+  outcome: 'UP' | 'DOWN';
+  /** Whether the position won */
+  won: boolean;
+  /** Realized P&L in USD */
+  pnl: number;
+  /** When the settlement occurred */
+  timestamp: Date;
+}
+
+/**
+ * Paper trading statistics snapshot
+ */
+export interface PaperTradingStats {
+  /** Number of open paper positions */
+  positionCount: number;
+  /** Cumulative realized P&L in USD */
+  cumulativePnL: number;
+  /** Snapshot of current open positions (copy, not live reference) */
+  positions: PaperPosition[];
+}
+
+/**
  * Market tracker maintaining state for each active market
  */
 interface MarketTracker {
@@ -178,6 +228,10 @@ export interface Crypto15MLStrategyEvents {
   error: [Error];
   marketAdded: [MarketAddedEvent];
   marketRemoved: [MarketRemovedEvent];
+  /** Emitted when a paper position is recorded in dry-run mode */
+  paperPosition: [PaperPosition];
+  /** Emitted when a paper position is settled (market resolved) in dry-run mode */
+  paperSettlement: [PaperSettlement];
 }
 
 /**
@@ -299,9 +353,16 @@ export class Crypto15MLStrategyService extends EventEmitter {
   private trackersBySymbol: Map<string, Set<string>> = new Map();
 
   private priceSubscription: Subscription | null = null;
+  private marketEventSubscription: Subscription | null = null;
   private predictiveScanInterval: ReturnType<typeof setInterval> | null = null;
   private reactiveScanInterval: ReturnType<typeof setInterval> | null = null;
   private cleanupInterval: ReturnType<typeof setInterval> | null = null;
+
+  /** Paper positions for dry-run mode (marketId -> PaperPosition) */
+  private paperPositions: Map<string, PaperPosition> = new Map();
+
+  /** Cumulative paper P&L for dry-run mode */
+  private paperPnL = 0;
 
   private running = false;
 
@@ -439,6 +500,11 @@ export class Crypto15MLStrategyService extends EventEmitter {
       // Subscribe to price updates
       this.subscribeToPriceUpdates();
 
+      // Subscribe to market resolutions for paper trading (dry-run mode only)
+      if (this.config.dryRun) {
+        this.subscribeToMarketResolutions();
+      }
+
       // Run initial scans
       await this.scanUpcomingMarkets();
       await this.scanActiveMarkets();
@@ -461,7 +527,11 @@ export class Crypto15MLStrategyService extends EventEmitter {
       );
 
       this.running = true;
-      this.log('Crypto15MLStrategyService started successfully');
+      if (this.config.dryRun) {
+        this.log('[DRY-RUN] Crypto15MLStrategyService started in dry-run mode (no real trades)');
+      } else {
+        this.log('Crypto15MLStrategyService started successfully');
+      }
     } catch (error) {
       // Cleanup any partially initialized resources
       this.cleanupOnStartFailure();
@@ -478,6 +548,10 @@ export class Crypto15MLStrategyService extends EventEmitter {
       this.priceSubscription.unsubscribe();
       this.priceSubscription = null;
     }
+    if (this.marketEventSubscription) {
+      this.marketEventSubscription.unsubscribe();
+      this.marketEventSubscription = null;
+    }
     if (this.predictiveScanInterval) {
       clearInterval(this.predictiveScanInterval);
       this.predictiveScanInterval = null;
@@ -493,6 +567,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
     this.models.clear();
     this.trackers.clear();
     this.trackersBySlug.clear();
+    this.paperPositions.clear();
+    this.paperPnL = 0;
     // Don't clear trackersBySymbol - it was pre-allocated in constructor
   }
 
@@ -510,10 +586,21 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     this.log('Stopping Crypto15MLStrategyService...');
 
+    // Log paper trading summary if in dry-run mode (always log, even if no open positions)
+    if (this.config.dryRun) {
+      this.log(`[DRY-RUN] Final stats: ${this.paperPositions.size} open positions, cumulative P&L: ${this.formatPnL(this.paperPnL)}`);
+    }
+
     // Unsubscribe from prices
     if (this.priceSubscription) {
       this.priceSubscription.unsubscribe();
       this.priceSubscription = null;
+    }
+
+    // Unsubscribe from market events (paper trading)
+    if (this.marketEventSubscription) {
+      this.marketEventSubscription.unsubscribe();
+      this.marketEventSubscription = null;
     }
 
     // Clear intervals
@@ -534,6 +621,10 @@ export class Crypto15MLStrategyService extends EventEmitter {
     this.trackers.clear();
     this.trackersBySlug.clear();
     this.trackersBySymbol.clear();
+
+    // Clear paper trading state
+    this.paperPositions.clear();
+    this.paperPnL = 0;
 
     this.running = false;
     this.log('Crypto15MLStrategyService stopped');
@@ -1030,7 +1121,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
     }
 
     if (this.config.dryRun) {
-      this.log(`[DRY RUN] Would execute: ${signal.slug} ${signal.side} @ ${signal.entryPrice.toFixed(3)}`);
+      // Record paper position for tracking
+      this.recordPaperPosition(signal);
 
       const executionResult: ExecutionResult = {
         signal,
@@ -1192,5 +1284,241 @@ export class Crypto15MLStrategyService extends EventEmitter {
     const errorObj = error instanceof Error ? error : new Error(String(error));
     this.log(`Error: ${errorObj.message}`);
     this.emit('error', errorObj);
+  }
+
+  // ============================================================================
+  // Paper Trading (Dry-Run Mode)
+  // ============================================================================
+
+  /** Maximum number of paper positions to prevent unbounded memory growth */
+  private static readonly MAX_PAPER_POSITIONS = 1000;
+
+  /**
+   * Fields to check for market outcome, in priority order.
+   * 'winner' is the standard field for resolved markets,
+   * 'outcome' and 'winning_outcome' are fallbacks for alternative event formats.
+   */
+  private static readonly OUTCOME_FIELD_NAMES = ['winner', 'outcome', 'winning_outcome'] as const;
+
+  /**
+   * Format P&L value as a display string with +/- prefix
+   */
+  private formatPnL(pnl: number): string {
+    return pnl >= 0 ? `+$${pnl.toFixed(2)}` : `-$${Math.abs(pnl).toFixed(2)}`;
+  }
+
+  /**
+   * Determine if a position wins based on side and outcome
+   */
+  private isWinningPosition(side: 'YES' | 'NO', outcome: 'UP' | 'DOWN'): boolean {
+    return (side === 'YES' && outcome === 'UP') ||
+           (side === 'NO' && outcome === 'DOWN');
+  }
+
+  /**
+   * Record a paper position for dry-run mode
+   *
+   * Stores the position without executing a real trade.
+   * Emits 'paperPosition' event for tracking.
+   */
+  private recordPaperPosition(signal: Signal): void {
+    // Guard: prevent overwriting existing position
+    if (this.paperPositions.has(signal.conditionId)) {
+      this.log(`[DRY-RUN] Warning: Paper position already exists for ${signal.conditionId}, skipping`);
+      return;
+    }
+
+    // Guard: prevent unbounded memory growth
+    if (this.paperPositions.size >= Crypto15MLStrategyService.MAX_PAPER_POSITIONS) {
+      const oldestKey = this.paperPositions.keys().next().value;
+      if (oldestKey) {
+        this.paperPositions.delete(oldestKey);
+        this.log(`[DRY-RUN] Evicted oldest paper position due to limit`);
+      }
+    }
+
+    const position: PaperPosition = {
+      marketId: signal.conditionId,
+      slug: signal.slug,
+      symbol: signal.asset,
+      side: signal.side,
+      entryPrice: signal.entryPrice,
+      size: this.config.positionSizeUsd,
+      confidence: signal.probability,
+      timestamp: new Date(),
+    };
+
+    this.paperPositions.set(signal.conditionId, position);
+
+    this.log(
+      `[DRY-RUN] Signal: BUY ${signal.side} @ ${signal.entryPrice.toFixed(2)} | ` +
+      `confidence: ${signal.probability.toFixed(2)} | market: ${signal.slug}`
+    );
+
+    this.emit('paperPosition', position);
+  }
+
+  /**
+   * Calculate paper P&L for a resolved market
+   *
+   * P&L calculation:
+   * - If YES position and outcome = UP: pnl = (1.0 - entryPrice) * size
+   * - If YES position and outcome = DOWN: pnl = -entryPrice * size
+   * - If NO position and outcome = DOWN: pnl = (1.0 - entryPrice) * size
+   * - If NO position and outcome = UP: pnl = -entryPrice * size
+   *
+   * Returns object with both pnl and won flag to avoid duplicate calculation.
+   */
+  private calculatePaperPnL(
+    position: PaperPosition,
+    outcome: 'UP' | 'DOWN'
+  ): { pnl: number; won: boolean } {
+    const won = this.isWinningPosition(position.side, outcome);
+
+    if (won) {
+      // Win: profit = (1 - entryPrice) * size
+      return { pnl: (1.0 - position.entryPrice) * position.size, won };
+    } else {
+      // Loss: loss = -entryPrice * size
+      return { pnl: -position.entryPrice * position.size, won };
+    }
+  }
+
+  /**
+   * Handle market resolution event for paper trading
+   *
+   * Called when a market resolves. Looks up any paper position
+   * for this market, calculates P&L, and emits settlement event.
+   */
+  private handleMarketResolution(conditionId: string, outcome: 'UP' | 'DOWN'): void {
+    const position = this.paperPositions.get(conditionId);
+    if (!position) {
+      return; // No paper position for this market
+    }
+
+    const { pnl, won } = this.calculatePaperPnL(position, outcome);
+
+    // Update cumulative P&L
+    this.paperPnL += pnl;
+
+    const settlement: PaperSettlement = {
+      position,
+      outcome,
+      won,
+      pnl,
+      timestamp: new Date(),
+    };
+
+    this.log(
+      `[DRY-RUN] Settlement: ${won ? 'WIN' : 'LOSS'} | ` +
+      `entry: ${position.entryPrice.toFixed(2)} | pnl: ${this.formatPnL(pnl)}`
+    );
+
+    this.emit('paperSettlement', settlement);
+
+    // Remove settled position
+    this.paperPositions.delete(conditionId);
+  }
+
+  /**
+   * Subscribe to market resolution events for paper trading
+   *
+   * Uses realtimeService to get market lifecycle events.
+   * When a market resolves, triggers paper P&L calculation.
+   * Only call this method when dryRun mode is enabled.
+   */
+  private subscribeToMarketResolutions(): void {
+    this.marketEventSubscription = this.realtimeService.subscribeMarketEvents({
+      onMarketEvent: (event) => {
+        try {
+          if (event.type !== 'resolved') {
+            return;
+          }
+
+          // Check if we have a paper position for this market
+          if (!this.paperPositions.has(event.conditionId)) {
+            return;
+          }
+
+          // Determine outcome from event data
+          // The resolved market data should indicate which outcome won
+          const outcome = this.parseMarketOutcome(event);
+          if (outcome) {
+            this.handleMarketResolution(event.conditionId, outcome);
+          }
+        } catch (error) {
+          this.emit('error', error instanceof Error ? error : new Error(String(error)));
+        }
+      },
+    });
+
+    this.log('[DRY-RUN] Subscribed to market resolution events');
+  }
+
+  /**
+   * Parse outcome string to UP/DOWN using strict matching
+   *
+   * Uses exact match after normalization to avoid false positives
+   * from strings like "notupbutdown".
+   */
+  private parseOutcomeString(value: unknown): 'UP' | 'DOWN' | null {
+    if (value == null) return null;
+
+    const normalized = String(value).toLowerCase().trim();
+
+    // Strict equality matching for known outcome values
+    if (normalized === 'up' || normalized === 'yes') {
+      return 'UP';
+    }
+    if (normalized === 'down' || normalized === 'no') {
+      return 'DOWN';
+    }
+
+    return null;
+  }
+
+  /**
+   * Parse market outcome from resolution event
+   *
+   * Tries to determine if the market resolved UP or DOWN
+   * from the event data. Uses strict matching to avoid
+   * false positives from malformed data.
+   */
+  private parseMarketOutcome(event: { data?: Record<string, unknown> }): 'UP' | 'DOWN' | null {
+    // Guard against malformed events
+    if (!event?.data || typeof event.data !== 'object') {
+      this.log(`[DRY-RUN] Malformed event data, skipping resolution`);
+      return null;
+    }
+
+    const data = event.data;
+
+    // Check known fields in priority order
+    for (const field of Crypto15MLStrategyService.OUTCOME_FIELD_NAMES) {
+      const result = this.parseOutcomeString(data[field]);
+      if (result) {
+        return result;
+      }
+    }
+
+    // Could not determine outcome - skip this resolution
+    this.log(`[DRY-RUN] Could not parse outcome from event data, skipping resolution`);
+    return null;
+  }
+
+  /**
+   * Get current paper trading statistics
+   *
+   * Returns a snapshot of the current paper trading state.
+   * The positions array is a copy - modifications do not affect internal state.
+   *
+   * @returns Current paper trading statistics snapshot
+   */
+  getPaperTradingStats(): PaperTradingStats {
+    return {
+      positionCount: this.paperPositions.size,
+      cumulativePnL: this.paperPnL,
+      positions: Array.from(this.paperPositions.values()),
+    };
   }
 }
