@@ -137,6 +137,53 @@ interface MarketTracker {
   createdAt: number;
 }
 
+/**
+ * Information about a market tracker (public view)
+ */
+export interface TrackerInfo {
+  conditionId: string;
+  slug: string;
+  asset: CryptoAsset;
+  endTime: number;
+  traded: boolean;
+}
+
+/**
+ * Event payload for marketAdded event
+ */
+export interface MarketAddedEvent {
+  conditionId: string;
+  slug: string;
+  asset: CryptoAsset;
+  endTime: number;
+}
+
+/**
+ * Event payload for marketRemoved event
+ */
+export interface MarketRemovedEvent {
+  conditionId: string;
+  slug: string;
+  asset: CryptoAsset;
+  traded: boolean;
+}
+
+/**
+ * Typed events emitted by Crypto15MLStrategyService
+ */
+export interface Crypto15MLStrategyEvents {
+  signal: [Signal];
+  execution: [ExecutionResult];
+  error: [Error];
+  marketAdded: [MarketAddedEvent];
+  marketRemoved: [MarketRemovedEvent];
+}
+
+/**
+ * Valid CryptoAsset values for validation
+ */
+const VALID_ASSETS: readonly CryptoAsset[] = ['BTC', 'ETH', 'SOL', 'XRP'] as const;
+
 // ============================================================================
 // Constants
 // ============================================================================
@@ -190,10 +237,30 @@ const ASSET_TO_SYMBOL: Record<CryptoAsset, string> = {
 // Crypto15MLStrategyService Implementation
 // ============================================================================
 
+/**
+ * Declaration merging for typed EventEmitter
+ */
+export declare interface Crypto15MLStrategyService {
+  on<K extends keyof Crypto15MLStrategyEvents>(
+    event: K,
+    listener: (...args: Crypto15MLStrategyEvents[K]) => void
+  ): this;
+  emit<K extends keyof Crypto15MLStrategyEvents>(
+    event: K,
+    ...args: Crypto15MLStrategyEvents[K]
+  ): boolean;
+}
+
 export class Crypto15MLStrategyService extends EventEmitter {
   private config: Crypto15MLConfig;
   private models: Map<string, Crypto15LRModel> = new Map();
   private trackers: Map<string, MarketTracker> = new Map();
+
+  /** Secondary index: slug -> conditionId for O(1) lookup */
+  private trackersBySlug: Map<string, string> = new Map();
+
+  /** Secondary index: symbol -> Set<conditionId> for O(1) price routing */
+  private trackersBySymbol: Map<string, Set<string>> = new Map();
 
   private priceSubscription: Subscription | null = null;
   private predictiveScanInterval: ReturnType<typeof setInterval> | null = null;
@@ -209,6 +276,10 @@ export class Crypto15MLStrategyService extends EventEmitter {
     config: Crypto15MLConfig
   ) {
     super();
+
+    // Validate configuration
+    this.validateConfig(config);
+
     // Deep copy config to prevent external mutation
     this.config = {
       ...config,
@@ -216,6 +287,30 @@ export class Crypto15MLStrategyService extends EventEmitter {
       symbols: [...config.symbols],
       thresholdBps: { ...config.thresholdBps },
     };
+  }
+
+  /**
+   * Validate configuration parameters
+   */
+  private validateConfig(config: Crypto15MLConfig): void {
+    if (config.positionSizeUsd <= 0) {
+      throw new Error('positionSizeUsd must be positive');
+    }
+    if (config.yesThreshold < 0 || config.yesThreshold > 1) {
+      throw new Error('yesThreshold must be between 0 and 1');
+    }
+    if (config.noThreshold < 0 || config.noThreshold > 1) {
+      throw new Error('noThreshold must be between 0 and 1');
+    }
+    if (config.entryPriceCap < 0 || config.entryPriceCap > 1) {
+      throw new Error('entryPriceCap must be between 0 and 1');
+    }
+    if (config.stateMinutes.some(m => m < 0 || m > 14)) {
+      throw new Error('stateMinutes values must be between 0 and 14');
+    }
+    if (config.symbols.length === 0) {
+      throw new Error('symbols array cannot be empty');
+    }
   }
 
   // ============================================================================
@@ -318,8 +413,10 @@ export class Crypto15MLStrategyService extends EventEmitter {
       this.cleanupInterval = null;
     }
 
-    // Clear trackers
+    // Clear trackers and secondary indexes
     this.trackers.clear();
+    this.trackersBySlug.clear();
+    this.trackersBySymbol.clear();
 
     this.running = false;
     this.log('Crypto15MLStrategyService stopped');
@@ -342,13 +439,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
   /**
    * Get information about all active trackers
    */
-  getTrackers(): Array<{
-    conditionId: string;
-    slug: string;
-    asset: CryptoAsset;
-    endTime: number;
-    traded: boolean;
-  }> {
+  getTrackers(): TrackerInfo[] {
     return Array.from(this.trackers.values()).map(t => ({
       conditionId: t.conditionId,
       slug: t.slug,
@@ -373,49 +464,53 @@ export class Crypto15MLStrategyService extends EventEmitter {
     const now = Date.now();
     const currentWindowStart = Math.floor(now / WINDOW_MS) * WINDOW_MS;
 
-    // Look ahead: current window + 2 future windows (30 minutes total)
-    const windowsToCheck = [
-      currentWindowStart,
-      currentWindowStart + WINDOW_MS,
-      currentWindowStart + WINDOW_MS * 2,
-    ];
+    // Calculate number of windows based on lookahead constant
+    const windowCount = Math.ceil(PREDICTIVE_LOOKAHEAD_MS / WINDOW_MS);
+    const windowsToCheck = Array.from(
+      { length: windowCount },
+      (_, i) => currentWindowStart + WINDOW_MS * i
+    );
 
     this.log(`Predictive scan: checking ${windowsToCheck.length} windows for ${SUPPORTED_COINS.length} coins`);
 
+    // Build list of slugs to check (excluding already tracked)
+    const slugsToCheck: string[] = [];
     for (const windowStartMs of windowsToCheck) {
       const windowStartSec = Math.floor(windowStartMs / 1000);
-
       for (const coin of SUPPORTED_COINS) {
         const slug = `${coin}-updown-15m-${windowStartSec}`;
-
-        // Skip if we already have this tracker
-        if (this.hasTrackerForSlug(slug)) {
-          continue;
+        if (!this.hasTrackerForSlug(slug)) {
+          slugsToCheck.push(slug);
         }
+      }
+    }
 
-        try {
-          // Try to fetch market by slug using MarketService.getMarket()
-          // which accepts both condition IDs and slugs
-          const unifiedMarket = await this.marketService.getMarket(slug);
-          if (unifiedMarket && unifiedMarket.active && !unifiedMarket.closed) {
-            // Create a minimal GammaMarket-like object for addMarketTracker
-            const market: GammaMarket = {
-              id: unifiedMarket.conditionId,
-              conditionId: unifiedMarket.conditionId,
-              slug: unifiedMarket.slug,
-              question: unifiedMarket.question,
-              outcomes: unifiedMarket.tokens.map(t => t.outcome),
-              outcomePrices: unifiedMarket.tokens.map(t => t.price),
-              volume: unifiedMarket.volume,
-              liquidity: unifiedMarket.liquidity,
-              active: unifiedMarket.active,
-              closed: unifiedMarket.closed,
-              endDate: unifiedMarket.endDate,
-            };
-            await this.addMarketTracker(market);
-          }
-        } catch {
-          // Market doesn't exist yet, that's OK for predictive scanning
+    if (slugsToCheck.length === 0) {
+      this.log('Predictive scan: all markets already tracked');
+      return;
+    }
+
+    // Parallelize API calls for better performance
+    const results = await Promise.allSettled(
+      slugsToCheck.map(async (slug) => {
+        const unifiedMarket = await this.marketService.getMarket(slug);
+        return { slug, unifiedMarket };
+      })
+    );
+
+    // Process results - pass UnifiedMarket directly to avoid redundant API call
+    for (const result of results) {
+      if (result.status === 'fulfilled') {
+        const { unifiedMarket } = result.value;
+        if (unifiedMarket && unifiedMarket.active && !unifiedMarket.closed) {
+          await this.addMarketTrackerFromUnified(unifiedMarket);
+        }
+      } else {
+        // Market doesn't exist yet - expected for future windows
+        // Only log in debug mode to avoid noise
+        if (this.config.debug) {
+          const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
+          this.log(`Predictive scan: market not found (expected): ${reason}`);
         }
       }
     }
@@ -455,14 +550,35 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
-   * Add a market tracker for a discovered market
+   * Add a market tracker for a discovered market (from GammaMarket)
    *
-   * Uses MarketService.getMarket() to fetch complete market data including token IDs.
+   * Fetches complete market data via MarketService and delegates to addMarketTrackerFromUnified.
+   * Used by scanActiveMarkets which receives GammaMarket from the API.
    */
   private async addMarketTracker(market: GammaMarket): Promise<void> {
-    const asset = this.inferAssetFromSlug(market.slug);
+    // Fetch full market data with token IDs
+    let unifiedMarket: UnifiedMarket;
+    try {
+      unifiedMarket = await this.marketService.getMarket(market.conditionId);
+    } catch (error) {
+      const msg = error instanceof Error ? error.message : String(error);
+      this.log(`Could not fetch full market data for ${market.slug}: ${msg}`);
+      return;
+    }
+
+    await this.addMarketTrackerFromUnified(unifiedMarket);
+  }
+
+  /**
+   * Add a market tracker from UnifiedMarket data
+   *
+   * Core implementation that creates and registers a tracker.
+   * Used directly by scanUpcomingMarkets to avoid redundant API calls.
+   */
+  private async addMarketTrackerFromUnified(unifiedMarket: UnifiedMarket): Promise<void> {
+    const asset = this.inferAssetFromSlug(unifiedMarket.slug);
     if (!asset) {
-      this.log(`Could not infer asset from slug: ${market.slug}`);
+      this.log(`Could not infer asset from slug: ${unifiedMarket.slug}`);
       return;
     }
 
@@ -472,37 +588,32 @@ export class Crypto15MLStrategyService extends EventEmitter {
       return;
     }
 
-    // Fetch full market data with token IDs
-    let unifiedMarket: UnifiedMarket;
-    try {
-      unifiedMarket = await this.marketService.getMarket(market.conditionId);
-    } catch (error) {
-      this.log(`Could not fetch full market data for ${market.slug}: ${error}`);
-      return;
-    }
-
-    // Get token IDs from UnifiedMarket.tokens array
-    // Index 0 is typically YES/Up, Index 1 is NO/Down
+    // Find tokens by outcome name for robustness against API changes
+    // Crypto markets use 'Up'/'Down', but we also check 'Yes'/'No' for compatibility
     if (!unifiedMarket.tokens || unifiedMarket.tokens.length < 2) {
-      this.log(`Market ${market.slug} does not have required tokens`);
+      this.log(`Market ${unifiedMarket.slug} does not have required tokens`);
       return;
     }
 
-    const yesToken = unifiedMarket.tokens[0];
-    const noToken = unifiedMarket.tokens[1];
+    const yesToken = unifiedMarket.tokens.find(
+      t => t.outcome === 'Up' || t.outcome === 'Yes'
+    );
+    const noToken = unifiedMarket.tokens.find(
+      t => t.outcome === 'Down' || t.outcome === 'No'
+    );
 
     if (!yesToken?.tokenId || !noToken?.tokenId) {
-      this.log(`Could not get token IDs for market ${market.slug}`);
+      this.log(`Could not get token IDs for market ${unifiedMarket.slug}`);
       return;
     }
 
     const tracker: MarketTracker = {
-      conditionId: market.conditionId,
-      slug: market.slug,
+      conditionId: unifiedMarket.conditionId,
+      slug: unifiedMarket.slug,
       asset,
       symbol,
       featureEngine: new Crypto15FeatureEngine(asset),
-      endTime: market.endDate.getTime(),
+      endTime: unifiedMarket.endDate.getTime(),
       tokenIds: { yes: yesToken.tokenId, no: noToken.tokenId },
       prices: {
         yes: yesToken.price ?? 0.5,
@@ -512,12 +623,25 @@ export class Crypto15MLStrategyService extends EventEmitter {
       createdAt: Date.now(),
     };
 
-    this.trackers.set(market.conditionId, tracker);
-    this.log(`Added tracker for ${market.slug} (${asset}), ends at ${new Date(tracker.endTime).toISOString()}`);
+    // Add to primary map
+    this.trackers.set(unifiedMarket.conditionId, tracker);
+
+    // Maintain secondary indexes for O(1) lookups
+    this.trackersBySlug.set(unifiedMarket.slug, unifiedMarket.conditionId);
+
+    // Add to symbol index
+    let symbolSet = this.trackersBySymbol.get(symbol);
+    if (!symbolSet) {
+      symbolSet = new Set();
+      this.trackersBySymbol.set(symbol, symbolSet);
+    }
+    symbolSet.add(unifiedMarket.conditionId);
+
+    this.log(`Added tracker for ${unifiedMarket.slug} (${asset}), ends at ${new Date(tracker.endTime).toISOString()}`);
 
     this.emit('marketAdded', {
-      conditionId: market.conditionId,
-      slug: market.slug,
+      conditionId: unifiedMarket.conditionId,
+      slug: unifiedMarket.slug,
       asset,
       endTime: tracker.endTime,
     });
@@ -558,23 +682,34 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Handle price update from WebSocket
    *
    * Routes the price to all relevant feature engines and evaluates signals.
+   * Uses secondary index for O(1) lookup instead of iterating all trackers.
    */
   private onPriceUpdate(priceUpdate: CryptoPrice): void {
-    // Convert symbol format (e.g., "BTC/USD" -> "BTC")
-    const asset = priceUpdate.symbol.split('/')[0] as CryptoAsset;
-    const symbol = ASSET_TO_SYMBOL[asset];
+    // Convert symbol format (e.g., "BTC/USD" -> "BTC") with validation
+    const asset = this.parseAssetFromPriceSymbol(priceUpdate.symbol);
+    if (!asset) {
+      return; // Unknown or invalid asset
+    }
 
+    const symbol = ASSET_TO_SYMBOL[asset];
     if (!symbol) {
-      return; // Unknown asset
+      return; // Unknown symbol mapping
     }
 
     const price = priceUpdate.price;
     const timestamp = priceUpdate.timestamp;
 
+    // Use secondary index for O(1) lookup of trackers by symbol
+    const trackerIds = this.trackersBySymbol.get(symbol);
+    if (!trackerIds || trackerIds.size === 0) {
+      return; // No trackers for this symbol
+    }
+
     // Route price to all trackers for this symbol
-    for (const tracker of this.trackers.values()) {
-      if (tracker.symbol !== symbol) {
-        continue;
+    for (const conditionId of trackerIds) {
+      const tracker = this.trackers.get(conditionId);
+      if (!tracker) {
+        continue; // Tracker was removed
       }
 
       // Ingest price and get features if at minute boundary
@@ -585,6 +720,20 @@ export class Crypto15MLStrategyService extends EventEmitter {
         this.evaluateSignal(tracker, features);
       }
     }
+  }
+
+  /**
+   * Parse and validate CryptoAsset from price symbol (e.g., "BTC/USD" -> "BTC")
+   */
+  private parseAssetFromPriceSymbol(symbol: string): CryptoAsset | null {
+    const slashIndex = symbol.indexOf('/');
+    const prefix = slashIndex > 0 ? symbol.substring(0, slashIndex) : symbol;
+
+    // Validate against known assets
+    if (VALID_ASSETS.includes(prefix as CryptoAsset)) {
+      return prefix as CryptoAsset;
+    }
+    return null;
   }
 
   // ============================================================================
@@ -662,19 +811,20 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     this.log(`Signal generated: ${tracker.slug} ${side} @ ${entryPrice.toFixed(3)} (prob=${prediction.probability.toFixed(3)}, z=${prediction.linearCombination.toFixed(3)})`);
 
+    // Mark as traded BEFORE async execution to prevent race conditions
+    // This ensures rapid price updates don't trigger duplicate trades
+    tracker.traded = true;
+
     this.emit('signal', signal);
 
-    // Execute the signal
-    this.executeSignal(tracker, signal);
+    // Execute the signal (fire-and-forget with error handling)
+    this.executeSignal(tracker, signal).catch(e => this.handleError(e));
   }
 
   /**
    * Execute a trading signal by placing a market order
    */
   private async executeSignal(tracker: MarketTracker, signal: Signal): Promise<void> {
-    // Mark as traded to prevent duplicate trades
-    tracker.traded = true;
-
     if (this.config.dryRun) {
       this.log(`[DRY RUN] Would execute: ${signal.slug} ${signal.side} @ ${signal.entryPrice.toFixed(3)}`);
 
@@ -740,35 +890,47 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Remove trackers for expired markets
    *
    * Runs every 30 seconds.
+   * Maintains secondary indexes when removing trackers.
    */
   private cleanupStaleTrackers(): void {
     const now = Date.now();
-    const expiredIds: string[] = [];
+    const expired: Array<[string, MarketTracker]> = [];
 
     for (const [conditionId, tracker] of this.trackers) {
       // Remove if market has ended
       if (tracker.endTime < now) {
-        expiredIds.push(conditionId);
+        expired.push([conditionId, tracker]);
       }
     }
 
-    for (const conditionId of expiredIds) {
-      const tracker = this.trackers.get(conditionId);
-      if (tracker) {
-        this.log(`Removing expired tracker: ${tracker.slug}`);
-        this.trackers.delete(conditionId);
+    for (const [conditionId, tracker] of expired) {
+      this.log(`Removing expired tracker: ${tracker.slug}`);
 
-        this.emit('marketRemoved', {
-          conditionId,
-          slug: tracker.slug,
-          asset: tracker.asset,
-          traded: tracker.traded,
-        });
+      // Remove from primary map
+      this.trackers.delete(conditionId);
+
+      // Remove from secondary indexes
+      this.trackersBySlug.delete(tracker.slug);
+
+      const symbolSet = this.trackersBySymbol.get(tracker.symbol);
+      if (symbolSet) {
+        symbolSet.delete(conditionId);
+        // Clean up empty sets
+        if (symbolSet.size === 0) {
+          this.trackersBySymbol.delete(tracker.symbol);
+        }
       }
+
+      this.emit('marketRemoved', {
+        conditionId,
+        slug: tracker.slug,
+        asset: tracker.asset,
+        traded: tracker.traded,
+      });
     }
 
-    if (expiredIds.length > 0) {
-      this.log(`Cleaned up ${expiredIds.length} expired trackers, ${this.trackers.size} remaining`);
+    if (expired.length > 0) {
+      this.log(`Cleaned up ${expired.length} expired trackers, ${this.trackers.size} remaining`);
     }
   }
 
@@ -798,14 +960,10 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
   /**
    * Check if we already have a tracker for a given slug
+   * Uses secondary index for O(1) lookup
    */
   private hasTrackerForSlug(slug: string): boolean {
-    for (const tracker of this.trackers.values()) {
-      if (tracker.slug === slug) {
-        return true;
-      }
-    }
-    return false;
+    return this.trackersBySlug.has(slug);
   }
 
   /**
