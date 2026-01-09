@@ -22,6 +22,7 @@
  */
 
 import { EventEmitter } from 'events';
+import { resolve, normalize } from 'path';
 import {
   Crypto15FeatureEngine,
   type CryptoAsset,
@@ -233,6 +234,41 @@ const ASSET_TO_SYMBOL: Record<CryptoAsset, string> = {
   XRP: 'XRPUSDT',
 };
 
+/** Maximum reasonable crypto price for validation (prevents extreme outliers) */
+const MAX_REASONABLE_PRICE: Record<CryptoAsset, number> = {
+  BTC: 1_000_000, // $1M max for BTC
+  ETH: 100_000,   // $100K max for ETH
+  SOL: 10_000,    // $10K max for SOL
+  XRP: 1_000,     // $1K max for XRP
+};
+
+/** Allowed base directory for model files */
+const ALLOWED_MODEL_DIR = resolve(process.cwd(), 'models');
+
+/**
+ * Type guard for CryptoAsset
+ */
+function isCryptoAsset(value: string): value is CryptoAsset {
+  return (VALID_ASSETS as readonly string[]).includes(value);
+}
+
+/**
+ * Check if an error is transient and should allow retry
+ */
+function isTransientError(error: unknown): boolean {
+  if (!(error instanceof Error)) return false;
+  const msg = error.message.toLowerCase();
+  return (
+    msg.includes('timeout') ||
+    msg.includes('network') ||
+    msg.includes('econnreset') ||
+    msg.includes('econnrefused') ||
+    msg.includes('rate limit') ||
+    msg.includes('503') ||
+    msg.includes('502')
+  );
+}
+
 // ============================================================================
 // Crypto15MLStrategyService Implementation
 // ============================================================================
@@ -277,6 +313,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
   ) {
     super();
 
+    // Increase max listeners to avoid warnings with multiple consumers
+    this.setMaxListeners(50);
+
     // Validate configuration
     this.validateConfig(config);
 
@@ -287,6 +326,11 @@ export class Crypto15MLStrategyService extends EventEmitter {
       symbols: [...config.symbols],
       thresholdBps: { ...config.thresholdBps },
     };
+
+    // Pre-allocate trackersBySymbol Sets for configured symbols
+    for (const symbol of this.config.symbols) {
+      this.trackersBySymbol.set(symbol, new Set());
+    }
   }
 
   /**
@@ -302,6 +346,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
     if (config.noThreshold < 0 || config.noThreshold > 1) {
       throw new Error('noThreshold must be between 0 and 1');
     }
+    if (config.noThreshold >= config.yesThreshold) {
+      throw new Error('noThreshold must be less than yesThreshold');
+    }
     if (config.entryPriceCap < 0 || config.entryPriceCap > 1) {
       throw new Error('entryPriceCap must be between 0 and 1');
     }
@@ -310,6 +357,42 @@ export class Crypto15MLStrategyService extends EventEmitter {
     }
     if (config.symbols.length === 0) {
       throw new Error('symbols array cannot be empty');
+    }
+
+    // Validate model paths are within allowed directory (prevent path traversal)
+    this.validateModelPath(config.modelPath, 'modelPath');
+    this.validateModelPath(config.imputationPath, 'imputationPath');
+
+    // Validate thresholdBps contains values for all configured symbols
+    for (const symbol of config.symbols) {
+      const asset = SYMBOL_TO_ASSET[symbol];
+      if (!asset) {
+        throw new Error(`Unknown symbol: ${symbol}`);
+      }
+      if (typeof config.thresholdBps[asset] !== 'number') {
+        throw new Error(`Missing thresholdBps for asset ${asset} (symbol ${symbol})`);
+      }
+      if (config.thresholdBps[asset] <= 0) {
+        throw new Error(`thresholdBps for ${asset} must be positive`);
+      }
+    }
+  }
+
+  /**
+   * Validate that a model path is within the allowed directory
+   */
+  private validateModelPath(filePath: string, fieldName: string): void {
+    const normalizedPath = normalize(filePath);
+    const resolvedPath = resolve(filePath);
+
+    // Check for path traversal attempts
+    if (normalizedPath.includes('..')) {
+      throw new Error(`${fieldName} contains path traversal (..)`);
+    }
+
+    // Check that path is within allowed directory
+    if (!resolvedPath.startsWith(ALLOWED_MODEL_DIR)) {
+      throw new Error(`${fieldName} must be within ${ALLOWED_MODEL_DIR}`);
     }
   }
 
@@ -320,6 +403,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
   /**
    * Start the strategy service
    *
+   * - Requires realtimeService to be connected
    * - Loads models from JSON files
    * - Subscribes to crypto price feeds
    * - Starts predictive and reactive market scanning
@@ -336,11 +420,16 @@ export class Crypto15MLStrategyService extends EventEmitter {
       return;
     }
 
+    // Require realtimeService to be connected before starting
+    if (!this.realtimeService.isConnected()) {
+      throw new Error('RealtimeService must be connected before starting Crypto15MLStrategyService');
+    }
+
     this.log('Starting Crypto15MLStrategyService...');
 
     try {
       // Load models with imputations
-      this.log(`Loading models from ${this.config.modelPath}...`);
+      this.log('Loading models...');
       this.models = await loadModelsWithImputations(
         this.config.modelPath,
         this.config.imputationPath
@@ -374,9 +463,37 @@ export class Crypto15MLStrategyService extends EventEmitter {
       this.running = true;
       this.log('Crypto15MLStrategyService started successfully');
     } catch (error) {
+      // Cleanup any partially initialized resources
+      this.cleanupOnStartFailure();
       this.handleError(error);
       throw error;
     }
+  }
+
+  /**
+   * Cleanup resources when start() fails partway through
+   */
+  private cleanupOnStartFailure(): void {
+    if (this.priceSubscription) {
+      this.priceSubscription.unsubscribe();
+      this.priceSubscription = null;
+    }
+    if (this.predictiveScanInterval) {
+      clearInterval(this.predictiveScanInterval);
+      this.predictiveScanInterval = null;
+    }
+    if (this.reactiveScanInterval) {
+      clearInterval(this.reactiveScanInterval);
+      this.reactiveScanInterval = null;
+    }
+    if (this.cleanupInterval) {
+      clearInterval(this.cleanupInterval);
+      this.cleanupInterval = null;
+    }
+    this.models.clear();
+    this.trackers.clear();
+    this.trackersBySlug.clear();
+    // Don't clear trackersBySymbol - it was pre-allocated in constructor
   }
 
   /**
@@ -574,8 +691,14 @@ export class Crypto15MLStrategyService extends EventEmitter {
    *
    * Core implementation that creates and registers a tracker.
    * Used directly by scanUpcomingMarkets to avoid redundant API calls.
+   * Thread-safe: checks for duplicates before adding to prevent race conditions.
    */
   private async addMarketTrackerFromUnified(unifiedMarket: UnifiedMarket): Promise<void> {
+    // Check for duplicate tracker (race condition prevention for parallel discovery)
+    if (this.trackers.has(unifiedMarket.conditionId)) {
+      return; // Already tracking this market
+    }
+
     const asset = this.inferAssetFromSlug(unifiedMarket.slug);
     if (!asset) {
       this.log(`Could not infer asset from slug: ${unifiedMarket.slug}`);
@@ -607,13 +730,20 @@ export class Crypto15MLStrategyService extends EventEmitter {
       return;
     }
 
+    // Validate endDate exists
+    const endTime = unifiedMarket.endDate?.getTime();
+    if (!endTime || endTime <= Date.now()) {
+      this.log(`Market ${unifiedMarket.slug} has invalid or past endDate`);
+      return;
+    }
+
     const tracker: MarketTracker = {
       conditionId: unifiedMarket.conditionId,
       slug: unifiedMarket.slug,
       asset,
       symbol,
       featureEngine: new Crypto15FeatureEngine(asset),
-      endTime: unifiedMarket.endDate.getTime(),
+      endTime,
       tokenIds: { yes: yesToken.tokenId, no: noToken.tokenId },
       prices: {
         yes: yesToken.price ?? 0.5,
@@ -683,6 +813,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
    *
    * Routes the price to all relevant feature engines and evaluates signals.
    * Uses secondary index for O(1) lookup instead of iterating all trackers.
+   * Validates price data to prevent manipulation attacks.
    */
   private onPriceUpdate(priceUpdate: CryptoPrice): void {
     // Convert symbol format (e.g., "BTC/USD" -> "BTC") with validation
@@ -698,6 +829,12 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     const price = priceUpdate.price;
     const timestamp = priceUpdate.timestamp;
+
+    // Validate price data to prevent manipulation
+    if (!this.isValidPrice(price, asset)) {
+      this.log(`Invalid price rejected for ${asset}: ${price}`);
+      return;
+    }
 
     // Use secondary index for O(1) lookup of trackers by symbol
     const trackerIds = this.trackersBySymbol.get(symbol);
@@ -723,15 +860,65 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
+   * Validate that a price is reasonable (not negative, not extreme outlier)
+   */
+  private isValidPrice(price: number, asset: CryptoAsset): boolean {
+    if (price <= 0 || !Number.isFinite(price)) {
+      return false;
+    }
+    const maxPrice = MAX_REASONABLE_PRICE[asset];
+    if (price > maxPrice) {
+      return false;
+    }
+    return true;
+  }
+
+  /**
+   * Refresh tracker prices from market service
+   *
+   * Fetches current market prices to avoid stale entry price decisions.
+   * Returns null if refresh fails (non-critical - will use cached prices).
+   */
+  private async refreshTrackerPrices(
+    tracker: MarketTracker
+  ): Promise<{ yes: number; no: number } | null> {
+    try {
+      const market = await this.marketService.getMarket(tracker.conditionId);
+      if (!market?.tokens || market.tokens.length < 2) {
+        return null;
+      }
+
+      const yesToken = market.tokens.find(t => t.outcome === 'Up' || t.outcome === 'Yes');
+      const noToken = market.tokens.find(t => t.outcome === 'Down' || t.outcome === 'No');
+
+      if (!yesToken?.price || !noToken?.price) {
+        return null;
+      }
+
+      // Update tracker cache
+      tracker.prices.yes = yesToken.price;
+      tracker.prices.no = noToken.price;
+
+      return { yes: yesToken.price, no: noToken.price };
+    } catch {
+      // Non-critical failure - log only in debug mode
+      if (this.config.debug) {
+        this.log(`Could not refresh prices for ${tracker.slug}`);
+      }
+      return null;
+    }
+  }
+
+  /**
    * Parse and validate CryptoAsset from price symbol (e.g., "BTC/USD" -> "BTC")
    */
   private parseAssetFromPriceSymbol(symbol: string): CryptoAsset | null {
     const slashIndex = symbol.indexOf('/');
     const prefix = slashIndex > 0 ? symbol.substring(0, slashIndex) : symbol;
 
-    // Validate against known assets
-    if (VALID_ASSETS.includes(prefix as CryptoAsset)) {
-      return prefix as CryptoAsset;
+    // Use type guard for validation
+    if (isCryptoAsset(prefix)) {
+      return prefix;
     }
     return null;
   }
@@ -809,7 +996,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       features,
     };
 
-    this.log(`Signal generated: ${tracker.slug} ${side} @ ${entryPrice.toFixed(3)} (prob=${prediction.probability.toFixed(3)}, z=${prediction.linearCombination.toFixed(3)})`);
+    this.log(`Signal generated: ${tracker.slug} ${side} @ ${entryPrice.toFixed(3)} (prob=${prediction.probability.toFixed(3)})`);
 
     // Mark as traded BEFORE async execution to prevent race conditions
     // This ensures rapid price updates don't trigger duplicate trades
@@ -823,8 +1010,25 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
   /**
    * Execute a trading signal by placing a market order
+   *
+   * Refreshes market prices before execution to ensure entry price is current.
    */
   private async executeSignal(tracker: MarketTracker, signal: Signal): Promise<void> {
+    // Refresh market prices before execution to avoid stale entry prices
+    const freshPrices = await this.refreshTrackerPrices(tracker);
+    if (freshPrices) {
+      // Re-validate entry price with fresh data
+      const freshEntryPrice = signal.side === 'YES' ? freshPrices.yes : freshPrices.no;
+      if (freshEntryPrice > this.config.entryPriceCap) {
+        this.log(`Fresh entry price ${freshEntryPrice.toFixed(3)} exceeds cap, skipping execution for ${tracker.slug}`);
+        // Reset traded flag since we didn't actually trade
+        tracker.traded = false;
+        return;
+      }
+      // Update signal with fresh price for accurate logging
+      signal.entryPrice = freshEntryPrice;
+    }
+
     if (this.config.dryRun) {
       this.log(`[DRY RUN] Would execute: ${signal.slug} ${signal.side} @ ${signal.entryPrice.toFixed(3)}`);
 
@@ -860,7 +1064,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       };
 
       if (orderResult.success) {
-        this.log(`Order executed: ${signal.slug} ${signal.side}, orderId=${orderResult.orderId}`);
+        this.log(`Order executed: ${signal.slug} ${signal.side}`);
       } else {
         this.log(`Order failed: ${signal.slug} ${signal.side}, error=${orderResult.errorMsg}`);
       }
@@ -868,6 +1072,12 @@ export class Crypto15MLStrategyService extends EventEmitter {
       this.emit('execution', executionResult);
     } catch (error) {
       this.handleError(error);
+
+      // Reset traded flag on transient errors to allow retry on next price tick
+      if (isTransientError(error)) {
+        tracker.traded = false;
+        this.log(`Transient error for ${tracker.slug}, will retry`);
+      }
 
       const executionResult: ExecutionResult = {
         signal,
