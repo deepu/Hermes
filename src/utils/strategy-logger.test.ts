@@ -1,0 +1,233 @@
+/**
+ * Tests for StrategyLogger
+ *
+ * Part of #9
+ */
+
+import { describe, it, expect, vi, beforeEach, afterEach } from 'vitest';
+import {
+  StrategyLogger,
+  createCrypto15MLLogger,
+  LogEvents,
+  type LogEntry,
+} from './strategy-logger.js';
+
+describe('StrategyLogger', () => {
+  let consoleSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  describe('constructor', () => {
+    it('should create logger with required config', () => {
+      const logger = new StrategyLogger({ strategy: 'TestStrategy' });
+      expect(logger.isEnabled()).toBe(true);
+    });
+
+    it('should respect enabled config', () => {
+      const logger = new StrategyLogger({ strategy: 'Test', enabled: false });
+      expect(logger.isEnabled()).toBe(false);
+    });
+
+    it('should use default values for optional config', () => {
+      const logger = new StrategyLogger({ strategy: 'Test' });
+      logger.info('test_event', {});
+
+      expect(consoleSpy).toHaveBeenCalledTimes(1);
+      const logOutput = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+      expect(logOutput._service).toBe('hermes');
+      expect(logOutput._app).toBe('trading');
+    });
+  });
+
+  describe('info', () => {
+    it('should log INFO level with correct structure', () => {
+      const logger = new StrategyLogger({ strategy: 'Crypto15ML' });
+      logger.info(LogEvents.STRATEGY_STARTED, { message: 'Strategy started' });
+
+      expect(consoleSpy).toHaveBeenCalledTimes(1);
+      const logOutput: LogEntry = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+
+      expect(logOutput.level).toBe('INFO');
+      expect(logOutput.strategy).toBe('Crypto15ML');
+      expect(logOutput.event).toBe('strategy_started');
+      expect(logOutput.message).toBe('Strategy started');
+      expect(logOutput.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
+    });
+
+    it('should include context fields', () => {
+      const logger = new StrategyLogger({ strategy: 'Crypto15ML' });
+      logger.info(LogEvents.SIGNAL_GENERATED, {
+        marketId: '0xabc123',
+        symbol: 'BTCUSDT',
+        slug: 'btc-updown-15m-1767456000',
+        stateMinute: 2,
+        side: 'YES',
+        confidence: 0.73,
+        entryPrice: 0.65,
+        modelProbability: 0.73,
+        imputedFeatures: 0,
+      });
+
+      const logOutput: LogEntry = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+      expect(logOutput.marketId).toBe('0xabc123');
+      expect(logOutput.symbol).toBe('BTCUSDT');
+      expect(logOutput.slug).toBe('btc-updown-15m-1767456000');
+      expect(logOutput.stateMinute).toBe(2);
+      expect(logOutput.side).toBe('YES');
+      expect(logOutput.confidence).toBe(0.73);
+      expect(logOutput.entryPrice).toBe(0.65);
+      expect(logOutput.modelProbability).toBe(0.73);
+      expect(logOutput.imputedFeatures).toBe(0);
+    });
+  });
+
+  describe('warn', () => {
+    it('should log WARN level', () => {
+      const logger = new StrategyLogger({ strategy: 'Crypto15ML' });
+      logger.warn(LogEvents.SIGNAL_REJECTED, {
+        slug: 'btc-updown-15m-1767456000',
+        message: 'Entry price too high',
+      });
+
+      const logOutput: LogEntry = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+      expect(logOutput.level).toBe('WARN');
+      expect(logOutput.event).toBe('signal_rejected');
+    });
+  });
+
+  describe('error', () => {
+    it('should log ERROR level', () => {
+      const logger = new StrategyLogger({ strategy: 'Crypto15ML' });
+      logger.error(LogEvents.EXECUTION_FAILED, {
+        error: 'Order rejected',
+        errorCode: 'insufficient_funds',
+      });
+
+      const logOutput: LogEntry = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+      expect(logOutput.level).toBe('ERROR');
+      expect(logOutput.event).toBe('execution_failed');
+      expect(logOutput.error).toBe('Order rejected');
+      expect(logOutput.errorCode).toBe('insufficient_funds');
+    });
+  });
+
+  describe('disabled logging', () => {
+    it('should not log when disabled', () => {
+      const logger = new StrategyLogger({ strategy: 'Test', enabled: false });
+      logger.info('test_event', {});
+      logger.warn('test_warn', {});
+      logger.error('test_error', {});
+
+      expect(consoleSpy).not.toHaveBeenCalled();
+    });
+
+    it('should support runtime enable/disable', () => {
+      const logger = new StrategyLogger({ strategy: 'Test', enabled: true });
+
+      logger.info('first', {});
+      expect(consoleSpy).toHaveBeenCalledTimes(1);
+
+      logger.setEnabled(false);
+      logger.info('second', {});
+      expect(consoleSpy).toHaveBeenCalledTimes(1); // Still 1
+
+      logger.setEnabled(true);
+      logger.info('third', {});
+      expect(consoleSpy).toHaveBeenCalledTimes(2);
+    });
+  });
+
+  describe('Railway metadata', () => {
+    it('should include Railway-specific fields', () => {
+      const logger = new StrategyLogger({
+        strategy: 'Crypto15ML',
+        service: 'hermes',
+        app: 'trading',
+        environment: 'production',
+      });
+      logger.info('test', {});
+
+      const logOutput: LogEntry = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+      expect(logOutput._service).toBe('hermes');
+      expect(logOutput._app).toBe('trading');
+      expect(logOutput._env).toBe('production');
+    });
+  });
+
+  describe('JSON format', () => {
+    it('should output valid single-line JSON', () => {
+      const logger = new StrategyLogger({ strategy: 'Test' });
+      logger.info('event', { key: 'value' });
+
+      const output = consoleSpy.mock.calls[0][0] as string;
+
+      // Should not contain newlines
+      expect(output).not.toContain('\n');
+
+      // Should be valid JSON
+      expect(() => JSON.parse(output)).not.toThrow();
+    });
+
+    it('should handle special characters in strings', () => {
+      const logger = new StrategyLogger({ strategy: 'Test' });
+      logger.info('event', { message: 'Line1\nLine2\tTabbed' });
+
+      const output = consoleSpy.mock.calls[0][0] as string;
+      const parsed = JSON.parse(output);
+
+      expect(parsed.message).toBe('Line1\nLine2\tTabbed');
+    });
+  });
+});
+
+describe('createCrypto15MLLogger', () => {
+  let consoleSpy: ReturnType<typeof vi.spyOn>;
+
+  beforeEach(() => {
+    consoleSpy = vi.spyOn(console, 'log').mockImplementation(() => {});
+  });
+
+  afterEach(() => {
+    consoleSpy.mockRestore();
+  });
+
+  it('should create logger with Crypto15ML strategy name', () => {
+    const logger = createCrypto15MLLogger();
+    logger.info('test', {});
+
+    const logOutput = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+    expect(logOutput.strategy).toBe('Crypto15ML');
+  });
+
+  it('should allow overriding options except strategy', () => {
+    const logger = createCrypto15MLLogger({ enabled: true, service: 'custom-service' });
+    logger.info('test', {});
+
+    const logOutput = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+    expect(logOutput.strategy).toBe('Crypto15ML');
+    expect(logOutput._service).toBe('custom-service');
+  });
+});
+
+describe('LogEvents', () => {
+  it('should have all expected event types', () => {
+    expect(LogEvents.STRATEGY_STARTED).toBe('strategy_started');
+    expect(LogEvents.STRATEGY_STOPPED).toBe('strategy_stopped');
+    expect(LogEvents.MODELS_LOADED).toBe('models_loaded');
+    expect(LogEvents.SIGNAL_GENERATED).toBe('signal_generated');
+    expect(LogEvents.SIGNAL_REJECTED).toBe('signal_rejected');
+    expect(LogEvents.EXECUTION_SUCCESS).toBe('execution_success');
+    expect(LogEvents.EXECUTION_FAILED).toBe('execution_failed');
+    expect(LogEvents.MARKET_ADDED).toBe('market_added');
+    expect(LogEvents.MARKET_REMOVED).toBe('market_removed');
+    expect(LogEvents.PAPER_POSITION).toBe('paper_position');
+    expect(LogEvents.PAPER_SETTLEMENT).toBe('paper_settlement');
+    expect(LogEvents.ERROR).toBe('error');
+  });
+});
