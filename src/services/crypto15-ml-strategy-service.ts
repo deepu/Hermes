@@ -572,8 +572,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     this.log('Stopping Crypto15MLStrategyService...');
 
-    // Log paper trading summary if in dry-run mode
-    if (this.config.dryRun && this.paperPositions.size > 0) {
+    // Log paper trading summary if in dry-run mode (always log, even if no open positions)
+    if (this.config.dryRun) {
       const pnlStr = this.paperPnL >= 0 ? `+$${this.paperPnL.toFixed(2)}` : `-$${Math.abs(this.paperPnL).toFixed(2)}`;
       this.log(`[DRY-RUN] Final stats: ${this.paperPositions.size} open positions, cumulative P&L: ${pnlStr}`);
     }
@@ -1277,6 +1277,17 @@ export class Crypto15MLStrategyService extends EventEmitter {
   // Paper Trading (Dry-Run Mode)
   // ============================================================================
 
+  /** Maximum number of paper positions to prevent unbounded memory growth */
+  private static readonly MAX_PAPER_POSITIONS = 1000;
+
+  /**
+   * Determine if a position wins based on side and outcome
+   */
+  private isWinningPosition(side: 'YES' | 'NO', outcome: 'UP' | 'DOWN'): boolean {
+    return (side === 'YES' && outcome === 'UP') ||
+           (side === 'NO' && outcome === 'DOWN');
+  }
+
   /**
    * Record a paper position for dry-run mode
    *
@@ -1284,6 +1295,21 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Emits 'paperPosition' event for tracking.
    */
   private recordPaperPosition(signal: Signal): void {
+    // Guard: prevent overwriting existing position
+    if (this.paperPositions.has(signal.conditionId)) {
+      this.log(`[DRY-RUN] Warning: Paper position already exists for ${signal.conditionId}, skipping`);
+      return;
+    }
+
+    // Guard: prevent unbounded memory growth
+    if (this.paperPositions.size >= Crypto15MLStrategyService.MAX_PAPER_POSITIONS) {
+      const oldestKey = this.paperPositions.keys().next().value;
+      if (oldestKey) {
+        this.paperPositions.delete(oldestKey);
+        this.log(`[DRY-RUN] Evicted oldest paper position due to limit`);
+      }
+    }
+
     const position: PaperPosition = {
       marketId: signal.conditionId,
       slug: signal.slug,
@@ -1313,18 +1339,21 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * - If YES position and outcome = DOWN: pnl = -entryPrice * size
    * - If NO position and outcome = DOWN: pnl = (1.0 - entryPrice) * size
    * - If NO position and outcome = UP: pnl = -entryPrice * size
+   *
+   * Returns object with both pnl and won flag to avoid duplicate calculation.
    */
-  private calculatePaperPnL(position: PaperPosition, outcome: 'UP' | 'DOWN'): number {
-    const won =
-      (position.side === 'YES' && outcome === 'UP') ||
-      (position.side === 'NO' && outcome === 'DOWN');
+  private calculatePaperPnL(
+    position: PaperPosition,
+    outcome: 'UP' | 'DOWN'
+  ): { pnl: number; won: boolean } {
+    const won = this.isWinningPosition(position.side, outcome);
 
     if (won) {
       // Win: profit = (1 - entryPrice) * size
-      return (1.0 - position.entryPrice) * position.size;
+      return { pnl: (1.0 - position.entryPrice) * position.size, won };
     } else {
       // Loss: loss = -entryPrice * size
-      return -position.entryPrice * position.size;
+      return { pnl: -position.entryPrice * position.size, won };
     }
   }
 
@@ -1340,10 +1369,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       return; // No paper position for this market
     }
 
-    const pnl = this.calculatePaperPnL(position, outcome);
-    const won =
-      (position.side === 'YES' && outcome === 'UP') ||
-      (position.side === 'NO' && outcome === 'DOWN');
+    const { pnl, won } = this.calculatePaperPnL(position, outcome);
 
     // Update cumulative P&L
     this.paperPnL += pnl;
@@ -1381,20 +1407,24 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     this.marketEventSubscription = this.realtimeService.subscribeMarketEvents({
       onMarketEvent: (event) => {
-        if (event.type !== 'resolved') {
-          return;
-        }
+        try {
+          if (event.type !== 'resolved') {
+            return;
+          }
 
-        // Check if we have a paper position for this market
-        if (!this.paperPositions.has(event.conditionId)) {
-          return;
-        }
+          // Check if we have a paper position for this market
+          if (!this.paperPositions.has(event.conditionId)) {
+            return;
+          }
 
-        // Determine outcome from event data
-        // The resolved market data should indicate which outcome won
-        const outcome = this.parseMarketOutcome(event);
-        if (outcome) {
-          this.handleMarketResolution(event.conditionId, outcome);
+          // Determine outcome from event data
+          // The resolved market data should indicate which outcome won
+          const outcome = this.parseMarketOutcome(event);
+          if (outcome) {
+            this.handleMarketResolution(event.conditionId, outcome);
+          }
+        } catch (error) {
+          this.emit('error', error instanceof Error ? error : new Error(String(error)));
         }
       },
     });
@@ -1403,51 +1433,49 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
+   * Parse outcome string to UP/DOWN using strict matching
+   *
+   * Uses exact match after normalization to avoid false positives
+   * from strings like "notupbutdown".
+   */
+  private parseOutcomeString(value: unknown): 'UP' | 'DOWN' | null {
+    if (value == null) return null;
+
+    const normalized = String(value).toLowerCase().trim();
+
+    // Strict equality matching for known outcome values
+    if (normalized === 'up' || normalized === 'yes') {
+      return 'UP';
+    }
+    if (normalized === 'down' || normalized === 'no') {
+      return 'DOWN';
+    }
+
+    return null;
+  }
+
+  /**
    * Parse market outcome from resolution event
    *
    * Tries to determine if the market resolved UP or DOWN
-   * from the event data.
+   * from the event data. Uses strict matching to avoid
+   * false positives from malformed data.
    */
   private parseMarketOutcome(event: { data: Record<string, unknown> }): 'UP' | 'DOWN' | null {
-    // The event data should contain resolution info
-    // Common patterns: winner, outcome, resolved_outcome
     const data = event.data;
 
-    // Check for winner field (token that won)
-    if (data.winner) {
-      const winner = String(data.winner).toLowerCase();
-      if (winner.includes('up') || winner.includes('yes')) {
-        return 'UP';
-      }
-      if (winner.includes('down') || winner.includes('no')) {
-        return 'DOWN';
+    // Check known fields in priority order
+    const fieldsToCheck = ['winner', 'outcome', 'winning_outcome'];
+
+    for (const field of fieldsToCheck) {
+      const result = this.parseOutcomeString(data[field]);
+      if (result) {
+        return result;
       }
     }
 
-    // Check for outcome field
-    if (data.outcome) {
-      const outcome = String(data.outcome).toLowerCase();
-      if (outcome.includes('up') || outcome.includes('yes')) {
-        return 'UP';
-      }
-      if (outcome.includes('down') || outcome.includes('no')) {
-        return 'DOWN';
-      }
-    }
-
-    // Check for winning_outcome
-    if (data.winning_outcome) {
-      const winning = String(data.winning_outcome).toLowerCase();
-      if (winning.includes('up') || winning.includes('yes')) {
-        return 'UP';
-      }
-      if (winning.includes('down') || winning.includes('no')) {
-        return 'DOWN';
-      }
-    }
-
-    // Fallback: query market service to get resolution
-    this.log(`Could not parse outcome from event data, will query market`);
+    // Could not determine outcome - skip this resolution
+    this.log(`Could not parse outcome from event data, skipping resolution`);
     return null;
   }
 

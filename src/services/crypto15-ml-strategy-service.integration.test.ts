@@ -1494,11 +1494,23 @@ describe('Crypto15MLStrategyService Integration', () => {
   // ============================================================================
 
   describe('Paper Trading: Dry-Run Mode', () => {
-    it('should emit paperPosition event when signal is generated in dry-run mode', async () => {
-      // Set high intercept to guarantee signal generation
-      testModelIntercept = 3.0;
+    // Helper constants for paper trading tests
+    const WINDOW_START_SEC = Math.floor(TEST_WINDOW_START / 1000);
+    const MODEL_INTERCEPT_YES = 3.0;
+    const MODEL_INTERCEPT_NO = -3.0;
 
-      const config = createTestConfig({ dryRun: true });
+    // Helper to create and start service with paper trading enabled
+    async function setupPaperTradingService(
+      conditionId: string,
+      prices: { yes: number; no: number },
+      configOverrides: Partial<Crypto15MLConfig> = {}
+    ): Promise<{ slug: string; market: UnifiedMarket }> {
+      const slug = `btc-updown-15m-${WINDOW_START_SEC}`;
+      const market = createTestMarket(conditionId, slug, TEST_END_TIME, prices);
+
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({ dryRun: true, ...configOverrides });
       service = new Crypto15MLStrategyService(
         mockMarketService,
         mockTradingService,
@@ -1506,29 +1518,34 @@ describe('Crypto15MLStrategyService Integration', () => {
         config
       );
 
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-paper-1', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
-
-      mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
-
-      const paperPositions: PaperPosition[] = [];
-      service.on('paperPosition', (pos) => paperPositions.push(pos));
-
       await service.start();
+      return { slug, market };
+    }
 
-      // Emit price to trigger signal
+    // Helper to trigger a signal by emitting a price
+    async function triggerSignal(): Promise<void> {
       mockRealtimeService.emitPrice({
         symbol: 'BTC/USD',
         price: TEST_BTC_PRICE,
         timestamp: TEST_WINDOW_START,
       });
       await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+    }
+
+    it('should emit paperPosition event when signal is generated in dry-run mode', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      const { slug } = await setupPaperTradingService('cond-paper-1', { yes: 0.50, no: 0.50 });
+
+      const paperPositions: PaperPosition[] = [];
+      service.on('paperPosition', (pos) => paperPositions.push(pos));
+
+      await triggerSignal();
 
       // Verify paperPosition event was emitted
       expect(paperPositions).toHaveLength(1);
       expect(paperPositions[0].marketId).toBe('cond-paper-1');
-      expect(paperPositions[0].slug).toBe(btcSlug);
+      expect(paperPositions[0].slug).toBe(slug);
       expect(paperPositions[0].symbol).toBe('BTC');
       expect(paperPositions[0].side).toBe('YES');
       expect(paperPositions[0].entryPrice).toBe(0.50);
@@ -1536,31 +1553,11 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should track paper position correctly after signal', async () => {
-      testModelIntercept = 3.0;
+      testModelIntercept = MODEL_INTERCEPT_YES;
 
-      const config = createTestConfig({ dryRun: true, positionSizeUsd: 50 });
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config
-      );
+      await setupPaperTradingService('cond-paper-track', { yes: 0.60, no: 0.40 }, { positionSizeUsd: 50 });
 
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-paper-track', btcSlug, TEST_END_TIME, { yes: 0.60, no: 0.40 });
-
-      mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
-
-      await service.start();
-
-      // Emit price to trigger signal
-      mockRealtimeService.emitPrice({
-        symbol: 'BTC/USD',
-        price: TEST_BTC_PRICE,
-        timestamp: TEST_WINDOW_START,
-      });
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await triggerSignal();
 
       // Verify paper trading stats
       const stats = service.getPaperTradingStats();
@@ -1569,34 +1566,14 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should emit paperSettlement event when market resolves UP with YES position', async () => {
-      testModelIntercept = 3.0;
+      testModelIntercept = MODEL_INTERCEPT_YES;
 
-      const config = createTestConfig({ dryRun: true });
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config
-      );
-
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-settle-up', btcSlug, TEST_END_TIME, { yes: 0.60, no: 0.40 });
-
-      mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
+      await setupPaperTradingService('cond-settle-up', { yes: 0.60, no: 0.40 });
 
       const settlements: PaperSettlement[] = [];
       service.on('paperSettlement', (s) => settlements.push(s));
 
-      await service.start();
-
-      // Emit price to trigger YES signal
-      mockRealtimeService.emitPrice({
-        symbol: 'BTC/USD',
-        price: TEST_BTC_PRICE,
-        timestamp: TEST_WINDOW_START,
-      });
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await triggerSignal();
 
       // Simulate market resolution (UP)
       mockRealtimeService.emitMarketEvent({
@@ -1616,34 +1593,14 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should emit paperSettlement with loss when market resolves opposite to position', async () => {
-      testModelIntercept = 3.0; // Will generate YES signal
+      testModelIntercept = MODEL_INTERCEPT_YES; // Will generate YES signal
 
-      const config = createTestConfig({ dryRun: true });
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config
-      );
-
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-settle-loss', btcSlug, TEST_END_TIME, { yes: 0.65, no: 0.35 });
-
-      mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
+      await setupPaperTradingService('cond-settle-loss', { yes: 0.65, no: 0.35 });
 
       const settlements: PaperSettlement[] = [];
       service.on('paperSettlement', (s) => settlements.push(s));
 
-      await service.start();
-
-      // Emit price to trigger YES signal (entry at 0.65)
-      mockRealtimeService.emitPrice({
-        symbol: 'BTC/USD',
-        price: TEST_BTC_PRICE,
-        timestamp: TEST_WINDOW_START,
-      });
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await triggerSignal();
 
       // Simulate market resolution (DOWN - opposite to YES position)
       mockRealtimeService.emitMarketEvent({
@@ -1663,35 +1620,14 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should calculate NO position P&L correctly on DOWN outcome (win)', async () => {
-      testModelIntercept = -3.0; // Will generate NO signal
+      testModelIntercept = MODEL_INTERCEPT_NO; // Will generate NO signal
 
-      const config = createTestConfig({ dryRun: true });
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config
-      );
-
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      // NO price at 0.40 (below entry cap)
-      const btcMarket = createTestMarket('cond-no-win', btcSlug, TEST_END_TIME, { yes: 0.60, no: 0.40 });
-
-      mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
+      await setupPaperTradingService('cond-no-win', { yes: 0.60, no: 0.40 });
 
       const settlements: PaperSettlement[] = [];
       service.on('paperSettlement', (s) => settlements.push(s));
 
-      await service.start();
-
-      // Emit price to trigger NO signal
-      mockRealtimeService.emitPrice({
-        symbol: 'BTC/USD',
-        price: TEST_BTC_PRICE,
-        timestamp: TEST_WINDOW_START,
-      });
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await triggerSignal();
 
       // Simulate market resolution (DOWN - matches NO position)
       mockRealtimeService.emitMarketEvent({
@@ -1711,7 +1647,7 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should track cumulative P&L across multiple settlements', async () => {
-      testModelIntercept = 3.0;
+      testModelIntercept = MODEL_INTERCEPT_YES;
 
       const config = createTestConfig({ dryRun: true });
       service = new Crypto15MLStrategyService(
@@ -1809,62 +1745,22 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should not call TradingService in dry-run mode', async () => {
-      testModelIntercept = 3.0;
+      testModelIntercept = MODEL_INTERCEPT_YES;
 
-      const config = createTestConfig({ dryRun: true });
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config
-      );
+      await setupPaperTradingService('cond-no-trade', { yes: 0.50, no: 0.50 });
 
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-no-trade', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
-
-      mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
-
-      await service.start();
-
-      // Emit price to trigger signal
-      mockRealtimeService.emitPrice({
-        symbol: 'BTC/USD',
-        price: TEST_BTC_PRICE,
-        timestamp: TEST_WINDOW_START,
-      });
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await triggerSignal();
 
       // TradingService should NOT be called
       expect(mockTradingService.mockCreateMarketOrder).not.toHaveBeenCalled();
     });
 
     it('should remove paper position after settlement', async () => {
-      testModelIntercept = 3.0;
+      testModelIntercept = MODEL_INTERCEPT_YES;
 
-      const config = createTestConfig({ dryRun: true });
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config
-      );
+      await setupPaperTradingService('cond-remove', { yes: 0.50, no: 0.50 });
 
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-remove', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
-
-      mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
-
-      await service.start();
-
-      // Emit price to trigger signal
-      mockRealtimeService.emitPrice({
-        symbol: 'BTC/USD',
-        price: TEST_BTC_PRICE,
-        timestamp: TEST_WINDOW_START,
-      });
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await triggerSignal();
 
       // Should have 1 position
       expect(service.getPaperTradingStats().positionCount).toBe(1);
@@ -1883,31 +1779,11 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should clear paper trading state on stop()', async () => {
-      testModelIntercept = 3.0;
+      testModelIntercept = MODEL_INTERCEPT_YES;
 
-      const config = createTestConfig({ dryRun: true });
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config
-      );
+      await setupPaperTradingService('cond-clear', { yes: 0.50, no: 0.50 });
 
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-clear', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
-
-      mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
-
-      await service.start();
-
-      // Emit price to trigger signal
-      mockRealtimeService.emitPrice({
-        symbol: 'BTC/USD',
-        price: TEST_BTC_PRICE,
-        timestamp: TEST_WINDOW_START,
-      });
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await triggerSignal();
 
       // Should have 1 position before stop
       expect(service.getPaperTradingStats().positionCount).toBe(1);
