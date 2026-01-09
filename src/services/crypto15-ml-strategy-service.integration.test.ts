@@ -17,7 +17,6 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach, vi, type Mock } from 'vitest';
-import { EventEmitter } from 'events';
 import {
   Crypto15MLStrategyService,
   type Crypto15MLConfig,
@@ -40,13 +39,26 @@ import { Crypto15LRModel, type ModelConfig } from '../strategies/crypto15-lr-mod
 const WINDOW_MS = 15 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
 
-// Align timestamp to window boundary for predictable testing
-const TEST_WINDOW_START = Math.floor(Date.now() / WINDOW_MS) * WINDOW_MS + WINDOW_MS;
+// Use a fixed timestamp for reproducible tests (2024-01-01 00:00:00 UTC)
+const MOCK_TIME = 1704067200000;
+const TEST_WINDOW_START = Math.floor(MOCK_TIME / WINDOW_MS) * WINDOW_MS + WINDOW_MS;
 const TEST_END_TIME = TEST_WINDOW_START + WINDOW_MS;
+
+// Test price constant
+const TEST_BTC_PRICE = 98500;
 
 // ============================================================================
 // Mock Helpers
 // ============================================================================
+
+/**
+ * Model intercept override for per-test model behavior.
+ * Set before test to control probability output:
+ * - intercept = 3.0 -> probability ~0.95 (high YES signal)
+ * - intercept = -3.0 -> probability ~0.05 (high NO signal)
+ * - intercept = 0.0 -> probability ~0.50 (neutral)
+ */
+let testModelIntercept = 0.0;
 
 /**
  * Create a minimal valid model config for testing
@@ -60,8 +72,9 @@ function createTestModelConfig(asset: string): ModelConfig {
       'return5m', 'highLowRange', 'volatility5m', 'momentum3m', 'trendStrength',
       'aboveOpen', 'dayOfWeek', 'hourOfDay',
     ],
-    coefficients: [0.1, -0.05, 2.5, 1.0, 0.5, 0.3, 0.2, -0.1, 0.8, 0.4, 0.6, 0.01, 0.02],
-    intercept: 0.0, // Neutral base
+    // Use small coefficients so intercept dominates the output
+    coefficients: [0.01, -0.01, 0.01, 0.01, 0.01, 0.01, 0.01, -0.01, 0.01, 0.01, 0.01, 0.001, 0.001],
+    intercept: testModelIntercept,
     featureMedians: {
       stateMinute: 7,
       minutesRemaining: 8,
@@ -244,6 +257,9 @@ describe('Crypto15MLStrategyService Integration', () => {
   beforeEach(() => {
     vi.useFakeTimers();
     vi.setSystemTime(TEST_WINDOW_START);
+
+    // Reset model intercept to neutral for each test
+    testModelIntercept = 0.0;
 
     mockMarketService = createMockMarketService();
     mockTradingService = createMockTradingService();
@@ -592,18 +608,8 @@ describe('Crypto15MLStrategyService Integration', () => {
 
   describe('Signal Generation: YES signal with p >= 0.70', () => {
     it('should generate YES signal when probability exceeds threshold', async () => {
-      // Create a model that will produce high probability
-      const highProbModelConfig = createTestModelConfig('BTC');
-      highProbModelConfig.intercept = 2.0; // High bias towards YES
-      highProbModelConfig.coefficients = highProbModelConfig.coefficients.map(() => 0.1);
-
-      vi.doMock('../strategies/model-loader.js', () => ({
-        loadModelsWithImputations: vi.fn(async () => {
-          const models = new Map<string, Crypto15LRModel>();
-          models.set('BTCUSDT', new Crypto15LRModel(highProbModelConfig));
-          return models;
-        }),
-      }));
+      // Set high intercept to produce probability ~0.95 (well above 0.70 threshold)
+      testModelIntercept = 3.0;
 
       const config = createTestConfig({
         symbols: ['BTCUSDT'],
@@ -617,7 +623,7 @@ describe('Crypto15MLStrategyService Integration', () => {
         config
       );
 
-      // Setup market with low YES price (below cap)
+      // Setup market with low YES price (below entry cap of 0.70)
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
       const btcMarket = createTestMarket('cond-yes-sig', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
@@ -635,16 +641,17 @@ describe('Crypto15MLStrategyService Integration', () => {
       // Emit price at minute boundary (state minute 0)
       mockRealtimeService.emitPrice({
         symbol: 'BTC/USD',
-        price: 98500,
+        price: TEST_BTC_PRICE,
         timestamp: TEST_WINDOW_START,
       });
 
       // Wait for async processing
       await vi.advanceTimersByTimeAsync(100);
 
-      // Check if signal was generated (depends on model output)
-      // Note: Signal generation depends on model probability
-      expect(service.isRunning()).toBe(true);
+      // Verify YES signal was generated
+      expect(signals).toHaveLength(1);
+      expect(signals[0].side).toBe('YES');
+      expect(signals[0].probability).toBeGreaterThanOrEqual(0.70);
     });
 
     it('should include correct signal metadata', async () => {
@@ -732,6 +739,9 @@ describe('Crypto15MLStrategyService Integration', () => {
 
   describe('Signal Generation: Entry price cap enforcement', () => {
     it('should skip signal when entry price exceeds cap', async () => {
+      // Set high intercept to produce signal-worthy probability
+      testModelIntercept = 3.0;
+
       const config = createTestConfig({ entryPriceCap: 0.60 });
       service = new Crypto15MLStrategyService(
         mockMarketService,
@@ -742,7 +752,7 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      // Both prices above entry cap
+      // Both prices above entry cap of 0.60
       const btcMarket = createTestMarket('cond-price-cap', btcSlug, TEST_END_TIME, { yes: 0.75, no: 0.75 });
 
       mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
@@ -755,13 +765,13 @@ describe('Crypto15MLStrategyService Integration', () => {
       // Emit price
       mockRealtimeService.emitPrice({
         symbol: 'BTC/USD',
-        price: 98500,
+        price: TEST_BTC_PRICE,
         timestamp: TEST_WINDOW_START,
       });
       await vi.advanceTimersByTimeAsync(100);
 
       // Signal should not be generated due to price cap
-      // (Actual behavior depends on model probability)
+      expect(signals).toHaveLength(0);
     });
   });
 
@@ -837,6 +847,9 @@ describe('Crypto15MLStrategyService Integration', () => {
 
   describe('Signal Generation: No duplicates for same market', () => {
     it('should mark market as traded after first signal', async () => {
+      // Set high intercept to guarantee signal generation
+      testModelIntercept = 3.0;
+
       const config = createTestConfig();
       service = new Crypto15MLStrategyService(
         mockMarketService,
@@ -847,7 +860,8 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-no-dup', btcSlug, TEST_END_TIME);
+      // Use low entry price to pass price cap check
+      const btcMarket = createTestMarket('cond-no-dup', btcSlug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
 
       mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
 
@@ -856,25 +870,24 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await service.start();
 
-      // Emit multiple prices to potentially trigger signals
+      // Emit multiple prices to attempt triggering multiple signals
       for (let i = 0; i < 3; i++) {
         mockRealtimeService.emitPrice({
           symbol: 'BTC/USD',
-          price: 98500,
+          price: TEST_BTC_PRICE,
           timestamp: TEST_WINDOW_START + i * MINUTE_MS,
         });
         await vi.advanceTimersByTimeAsync(MINUTE_MS);
       }
 
-      // At most 1 signal per market
-      expect(signalCount).toBeLessThanOrEqual(1);
+      // Exactly 1 signal per market (first one wins)
+      expect(signalCount).toBe(1);
 
-      // Check tracker marked as traded
+      // Verify tracker is marked as traded
       const trackers = service.getTrackers();
       const btcTracker = trackers.find(t => t.slug === btcSlug);
-      if (signalCount > 0 && btcTracker) {
-        expect(btcTracker.traded).toBe(true);
-      }
+      expect(btcTracker).toBeDefined();
+      expect(btcTracker!.traded).toBe(true);
     });
   });
 
@@ -1005,11 +1018,11 @@ describe('Crypto15MLStrategyService Integration', () => {
         config
       );
 
-      // Create a market that will expire soon
-      const pastEndTime = TEST_WINDOW_START - 1000; // Already expired
+      // Create a market that will expire in 10 seconds (valid when added, expires during test)
+      const shortEndTime = TEST_WINDOW_START + 10 * 1000;
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
-      const btcMarket = createTestMarket('cond-expire', btcSlug, pastEndTime);
+      const btcMarket = createTestMarket('cond-expire', btcSlug, shortEndTime);
 
       mockMarketService.mockGetMarket.mockResolvedValue(btcMarket);
 
@@ -1018,13 +1031,16 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await service.start();
 
-      // Advance past cleanup interval (30 seconds)
-      vi.advanceTimersByTime(35 * 1000);
+      // Verify tracker was added
+      expect(service.getTrackerCount()).toBe(1);
 
-      await vi.advanceTimersByTimeAsync(100);
+      // Advance time past market expiration (10s) and cleanup interval (30s)
+      await vi.advanceTimersByTimeAsync(50 * 1000);
 
-      // Expired tracker should be removed
-      // Note: The market may not be added if endDate is in the past
+      // Verify tracker was removed and event emitted
+      expect(service.getTrackerCount()).toBe(0);
+      expect(removedEvents).toHaveLength(1);
+      expect(removedEvents[0].slug).toBe(btcSlug);
     });
   });
 
@@ -1042,8 +1058,8 @@ describe('Crypto15MLStrategyService Integration', () => {
         config
       );
 
-      // Create market that will expire
-      const shortEndTime = TEST_WINDOW_START + 10 * 1000; // Expires in 10 seconds
+      // Create market that will expire in 10 seconds
+      const shortEndTime = TEST_WINDOW_START + 10 * 1000;
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const btcSlug = `btc-updown-15m-${windowStartSec}`;
       const btcMarket = createTestMarket('cond-cleanup', btcSlug, shortEndTime);
@@ -1052,17 +1068,14 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await service.start();
 
-      const initialCount = service.getTrackerCount();
+      // Verify tracker was created
+      expect(service.getTrackerCount()).toBe(1);
 
-      // Advance time past market end
-      vi.advanceTimersByTime(15 * 1000);
+      // Advance time past market end (10s) and cleanup interval (30s)
+      await vi.advanceTimersByTimeAsync(50 * 1000);
 
-      // Advance past cleanup interval
-      vi.advanceTimersByTime(35 * 1000);
-
-      await vi.advanceTimersByTimeAsync(100);
-
-      // Tracker count should decrease (if any were created)
+      // Tracker count should be 0 after cleanup
+      expect(service.getTrackerCount()).toBe(0);
     });
   });
 
@@ -1327,7 +1340,8 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await service.start();
 
-      expect(service.getTrackerCount()).toBeGreaterThanOrEqual(0);
+      // After starting with a valid market, tracker count should be exactly 1
+      expect(service.getTrackerCount()).toBe(1);
     });
 
     it('should return tracker info correctly', async () => {
