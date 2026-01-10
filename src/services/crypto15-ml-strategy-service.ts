@@ -179,6 +179,18 @@ export interface PaperTradingStats {
 }
 
 /**
+ * Minute price snapshot during trade window
+ */
+interface TrackerMinutePrice {
+  /** Minute offset within window (0-14) */
+  minuteOffset: number;
+  /** Unix ms timestamp */
+  timestamp: number;
+  /** Spot price at this minute */
+  price: number;
+}
+
+/**
  * Market tracker maintaining state for each active market
  */
 interface MarketTracker {
@@ -202,6 +214,10 @@ interface MarketTracker {
   traded: boolean;
   /** When this tracker was created */
   createdAt: number;
+  /** Minute-level prices recorded during window (0-14) */
+  minutePrices: TrackerMinutePrice[];
+  /** Database trade ID (set after persistence, used for recording minute prices) */
+  tradeId?: number;
 }
 
 /**
@@ -889,6 +905,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       },
       traded: false,
       createdAt: Date.now(),
+      minutePrices: [],
     };
 
     // Add to primary map
@@ -996,9 +1013,61 @@ export class Crypto15MLStrategyService extends EventEmitter {
       const features = tracker.featureEngine.ingestPrice(price, timestamp);
 
       if (features) {
+        // Record minute price at each minute boundary
+        this.recordMinutePrice(tracker, features.stateMinute, price, timestamp);
+
         // We're at a minute boundary - evaluate for signal
         this.evaluateSignal(tracker, features);
       }
+    }
+  }
+
+  /**
+   * Record a minute price snapshot for a tracker
+   *
+   * Stores the price in the tracker's minutePrices array and persists
+   * to database if a trade has been recorded for this market.
+   */
+  private recordMinutePrice(
+    tracker: MarketTracker,
+    minuteOffset: number,
+    price: number,
+    timestamp: number
+  ): void {
+    // Check if we already have a price for this minute offset (avoid duplicates)
+    const existing = tracker.minutePrices.find(p => p.minuteOffset === minuteOffset);
+    if (existing) {
+      return; // Already recorded this minute
+    }
+
+    // Add to tracker's minute prices array
+    tracker.minutePrices.push({
+      minuteOffset,
+      timestamp,
+      price,
+    });
+
+    // If we have a trade ID, persist to database
+    if (tracker.tradeId && this.tradeRepository) {
+      // Use setImmediate to avoid blocking the trading hot path
+      setImmediate(async () => {
+        try {
+          await this.tradeRepository!.recordMinutePrice(
+            tracker.tradeId!,
+            minuteOffset,
+            price,
+            timestamp
+          );
+        } catch (error) {
+          // Log error but don't crash - minute price persistence is non-critical
+          this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+            marketId: tracker.conditionId,
+            minuteOffset,
+            error: error instanceof Error ? error.message : String(error),
+            message: 'Failed to persist minute price',
+          });
+        }
+      });
     }
   }
 
@@ -1470,6 +1539,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
    *
    * Uses setImmediate to avoid blocking the trading hot path.
    * Errors are logged but don't crash the service.
+   * After persistence, stores tradeId on tracker and persists any
+   * already-collected minute prices.
    */
   private persistTrade(signal: Signal, tracker: MarketTracker): void {
     const repo = this.tradeRepository;
@@ -1486,12 +1557,18 @@ export class Crypto15MLStrategyService extends EventEmitter {
         const tradeId = await repo.recordTrade(tradeRecord);
         this.persistedTrades.add(conditionId);
 
+        // Store tradeId on tracker for future minute price persistence
+        tracker.tradeId = tradeId;
+
         this.logger.info(LogEvents.TRADE_PERSISTED, {
           marketId: conditionId,
           slug: signal.slug,
           tradeId,
           message: `Trade persisted with ID ${tradeId}`,
         });
+
+        // Persist any minute prices that were collected before trade was recorded
+        await this.persistExistingMinutePrices(tracker, tradeId);
       } catch (error) {
         // Log error but don't crash - persistence is non-critical
         this.logger.error(LogEvents.PERSISTENCE_ERROR, {
@@ -1502,6 +1579,49 @@ export class Crypto15MLStrategyService extends EventEmitter {
         });
       }
     });
+  }
+
+  /**
+   * Persist any minute prices that were collected before the trade was persisted
+   *
+   * This handles the case where minute prices are recorded at minute boundaries
+   * before the trade signal is generated (which happens at state minutes 0, 1, 2).
+   */
+  private async persistExistingMinutePrices(
+    tracker: MarketTracker,
+    tradeId: number
+  ): Promise<void> {
+    const repo = this.tradeRepository;
+    if (!repo || tracker.minutePrices.length === 0) {
+      return;
+    }
+
+    try {
+      // Persist all collected minute prices
+      for (const mp of tracker.minutePrices) {
+        await repo.recordMinutePrice(
+          tradeId,
+          mp.minuteOffset,
+          mp.price,
+          mp.timestamp
+        );
+      }
+
+      this.logger.info(LogEvents.TRADE_PERSISTED, {
+        marketId: tracker.conditionId,
+        tradeId,
+        minutePriceCount: tracker.minutePrices.length,
+        message: `Persisted ${tracker.minutePrices.length} existing minute prices`,
+      });
+    } catch (error) {
+      // Non-critical - log and continue
+      this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+        marketId: tracker.conditionId,
+        tradeId,
+        error: error instanceof Error ? error.message : String(error),
+        message: 'Failed to persist existing minute prices',
+      });
+    }
   }
 
   /**
@@ -1623,6 +1743,42 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
+   * Calculate timing metrics from feature engine's window state
+   *
+   * Returns the minutes until each threshold was first hit.
+   * Returns undefined for thresholds that were never hit.
+   */
+  private calculateTimingMetrics(
+    tracker: MarketTracker
+  ): { timeToUpThreshold?: number; timeToDownThreshold?: number } {
+    const windowState = tracker.featureEngine.getState().windowState;
+    if (!windowState) {
+      return {};
+    }
+
+    return {
+      timeToUpThreshold: Number.isNaN(windowState.firstUpHitMinute)
+        ? undefined
+        : windowState.firstUpHitMinute,
+      timeToDownThreshold: Number.isNaN(windowState.firstDownHitMinute)
+        ? undefined
+        : windowState.firstDownHitMinute,
+    };
+  }
+
+  /**
+   * Get window close price from minute prices
+   *
+   * Returns the price at minute 14 (last minute of window) if available.
+   * Returns undefined if minute 14 price is not yet recorded.
+   */
+  private getWindowClosePrice(tracker: MarketTracker): number | undefined {
+    // Window minute 14 is the last minute (0-indexed, 15 minute window)
+    const closePrice = tracker.minutePrices.find(p => p.minuteOffset === 14);
+    return closePrice?.price;
+  }
+
+  /**
    * Persist outcome update to the database asynchronously
    *
    * Uses setImmediate to avoid blocking. Errors are logged but don't crash.
@@ -1705,18 +1861,30 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     // Persist outcome to database if we have a tracked trade
     if (this.persistedTrades.has(conditionId)) {
-      // Get tracker for excursion calculation (may be null if already cleaned up)
+      // Get tracker for metrics calculation (may be null if already cleaned up)
       const tracker = this.trackers.get(conditionId);
+
+      // Calculate metrics from tracker (or use defaults if tracker unavailable)
       const excursions = tracker
         ? this.calculateExcursions(tracker, position.side)
         : { mfe: 0, mae: 0 };
+
+      const timingMetrics = tracker
+        ? this.calculateTimingMetrics(tracker)
+        : {};
+
+      const windowClosePrice = tracker
+        ? this.getWindowClosePrice(tracker)
+        : undefined;
 
       const tradeOutcome: TradeOutcome = {
         outcome,
         isWin: won,
         pnl,
         resolutionTimestamp: Date.now(),
-        // windowClosePrice: not available at resolution time (Issue #27 will add minute price tracking)
+        windowClosePrice,
+        timeToUpThreshold: timingMetrics.timeToUpThreshold,
+        timeToDownThreshold: timingMetrics.timeToDownThreshold,
         maxFavorableExcursion: excursions.mfe,
         maxAdverseExcursion: excursions.mae,
       };

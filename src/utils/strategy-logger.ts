@@ -139,6 +139,10 @@ export interface LogContext {
   outcome?: 'UP' | 'DOWN';
   /** Whether trade was a win */
   isWin?: boolean;
+  /** Minute offset within window (0-14) for minute price tracking */
+  minuteOffset?: number;
+  /** Number of minute prices recorded/persisted */
+  minutePriceCount?: number;
 }
 
 /**
