@@ -192,6 +192,24 @@ export interface RegimeStats {
 }
 
 /**
+ * Statistics for a specific symbol
+ */
+export interface SymbolStats {
+  /** Symbol (BTC, ETH, SOL, XRP) */
+  symbol: string;
+  /** Total number of resolved trades */
+  totalTrades: number;
+  /** Number of winning trades */
+  wins: number;
+  /** Win rate percentage (0-100) */
+  winRate: number;
+  /** Total P&L in USD */
+  totalPnl: number;
+  /** Average P&L per trade */
+  avgPnl: number;
+}
+
+/**
  * Calibration bucket for predicted vs actual win rates
  */
 export interface CalibrationBucket {
@@ -266,8 +284,14 @@ export interface ITradeRepository {
   getTradesByDateRange(start: Date, end: Date): Promise<TradeRecord[]>;
   /** Get trades for a specific symbol */
   getTradesBySymbol(symbol: CryptoAsset): Promise<TradeRecord[]>;
+  /** Get performance statistics for a specific symbol */
+  getSymbolStats(symbol: CryptoAsset): Promise<SymbolStats>;
+  /** Get performance statistics for all symbols */
+  getAllSymbolStats(): Promise<SymbolStats[]>;
   /** Get performance statistics by volatility regime */
   getPerformanceByRegime(regime: VolatilityRegime): Promise<RegimeStats>;
+  /** Get performance statistics for all volatility regimes */
+  getAllRegimeStats(): Promise<RegimeStats[]>;
   /** Get calibration data for all probability buckets */
   getCalibrationData(): Promise<CalibrationBucket[]>;
 

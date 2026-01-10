@@ -19,6 +19,7 @@ import type {
   MinutePrice,
   ITradeRepository,
   RegimeStats,
+  SymbolStats,
   CalibrationBucket,
   DatabaseStats,
   VolatilityRegime,
@@ -133,6 +134,9 @@ export class TradeRepository implements ITradeRepository {
     selectPrices?: Statement;
     selectStats?: Statement;
     selectRegimeStats?: Statement;
+    selectSymbolStats?: Statement;
+    selectAllSymbolStats?: Statement;
+    selectAllRegimeStats?: Statement;
     selectCalibration?: Statement;
   } = {};
 
@@ -338,6 +342,45 @@ export class TradeRepository implements ITradeRepository {
         SUM(pnl) as total_pnl
       FROM trades
       WHERE volatility_regime = ? AND outcome IS NOT NULL
+    `);
+
+    this.statements.selectSymbolStats = db.prepare(`
+      SELECT
+        COUNT(*) as total_trades,
+        SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+        AVG(is_win) as win_rate,
+        AVG(pnl) as avg_pnl,
+        SUM(pnl) as total_pnl
+      FROM trades
+      WHERE symbol = ? AND outcome IS NOT NULL
+    `);
+
+    this.statements.selectAllSymbolStats = db.prepare(`
+      SELECT
+        symbol,
+        COUNT(*) as total_trades,
+        SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+        AVG(is_win) as win_rate,
+        AVG(pnl) as avg_pnl,
+        SUM(pnl) as total_pnl
+      FROM trades
+      WHERE outcome IS NOT NULL
+      GROUP BY symbol
+      ORDER BY total_trades DESC
+    `);
+
+    this.statements.selectAllRegimeStats = db.prepare(`
+      SELECT
+        volatility_regime,
+        COUNT(*) as total_trades,
+        SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+        AVG(is_win) as win_rate,
+        AVG(pnl) as avg_pnl,
+        SUM(pnl) as total_pnl
+      FROM trades
+      WHERE outcome IS NOT NULL AND volatility_regime IS NOT NULL
+      GROUP BY volatility_regime
+      ORDER BY total_trades DESC
     `);
 
     this.statements.selectCalibration = db.prepare(`
@@ -666,6 +709,80 @@ export class TradeRepository implements ITradeRepository {
       avgPnl: row.avg_pnl ?? 0,
       totalPnl: row.total_pnl ?? 0,
     };
+  }
+
+  /**
+   * Get performance statistics for all volatility regimes
+   */
+  async getAllRegimeStats(): Promise<RegimeStats[]> {
+    this.ensureInitialized();
+
+    const rows = this.getStatement('selectAllRegimeStats').all() as Array<{
+      volatility_regime: string;
+      total_trades: number;
+      wins: number;
+      win_rate: number | null;
+      avg_pnl: number | null;
+      total_pnl: number | null;
+    }>;
+
+    return rows.map((row) => ({
+      regime: row.volatility_regime as VolatilityRegime,
+      totalTrades: row.total_trades,
+      wins: row.wins ?? 0,
+      winRate: (row.win_rate ?? 0) * 100,
+      avgPnl: row.avg_pnl ?? 0,
+      totalPnl: row.total_pnl ?? 0,
+    }));
+  }
+
+  /**
+   * Get performance statistics for a specific symbol
+   */
+  async getSymbolStats(symbol: CryptoAsset): Promise<SymbolStats> {
+    this.ensureInitialized();
+
+    const row = this.getStatement('selectSymbolStats').get(symbol) as {
+      total_trades: number;
+      wins: number;
+      win_rate: number | null;
+      avg_pnl: number | null;
+      total_pnl: number | null;
+    };
+
+    return {
+      symbol,
+      totalTrades: row.total_trades,
+      wins: row.wins ?? 0,
+      winRate: (row.win_rate ?? 0) * 100,
+      totalPnl: row.total_pnl ?? 0,
+      avgPnl: row.avg_pnl ?? 0,
+    };
+  }
+
+  /**
+   * Get performance statistics for all symbols
+   */
+  async getAllSymbolStats(): Promise<SymbolStats[]> {
+    this.ensureInitialized();
+
+    const rows = this.getStatement('selectAllSymbolStats').all() as Array<{
+      symbol: string;
+      total_trades: number;
+      wins: number;
+      win_rate: number | null;
+      avg_pnl: number | null;
+      total_pnl: number | null;
+    }>;
+
+    return rows.map((row) => ({
+      symbol: row.symbol,
+      totalTrades: row.total_trades,
+      wins: row.wins ?? 0,
+      winRate: (row.win_rate ?? 0) * 100,
+      totalPnl: row.total_pnl ?? 0,
+      avgPnl: row.avg_pnl ?? 0,
+    }));
   }
 
   /**
