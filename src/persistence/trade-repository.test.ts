@@ -185,8 +185,9 @@ describe('TradeRepository', () => {
         syncMode: 'sync',
       });
 
+      // Error message is intentionally generic to avoid information disclosure
       await expect(invalidRepo.initialize()).rejects.toThrow(
-        /Database path must be within/
+        /Invalid database path/
       );
     });
   });

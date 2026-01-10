@@ -81,6 +81,10 @@ CREATE INDEX IF NOT EXISTS idx_trades_hour ON trades(hour_of_day);
 CREATE INDEX IF NOT EXISTS idx_trades_volatility ON trades(volatility_regime);
 CREATE INDEX IF NOT EXISTS idx_trades_pending ON trades(outcome) WHERE outcome IS NULL;
 
+-- Composite indexes for common query patterns
+CREATE INDEX IF NOT EXISTS idx_trades_symbol_timestamp ON trades(symbol, signal_timestamp);
+CREATE INDEX IF NOT EXISTS idx_trades_symbol_outcome ON trades(symbol, outcome) WHERE outcome IS NOT NULL;
+
 -- ============================================================================
 -- Trade Features Table (Normalized 17 features)
 -- ============================================================================
@@ -109,8 +113,9 @@ CREATE TABLE IF NOT EXISTS trade_features (
     first_up_hit_minute REAL,            -- Can be NaN, stored as NULL
     first_down_hit_minute REAL,
 
-    -- Volume (currently 0, reserved for future)
-    volume_zscore_15m REAL DEFAULT 0,
+    -- Volume z-score: placeholder for future implementation
+    -- TODO(#26): Implement volume_zscore_15m calculation when volume data is available
+    volume_zscore_15m REAL DEFAULT 0,  -- Default 0 represents neutral z-score (at mean)
 
     FOREIGN KEY (trade_id) REFERENCES trades(id) ON DELETE CASCADE
 );

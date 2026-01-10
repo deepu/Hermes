@@ -274,6 +274,10 @@ export interface ITradeRepository {
   vacuum(): Promise<void>;
   /** Get database statistics */
   getStats(): Promise<DatabaseStats>;
+
+  // === Transaction Support ===
+  /** Execute multiple operations within a single transaction */
+  transaction<T>(fn: () => T): Promise<T>;
 }
 
 // ============================================================================

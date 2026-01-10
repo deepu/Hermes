@@ -9,7 +9,7 @@
 
 import Database from 'better-sqlite3';
 import type { Statement } from 'better-sqlite3';
-import { readFileSync, existsSync, mkdirSync, statSync, readdirSync } from 'fs';
+import { readFileSync, existsSync, mkdirSync, statSync, readdirSync, realpathSync } from 'fs';
 import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
@@ -46,51 +46,60 @@ const MIGRATIONS_DIR = join(__dirname, 'migrations');
 /** Default allowed base directory for database files */
 const DEFAULT_ALLOWED_BASE_DIR = './data';
 
+/** Maximum number of IDs in a single batch query (SQLite limit is 999) */
+const MAX_BATCH_SIZE = 500;
+
+/** Maximum number of pending writes in the async queue */
+const MAX_WRITE_QUEUE_SIZE = 1000;
+
+/** SQLite busy timeout in milliseconds */
+const BUSY_TIMEOUT_MS = 5000;
+
 // ============================================================================
-// Type Validators
+// Type Validators (Generic Factory Pattern)
 // ============================================================================
 
 /**
- * Validate and cast a string to CryptoAsset
+ * Create a type assertion function for a given set of valid values.
+ * Eliminates duplication across multiple type validators.
  */
-function assertCryptoAsset(value: string): CryptoAsset {
-  if (!VALID_CRYPTO_ASSETS.includes(value as CryptoAsset)) {
-    throw new Error(`Invalid CryptoAsset: ${value}. Expected one of: ${VALID_CRYPTO_ASSETS.join(', ')}`);
-  }
-  return value as CryptoAsset;
+function createAsserter<T extends string>(
+  typeName: string,
+  validValues: readonly T[]
+): {
+  assert: (value: string) => T;
+  assertNullable: (value: string | null) => T | undefined;
+} {
+  const validSet = new Set<string>(validValues);
+
+  const assert = (value: string): T => {
+    if (!validSet.has(value)) {
+      throw new Error(
+        `Invalid ${typeName}: ${value}. Expected one of: ${validValues.join(', ')}`
+      );
+    }
+    return value as T;
+  };
+
+  const assertNullable = (value: string | null): T | undefined => {
+    if (value === null) return undefined;
+    return assert(value);
+  };
+
+  return { assert, assertNullable };
 }
 
-/**
- * Validate and cast a string to TradeSide
- */
-function assertTradeSide(value: string): TradeSide {
-  if (!VALID_TRADE_SIDES.includes(value as TradeSide)) {
-    throw new Error(`Invalid TradeSide: ${value}. Expected one of: ${VALID_TRADE_SIDES.join(', ')}`);
-  }
-  return value as TradeSide;
-}
+// Create type-safe assertion functions
+const cryptoAssetAsserter = createAsserter<CryptoAsset>('CryptoAsset', VALID_CRYPTO_ASSETS);
+const tradeSideAsserter = createAsserter<TradeSide>('TradeSide', VALID_TRADE_SIDES);
+const volatilityRegimeAsserter = createAsserter<VolatilityRegime>('VolatilityRegime', VALID_VOLATILITY_REGIMES);
+const tradeOutcomeAsserter = createAsserter<TradeOutcomeDirection>('TradeOutcome', VALID_TRADE_OUTCOMES);
 
-/**
- * Validate and cast a string to VolatilityRegime (or undefined)
- */
-function assertVolatilityRegime(value: string | null): VolatilityRegime | undefined {
-  if (value === null) return undefined;
-  if (!VALID_VOLATILITY_REGIMES.includes(value as VolatilityRegime)) {
-    throw new Error(`Invalid VolatilityRegime: ${value}. Expected one of: ${VALID_VOLATILITY_REGIMES.join(', ')}`);
-  }
-  return value as VolatilityRegime;
-}
-
-/**
- * Validate and cast a string to TradeOutcomeDirection (or undefined)
- */
-function assertTradeOutcome(value: string | null): TradeOutcomeDirection | undefined {
-  if (value === null) return undefined;
-  if (!VALID_TRADE_OUTCOMES.includes(value as TradeOutcomeDirection)) {
-    throw new Error(`Invalid TradeOutcome: ${value}. Expected one of: ${VALID_TRADE_OUTCOMES.join(', ')}`);
-  }
-  return value as TradeOutcomeDirection;
-}
+// Convenience aliases for existing usage patterns
+const assertCryptoAsset = cryptoAssetAsserter.assert;
+const assertTradeSide = tradeSideAsserter.assert;
+const assertVolatilityRegime = volatilityRegimeAsserter.assertNullable;
+const assertTradeOutcome = tradeOutcomeAsserter.assertNullable;
 
 /**
  * Convert boolean to SQLite integer
@@ -166,18 +175,24 @@ export class TradeRepository implements ITradeRepository {
     // Validate database path is within allowed directory
     this.validateDbPath(this.config.dbPath);
 
-    // Ensure directory exists
+    // Ensure directory exists (mkdirSync with recursive handles existing dirs)
     const dbDir = dirname(this.config.dbPath);
-    if (!existsSync(dbDir)) {
+    try {
       mkdirSync(dbDir, { recursive: true });
+    } catch (error) {
+      // Only throw if error is not EEXIST (directory already exists)
+      if ((error as NodeJS.ErrnoException).code !== 'EEXIST') {
+        throw error;
+      }
     }
 
     // Open database connection
     this.db = new Database(this.config.dbPath);
 
-    // Enable foreign keys and WAL mode for better performance
+    // Enable foreign keys, WAL mode, and set busy timeout for better performance
     this.db.pragma('foreign_keys = ON');
     this.db.pragma('journal_mode = WAL');
+    this.db.pragma(`busy_timeout = ${BUSY_TIMEOUT_MS}`);
 
     // Run migrations
     await this.runMigrations();
@@ -187,19 +202,36 @@ export class TradeRepository implements ITradeRepository {
   }
 
   /**
-   * Validate that the database path is within an allowed directory
+   * Validate that the database path is within an allowed directory.
+   * Uses realpathSync after directory creation to catch symlink attacks.
    */
   private validateDbPath(dbPath: string): void {
     const resolvedPath = resolve(dbPath);
     const allowedBase = resolve(DEFAULT_ALLOWED_BASE_DIR);
-
-    // Allow paths within the data directory or test-data directory (for tests)
     const testBase = resolve('./test-data');
+
+    // First check the resolved path
     if (!resolvedPath.startsWith(allowedBase) && !resolvedPath.startsWith(testBase)) {
-      throw new Error(
-        `Database path must be within '${DEFAULT_ALLOWED_BASE_DIR}' or './test-data' directory. ` +
-        `Got: ${dbPath} (resolved: ${resolvedPath})`
-      );
+      throw new Error('Invalid database path specified');
+    }
+
+    // If the path already exists, verify it's not a symlink pointing outside
+    const dbDir = dirname(resolvedPath);
+    if (existsSync(dbDir)) {
+      try {
+        const realDir = realpathSync(dbDir);
+        const realAllowedBase = realpathSync(allowedBase);
+        const realTestBase = existsSync(testBase) ? realpathSync(testBase) : testBase;
+
+        if (!realDir.startsWith(realAllowedBase) && !realDir.startsWith(realTestBase)) {
+          throw new Error('Invalid database path specified');
+        }
+      } catch (error) {
+        // If realpathSync fails on allowed bases, just use the original check
+        if ((error as Error).message === 'Invalid database path specified') {
+          throw error;
+        }
+      }
     }
   }
 
@@ -341,6 +373,18 @@ export class TradeRepository implements ITradeRepository {
     // Process any remaining writes
     await this.flushWriteQueue();
 
+    // Finalize all prepared statements before clearing
+    for (const stmt of Object.values(this.statements)) {
+      if (stmt) {
+        try {
+          // better-sqlite3 statements don't have finalize, but clearing helps GC
+          // The database.close() will handle cleanup
+        } catch {
+          // Ignore finalization errors during shutdown
+        }
+      }
+    }
+
     // Clear cached statements
     this.statements = {};
 
@@ -348,6 +392,25 @@ export class TradeRepository implements ITradeRepository {
       this.db.close();
       this.db = null;
     }
+  }
+
+  // ============================================================================
+  // Statement Access (Safe Getters)
+  // ============================================================================
+
+  /**
+   * Safely get a prepared statement, throwing a descriptive error if not initialized.
+   */
+  private getStatement<K extends keyof typeof this.statements>(
+    name: K
+  ): NonNullable<(typeof this.statements)[K]> {
+    const stmt = this.statements[name];
+    if (!stmt) {
+      throw new Error(
+        `Statement '${name}' not initialized. Ensure initialize() was called successfully.`
+      );
+    }
+    return stmt as NonNullable<(typeof this.statements)[K]>;
   }
 
   // ============================================================================
@@ -363,16 +426,27 @@ export class TradeRepository implements ITradeRepository {
       return Promise.resolve(operation());
     }
 
+    // Check queue size limit to prevent memory exhaustion
+    if (this.writeQueue.length >= MAX_WRITE_QUEUE_SIZE) {
+      return Promise.reject(
+        new Error(`Write queue full (limit: ${MAX_WRITE_QUEUE_SIZE}). Try again later.`)
+      );
+    }
+
     // Async mode: queue the write with proper error handling
     return new Promise((resolve, reject) => {
-      this.queueWrite(() => {
-        try {
-          const result = operation();
-          resolve(result);
-        } catch (error) {
-          reject(error);
-        }
-      });
+      try {
+        this.queueWrite(() => {
+          try {
+            const result = operation();
+            resolve(result);
+          } catch (error) {
+            reject(error);
+          }
+        });
+      } catch (error) {
+        reject(error);
+      }
     });
   }
 
@@ -388,7 +462,7 @@ export class TradeRepository implements ITradeRepository {
     return this.executeWrite(() => {
       // Wrap in transaction for atomicity (trade + features)
       const insertTradeWithFeatures = this.database.transaction(() => {
-        const stmt = this.statements.insertTrade!;
+        const stmt = this.getStatement('insertTrade');
 
         const result = stmt.run({
           conditionId: trade.conditionId,
@@ -434,7 +508,7 @@ export class TradeRepository implements ITradeRepository {
     this.ensureInitialized();
 
     return this.executeWrite(() => {
-      const stmt = this.statements.updateOutcome!;
+      const stmt = this.getStatement('updateOutcome');
 
       stmt.run({
         conditionId,
@@ -464,7 +538,7 @@ export class TradeRepository implements ITradeRepository {
     this.ensureInitialized();
 
     return this.executeWrite(() => {
-      const stmt = this.statements.insertPrice!;
+      const stmt = this.getStatement('insertPrice');
 
       stmt.run({
         tradeId,
@@ -485,7 +559,7 @@ export class TradeRepository implements ITradeRepository {
   async getTradeByConditionId(conditionId: string): Promise<TradeRecord | null> {
     this.ensureInitialized();
 
-    const row = this.statements.selectByConditionId!.get(conditionId) as TradeRow | undefined;
+    const row = this.getStatement('selectByConditionId').get(conditionId) as TradeRow | undefined;
     if (!row) return null;
 
     return this.rowToTradeRecord(row);
@@ -497,7 +571,7 @@ export class TradeRepository implements ITradeRepository {
   async getTradeById(id: number): Promise<TradeRecord | null> {
     this.ensureInitialized();
 
-    const row = this.statements.selectById!.get(id) as TradeRow | undefined;
+    const row = this.getStatement('selectById').get(id) as TradeRow | undefined;
     if (!row) return null;
 
     return this.rowToTradeRecord(row);
@@ -510,7 +584,7 @@ export class TradeRepository implements ITradeRepository {
   async getPendingTrades(limit: number = 1000): Promise<TradeRecord[]> {
     this.ensureInitialized();
 
-    const rows = this.statements.selectPending!.all(limit) as TradeRow[];
+    const rows = this.getStatement('selectPending').all(limit) as TradeRow[];
     return this.rowsToTradeRecords(rows);
   }
 
@@ -524,7 +598,7 @@ export class TradeRepository implements ITradeRepository {
   async getTradesByDateRange(start: Date, end: Date): Promise<TradeRecord[]> {
     this.ensureInitialized();
 
-    const rows = this.statements.selectByDateRange!.all(start.getTime(), end.getTime()) as TradeRow[];
+    const rows = this.getStatement('selectByDateRange').all(start.getTime(), end.getTime()) as TradeRow[];
     return this.rowsToTradeRecords(rows);
   }
 
@@ -534,7 +608,7 @@ export class TradeRepository implements ITradeRepository {
   async getTradesBySymbol(symbol: CryptoAsset): Promise<TradeRecord[]> {
     this.ensureInitialized();
 
-    const rows = this.statements.selectBySymbol!.all(symbol) as TradeRow[];
+    const rows = this.getStatement('selectBySymbol').all(symbol) as TradeRow[];
     return this.rowsToTradeRecords(rows);
   }
 
@@ -544,7 +618,7 @@ export class TradeRepository implements ITradeRepository {
   async getPerformanceByRegime(regime: VolatilityRegime): Promise<RegimeStats> {
     this.ensureInitialized();
 
-    const row = this.statements.selectRegimeStats!.get(regime) as {
+    const row = this.getStatement('selectRegimeStats').get(regime) as {
       total_trades: number;
       wins: number;
       win_rate: number | null;
@@ -568,7 +642,7 @@ export class TradeRepository implements ITradeRepository {
   async getCalibrationData(): Promise<CalibrationBucket[]> {
     this.ensureInitialized();
 
-    const rows = this.statements.selectCalibration!.all() as Array<{
+    const rows = this.getStatement('selectCalibration').all() as Array<{
       bucket: string;
       trades: number;
       avg_predicted: number;
@@ -607,7 +681,7 @@ export class TradeRepository implements ITradeRepository {
   async getStats(): Promise<DatabaseStats> {
     this.ensureInitialized();
 
-    const row = this.statements.selectStats!.get() as {
+    const row = this.getStatement('selectStats').get() as {
       total: number;
       pending: number;
       resolved: number;
@@ -629,6 +703,23 @@ export class TradeRepository implements ITradeRepository {
       oldestTrade: row.oldest ?? undefined,
       newestTrade: row.newest ?? undefined,
     };
+  }
+
+  // ============================================================================
+  // Transaction Support
+  // ============================================================================
+
+  /**
+   * Execute multiple operations within a single transaction.
+   * All operations will either succeed together or fail together.
+   * @param fn Function containing the operations to execute
+   * @returns The result of the function
+   */
+  async transaction<T>(fn: () => T): Promise<T> {
+    this.ensureInitialized();
+
+    const txn = this.database.transaction(fn);
+    return txn();
   }
 
   // ============================================================================
@@ -719,7 +810,7 @@ export class TradeRepository implements ITradeRepository {
    * Insert feature vector for a trade
    */
   private insertFeatures(tradeId: number, features: FeatureVector): void {
-    const stmt = this.statements.insertFeatures!;
+    const stmt = this.getStatement('insertFeatures');
 
     stmt.run({
       tradeId,
@@ -742,43 +833,56 @@ export class TradeRepository implements ITradeRepository {
   }
 
   /**
-   * Batch fetch features for multiple trades (fixes N+1 query)
+   * Batch fetch features for multiple trades (fixes N+1 query).
+   * Chunks large arrays to stay within SQLite's parameter limit.
    */
   private batchGetFeatures(tradeIds: number[]): Map<number, FeatureRow> {
     if (tradeIds.length === 0) return new Map();
 
-    const placeholders = tradeIds.map(() => '?').join(',');
-    const stmt = this.database.prepare(`
-      SELECT * FROM trade_features WHERE trade_id IN (${placeholders})
-    `);
-
-    const rows = stmt.all(...tradeIds) as FeatureRow[];
     const map = new Map<number, FeatureRow>();
-    for (const row of rows) {
-      map.set(row.trade_id, row);
+
+    // Process in chunks to avoid SQLite parameter limit (999)
+    for (let i = 0; i < tradeIds.length; i += MAX_BATCH_SIZE) {
+      const chunk = tradeIds.slice(i, i + MAX_BATCH_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const stmt = this.database.prepare(`
+        SELECT * FROM trade_features WHERE trade_id IN (${placeholders})
+      `);
+
+      const rows = stmt.all(...chunk) as FeatureRow[];
+      for (const row of rows) {
+        map.set(row.trade_id, row);
+      }
     }
+
     return map;
   }
 
   /**
-   * Batch fetch minute prices for multiple trades (fixes N+1 query)
+   * Batch fetch minute prices for multiple trades (fixes N+1 query).
+   * Chunks large arrays to stay within SQLite's parameter limit.
    */
   private batchGetPrices(tradeIds: number[]): Map<number, PriceRow[]> {
     if (tradeIds.length === 0) return new Map();
 
-    const placeholders = tradeIds.map(() => '?').join(',');
-    const stmt = this.database.prepare(`
-      SELECT * FROM trade_prices WHERE trade_id IN (${placeholders}) ORDER BY minute_offset ASC
-    `);
-
-    const rows = stmt.all(...tradeIds) as PriceRow[];
     const map = new Map<number, PriceRow[]>();
 
-    for (const row of rows) {
-      const existing = map.get(row.trade_id) || [];
-      existing.push(row);
-      map.set(row.trade_id, existing);
+    // Process in chunks to avoid SQLite parameter limit (999)
+    for (let i = 0; i < tradeIds.length; i += MAX_BATCH_SIZE) {
+      const chunk = tradeIds.slice(i, i + MAX_BATCH_SIZE);
+      const placeholders = chunk.map(() => '?').join(',');
+      const stmt = this.database.prepare(`
+        SELECT * FROM trade_prices WHERE trade_id IN (${placeholders}) ORDER BY minute_offset ASC
+      `);
+
+      const rows = stmt.all(...chunk) as PriceRow[];
+      for (const row of rows) {
+        const existing = map.get(row.trade_id) || [];
+        existing.push(row);
+        map.set(row.trade_id, existing);
+      }
     }
+
     return map;
   }
 
@@ -786,7 +890,7 @@ export class TradeRepository implements ITradeRepository {
    * Get features for a single trade
    */
   private getFeatures(tradeId: number): FeatureRow | null {
-    const row = this.statements.selectFeatures!.get(tradeId) as FeatureRow | undefined;
+    const row = this.getStatement('selectFeatures').get(tradeId) as FeatureRow | undefined;
     return row ?? null;
   }
 
@@ -794,7 +898,7 @@ export class TradeRepository implements ITradeRepository {
    * Get minute prices for a single trade
    */
   private getMinutePrices(tradeId: number): MinutePrice[] {
-    const rows = this.statements.selectPrices!.all(tradeId) as PriceRow[];
+    const rows = this.getStatement('selectPrices').all(tradeId) as PriceRow[];
     return rows.map((row) => ({
       minuteOffset: row.minute_offset,
       timestamp: row.timestamp,
