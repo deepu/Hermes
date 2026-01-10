@@ -1796,4 +1796,314 @@ describe('Crypto15MLStrategyService Integration', () => {
       expect(service.getPaperTradingStats().cumulativePnL).toBe(0);
     });
   });
+
+  // ============================================================================
+  // Persistence Integration Tests
+  // ============================================================================
+
+  describe('Trade Persistence Integration', () => {
+    const MODEL_INTERCEPT_YES = 3.0;
+
+    // Mock trade repository
+    function createMockTradeRepository() {
+      return {
+        initialize: vi.fn().mockResolvedValue(undefined),
+        close: vi.fn().mockResolvedValue(undefined),
+        recordTrade: vi.fn().mockResolvedValue(1),
+        updateOutcome: vi.fn().mockResolvedValue(undefined),
+        getTradeByConditionId: vi.fn().mockResolvedValue(null),
+        getPendingTrades: vi.fn().mockResolvedValue([]),
+        getTradeById: vi.fn().mockResolvedValue(null),
+        getTradesByDateRange: vi.fn().mockResolvedValue([]),
+        getTradesBySymbol: vi.fn().mockResolvedValue([]),
+        getPerformanceByRegime: vi.fn().mockResolvedValue({ regime: 'mid', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
+        getCalibrationData: vi.fn().mockResolvedValue([]),
+        vacuum: vi.fn().mockResolvedValue(undefined),
+        getStats: vi.fn().mockResolvedValue({ totalTrades: 0, pendingTrades: 0, resolvedTrades: 0, dbSizeBytes: 0 }),
+        transaction: vi.fn((fn) => fn()),
+        recordMinutePrice: vi.fn().mockResolvedValue(undefined),
+      };
+    }
+
+    it('should initialize repository on start when persistence is enabled', async () => {
+      const mockRepo = createMockTradeRepository();
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo as any
+      );
+
+      await service.start();
+
+      expect(mockRepo.initialize).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not initialize repository when persistence is disabled', async () => {
+      const mockRepo = createMockTradeRepository();
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: false,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo as any
+      );
+
+      await service.start();
+
+      expect(mockRepo.initialize).not.toHaveBeenCalled();
+    });
+
+    it('should persist trade when paper position is recorded', async () => {
+      const mockRepo = createMockTradeRepository();
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-persist-1', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo as any
+      );
+
+      await service.start();
+
+      // Add the tracker by scanning
+      await (service as any).scanUpcomingMarkets();
+
+      // Feed prices to trigger a signal
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle (including setImmediate for persistence)
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100); // Extra time for setImmediate
+
+      // Trade should have been persisted
+      expect(mockRepo.recordTrade).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordTrade).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-persist-1',
+          slug,
+          symbol: 'BTC',
+          side: 'YES',
+        })
+      );
+    });
+
+    it('should update outcome when market resolves', async () => {
+      const mockRepo = createMockTradeRepository();
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-outcome-1', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo as any
+      );
+
+      await service.start();
+
+      // Add the tracker by scanning
+      await (service as any).scanUpcomingMarkets();
+
+      // Feed prices to trigger a signal
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Verify trade was recorded
+      expect(mockRepo.recordTrade).toHaveBeenCalledTimes(1);
+
+      // Emit market resolution event (UP = YES wins)
+      mockRealtimeService.emitMarketEvent({
+        conditionId: 'cond-outcome-1',
+        type: 'resolved',
+        data: { winner: 'Up' },
+        timestamp: Date.now(),
+      });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Outcome should have been updated
+      expect(mockRepo.updateOutcome).toHaveBeenCalledTimes(1);
+      expect(mockRepo.updateOutcome).toHaveBeenCalledWith(
+        'cond-outcome-1',
+        expect.objectContaining({
+          outcome: 'UP',
+          isWin: true, // YES position wins when market goes UP
+        })
+      );
+    });
+
+    it('should close repository on stop', async () => {
+      const mockRepo = createMockTradeRepository();
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo as any
+      );
+
+      await service.start();
+      service.stop();
+
+      // Allow async close to complete
+      await vi.advanceTimersByTimeAsync(100);
+
+      expect(mockRepo.close).toHaveBeenCalledTimes(1);
+    });
+
+    it('should not persist trade when no repository is provided', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-no-repo', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig(); // No persistence config, no repository
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config
+        // No repository parameter
+      );
+
+      await service.start();
+
+      // Add the tracker by scanning
+      await (service as any).scanUpcomingMarkets();
+
+      // Feed prices to trigger a signal
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      // Service should still work (paper trading) without crashing
+      expect(service.getPaperTradingStats().positionCount).toBe(1);
+    });
+
+    it('should handle persistence errors gracefully', async () => {
+      const mockRepo = createMockTradeRepository();
+      mockRepo.recordTrade.mockRejectedValue(new Error('Database write failed'));
+
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-error-1', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo as any
+      );
+
+      await service.start();
+
+      // Add the tracker by scanning
+      await (service as any).scanUpcomingMarkets();
+
+      // Feed prices to trigger a signal
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Paper position should still be recorded even if persistence fails
+      expect(service.getPaperTradingStats().positionCount).toBe(1);
+
+      // Service should not crash
+      expect(service.isRunning()).toBe(true);
+    });
+  });
 });

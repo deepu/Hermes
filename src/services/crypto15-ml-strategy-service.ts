@@ -41,6 +41,7 @@ import type { TradingService, OrderResult } from './trading-service.js';
 import type { RealtimeServiceV2, CryptoPrice, Subscription } from './realtime-service-v2.js';
 import type { GammaMarket } from '../clients/gamma-api.js';
 import type { UnifiedMarket } from '../core/types.js';
+import type { ITradeRepository, TradeRecord, TradeOutcome, PersistenceConfig } from '../types/trade-record.types.js';
 
 // ============================================================================
 // Types
@@ -83,6 +84,8 @@ export interface Crypto15MLConfig {
   dryRun?: boolean;
   /** Optional logger instance for dependency injection (useful for testing) */
   logger?: IStrategyLogger;
+  /** Persistence configuration for trade recording */
+  persistence?: PersistenceConfig;
 }
 
 /**
@@ -377,6 +380,12 @@ export class Crypto15MLStrategyService extends EventEmitter {
   /** Cumulative paper P&L for dry-run mode */
   private paperPnL = 0;
 
+  /** Trade repository for persistence (injected via constructor) */
+  private tradeRepository: ITradeRepository | null = null;
+
+  /** Map conditionId -> database trade ID for outcome updates */
+  private tradeIdMap: Map<string, number> = new Map();
+
   private running = false;
 
   /** Structured JSON logger for Railway-compatible logging */
@@ -386,7 +395,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
     private marketService: MarketService,
     private tradingService: TradingService,
     private realtimeService: RealtimeServiceV2,
-    config: Crypto15MLConfig
+    config: Crypto15MLConfig,
+    tradeRepository?: ITradeRepository
   ) {
     super();
 
@@ -413,6 +423,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
     for (const symbol of this.config.symbols) {
       this.trackersBySymbol.set(symbol, new Set());
     }
+
+    // Store injected trade repository (if provided)
+    this.tradeRepository = tradeRepository ?? null;
   }
 
   /**
@@ -516,6 +529,15 @@ export class Crypto15MLStrategyService extends EventEmitter {
         message: `Loaded ${this.models.size} models`,
         modelCount: this.models.size,
       });
+
+      // Initialize trade repository if provided and persistence is enabled
+      if (this.tradeRepository && this.config.persistence?.enabled !== false) {
+        await this.tradeRepository.initialize();
+        this.logger.info(LogEvents.REPOSITORY_INITIALIZED, {
+          message: 'Trade repository initialized',
+          dbPath: this.config.persistence?.dbPath ?? 'default',
+        });
+      }
 
       // Subscribe to price updates
       this.subscribeToPriceUpdates();
@@ -656,6 +678,19 @@ export class Crypto15MLStrategyService extends EventEmitter {
     // Clear paper trading state
     this.paperPositions.clear();
     this.paperPnL = 0;
+
+    // Clear trade ID map
+    this.tradeIdMap.clear();
+
+    // Close trade repository (fire-and-forget, errors logged internally)
+    if (this.tradeRepository) {
+      this.tradeRepository.close().catch((error) => {
+        this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+          error: error instanceof Error ? error.message : String(error),
+          message: 'Failed to close trade repository',
+        });
+      });
+    }
 
     this.running = false;
   }
@@ -1162,8 +1197,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
     }
 
     if (this.config.dryRun) {
-      // Record paper position for tracking
-      this.recordPaperPosition(signal);
+      // Record paper position for tracking (pass tracker for persistence)
+      this.recordPaperPosition(signal, tracker);
 
       const executionResult: ExecutionResult = {
         signal,
@@ -1397,12 +1432,84 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
+   * Convert a Signal to a TradeRecord for persistence
+   *
+   * Creates a complete TradeRecord from a generated signal with all
+   * required fields for database storage.
+   */
+  private signalToTradeRecord(signal: Signal, tracker: MarketTracker): TradeRecord {
+    const now = new Date();
+    // Get window state from feature engine to access open price
+    const engineState = tracker.featureEngine.getState();
+    const windowOpenPrice = engineState.windowState?.openPrice;
+
+    return {
+      conditionId: signal.conditionId,
+      slug: signal.slug,
+      symbol: signal.asset,
+      side: signal.side,
+      entryPrice: signal.entryPrice,
+      positionSize: this.config.positionSizeUsd,
+      signalTimestamp: signal.timestamp,
+      probability: signal.probability,
+      linearCombination: signal.linearCombination,
+      imputedCount: signal.imputedCount,
+      features: signal.features,
+      stateMinute: signal.stateMinute,
+      hourOfDay: now.getUTCHours(),
+      dayOfWeek: now.getUTCDay(),
+      volatility5m: signal.features.volatility5m,
+      windowOpenPrice,
+      entryBidPrice: tracker.prices.no, // NO price is bid-like
+      entryAskPrice: tracker.prices.yes, // YES price is ask-like
+    };
+  }
+
+  /**
+   * Persist a trade to the repository asynchronously
+   *
+   * Uses setImmediate to avoid blocking the trading hot path.
+   * Errors are logged but don't crash the service.
+   */
+  private persistTrade(signal: Signal, tracker: MarketTracker): void {
+    if (!this.tradeRepository) {
+      return; // Persistence not enabled
+    }
+
+    const tradeRecord = this.signalToTradeRecord(signal, tracker);
+
+    // Use setImmediate to avoid blocking the trading hot path
+    setImmediate(async () => {
+      try {
+        const tradeId = await this.tradeRepository!.recordTrade(tradeRecord);
+        this.tradeIdMap.set(signal.conditionId, tradeId);
+
+        this.logger.info(LogEvents.TRADE_PERSISTED, {
+          marketId: signal.conditionId,
+          slug: signal.slug,
+          tradeId,
+          message: `Trade persisted with ID ${tradeId}`,
+        });
+      } catch (error) {
+        // Log error but don't crash - persistence is non-critical
+        this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+          marketId: signal.conditionId,
+          slug: signal.slug,
+          error: error instanceof Error ? error.message : String(error),
+          message: 'Failed to persist trade',
+        });
+      }
+    });
+  }
+
+  /**
    * Record a paper position for dry-run mode
    *
    * Stores the position without executing a real trade.
    * Emits 'paperPosition' event for tracking.
+   * If persistence is enabled, also persists to database.
    */
-  private recordPaperPosition(signal: Signal): void {
+  private recordPaperPosition(signal: Signal, tracker?: MarketTracker): void {
     // Guard: prevent overwriting existing position
     if (this.paperPositions.has(signal.conditionId)) {
       this.logger.warn(LogEvents.PAPER_POSITION, {
@@ -1454,6 +1561,11 @@ export class Crypto15MLStrategyService extends EventEmitter {
     });
 
     this.emit('paperPosition', position);
+
+    // Persist trade to database if repository is available and tracker is provided
+    if (tracker) {
+      this.persistTrade(signal, tracker);
+    }
   }
 
   /**
@@ -1483,10 +1595,90 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
+   * Calculate Maximum Favorable Excursion (MFE) for a position
+   *
+   * MFE is the best price move in the trade's favor during the window.
+   * For YES positions: max run-up (price went up in our favor)
+   * For NO positions: max run-down (price went down in our favor)
+   */
+  private calculateMFE(tracker: MarketTracker, side: 'YES' | 'NO'): number {
+    const windowState = tracker.featureEngine.getState().windowState;
+    if (!windowState) return 0;
+
+    // For YES position, we want the price to go UP (run-up is favorable)
+    // For NO position, we want the price to go DOWN (run-down is favorable)
+    if (side === 'YES') {
+      return Math.abs(windowState.maxRunUp);
+    } else {
+      return Math.abs(windowState.maxRunDown);
+    }
+  }
+
+  /**
+   * Calculate Maximum Adverse Excursion (MAE) for a position
+   *
+   * MAE is the worst price move against the trade during the window.
+   * For YES positions: max run-down (price went down against us)
+   * For NO positions: max run-up (price went up against us)
+   */
+  private calculateMAE(tracker: MarketTracker, side: 'YES' | 'NO'): number {
+    const windowState = tracker.featureEngine.getState().windowState;
+    if (!windowState) return 0;
+
+    // For YES position, run-down is adverse (price went against us)
+    // For NO position, run-up is adverse (price went against us)
+    if (side === 'YES') {
+      return Math.abs(windowState.maxRunDown);
+    } else {
+      return Math.abs(windowState.maxRunUp);
+    }
+  }
+
+  /**
+   * Persist outcome update to the database asynchronously
+   *
+   * Uses setImmediate to avoid blocking. Errors are logged but don't crash.
+   */
+  private persistOutcome(
+    conditionId: string,
+    outcome: TradeOutcome
+  ): void {
+    if (!this.tradeRepository) {
+      return; // Persistence not enabled
+    }
+
+    // Use setImmediate to avoid blocking
+    setImmediate(async () => {
+      try {
+        await this.tradeRepository!.updateOutcome(conditionId, outcome);
+
+        this.logger.info(LogEvents.OUTCOME_PERSISTED, {
+          marketId: conditionId,
+          outcome: outcome.outcome,
+          isWin: outcome.isWin,
+          pnl: outcome.pnl,
+          message: `Outcome persisted: ${outcome.outcome} (${outcome.isWin ? 'WIN' : 'LOSS'})`,
+        });
+
+        // Clean up trade ID mapping
+        this.tradeIdMap.delete(conditionId);
+      } catch (error) {
+        // Log error but don't crash - persistence is non-critical
+        this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+          marketId: conditionId,
+          error: error instanceof Error ? error.message : String(error),
+          message: 'Failed to persist outcome',
+        });
+      }
+    });
+  }
+
+  /**
    * Handle market resolution event for paper trading
    *
    * Called when a market resolves. Looks up any paper position
    * for this market, calculates P&L, and emits settlement event.
+   * If persistence is enabled, updates the outcome in the database.
    */
   private handleMarketResolution(conditionId: string, outcome: 'UP' | 'DOWN'): void {
     const position = this.paperPositions.get(conditionId);
@@ -1520,6 +1712,29 @@ export class Crypto15MLStrategyService extends EventEmitter {
     });
 
     this.emit('paperSettlement', settlement);
+
+    // Persist outcome to database if we have a tracked trade
+    if (this.tradeIdMap.has(conditionId)) {
+      // Get tracker for MFE/MAE calculation (may be null if already cleaned up)
+      const tracker = this.trackers.get(conditionId);
+      const mfe = tracker ? this.calculateMFE(tracker, position.side) : 0;
+      const mae = tracker ? this.calculateMAE(tracker, position.side) : 0;
+      // Note: windowClosePrice not available from feature engine at resolution time
+      // The minute price tracking (Issue #27) will capture this data
+      const windowClosePrice = 0;
+
+      const tradeOutcome: TradeOutcome = {
+        outcome,
+        isWin: won,
+        pnl,
+        resolutionTimestamp: Date.now(),
+        windowClosePrice,
+        maxFavorableExcursion: mfe,
+        maxAdverseExcursion: mae,
+      };
+
+      this.persistOutcome(conditionId, tradeOutcome);
+    }
 
     // Remove settled position
     this.paperPositions.delete(conditionId);
