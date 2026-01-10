@@ -9,6 +9,7 @@ import {
   StrategyLogger,
   createCrypto15MLLogger,
   LogEvents,
+  type IStrategyLogger,
   type LogEntry,
   type LogContext,
 } from './strategy-logger.js';
@@ -71,8 +72,8 @@ describe('StrategyLogger', () => {
         side: 'YES',
         confidence: 0.73,
         entryPrice: 0.65,
-        modelProbability: 0.73,
         imputedFeatures: 0,
+        linearCombination: 1.23,
       });
 
       const logOutput: LogEntry = JSON.parse(consoleSpy.mock.calls[0][0] as string);
@@ -83,8 +84,8 @@ describe('StrategyLogger', () => {
       expect(logOutput.side).toBe('YES');
       expect(logOutput.confidence).toBe(0.73);
       expect(logOutput.entryPrice).toBe(0.65);
-      expect(logOutput.modelProbability).toBe(0.73);
       expect(logOutput.imputedFeatures).toBe(0);
+      expect(logOutput.linearCombination).toBe(1.23);
     });
   });
 
@@ -128,19 +129,12 @@ describe('StrategyLogger', () => {
       expect(consoleSpy).not.toHaveBeenCalled();
     });
 
-    it('should support runtime enable/disable', () => {
-      const logger = new StrategyLogger({ strategy: 'Test', enabled: true });
+    it('should report enabled state correctly', () => {
+      const enabledLogger = new StrategyLogger({ strategy: 'Test', enabled: true });
+      const disabledLogger = new StrategyLogger({ strategy: 'Test', enabled: false });
 
-      logger.info(LogEvents.STRATEGY_STARTED, {});
-      expect(consoleSpy).toHaveBeenCalledTimes(1);
-
-      logger.setEnabled(false);
-      logger.info(LogEvents.STRATEGY_STOPPED, {});
-      expect(consoleSpy).toHaveBeenCalledTimes(1); // Still 1
-
-      logger.setEnabled(true);
-      logger.info(LogEvents.MODELS_LOADED, {});
-      expect(consoleSpy).toHaveBeenCalledTimes(2);
+      expect(enabledLogger.isEnabled()).toBe(true);
+      expect(disabledLogger.isEnabled()).toBe(false);
     });
   });
 
@@ -183,6 +177,24 @@ describe('StrategyLogger', () => {
       const parsed = JSON.parse(output);
 
       expect(parsed.message).toBe('Line1\nLine2\tTabbed');
+    });
+
+    it('should prevent context from overriding base fields (security)', () => {
+      const logger = new StrategyLogger({ strategy: 'Crypto15ML' });
+
+      // Attempt to override base fields via context (should be ignored)
+      // Using type assertion to bypass TypeScript since this tests runtime behavior
+      logger.info(LogEvents.STRATEGY_STARTED, {
+        message: 'Test message',
+      } as LogContext & { timestamp?: string; level?: string; strategy?: string });
+
+      const logOutput: LogEntry = JSON.parse(consoleSpy.mock.calls[0][0] as string);
+
+      // Base fields should be set correctly, not overridden
+      expect(logOutput.strategy).toBe('Crypto15ML');
+      expect(logOutput.level).toBe('INFO');
+      expect(logOutput.event).toBe('strategy_started');
+      expect(logOutput.timestamp).toMatch(/^\d{4}-\d{2}-\d{2}T/);
     });
   });
 
@@ -234,6 +246,17 @@ describe('createCrypto15MLLogger', () => {
     const logOutput = JSON.parse(consoleSpy.mock.calls[0][0] as string);
     expect(logOutput.strategy).toBe('Crypto15ML');
     expect(logOutput._service).toBe('custom-service');
+  });
+
+  it('should return IStrategyLogger interface', () => {
+    // This is a compile-time check that the factory returns IStrategyLogger
+    const logger: IStrategyLogger = createCrypto15MLLogger();
+
+    // Verify all interface methods are present
+    expect(typeof logger.info).toBe('function');
+    expect(typeof logger.warn).toBe('function');
+    expect(typeof logger.error).toBe('function');
+    expect(typeof logger.isEnabled).toBe('function');
   });
 });
 

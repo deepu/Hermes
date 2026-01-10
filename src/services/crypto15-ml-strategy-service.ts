@@ -34,6 +34,7 @@ import {
   createCrypto15MLLogger,
   LogEvents,
   StrategyLogger,
+  type IStrategyLogger,
 } from '../utils/strategy-logger.js';
 import type { MarketService } from './market-service.js';
 import type { TradingService, OrderResult } from './trading-service.js';
@@ -44,6 +45,11 @@ import type { UnifiedMarket } from '../core/types.js';
 // ============================================================================
 // Types
 // ============================================================================
+
+/**
+ * Error category for filtering and classification in logs
+ */
+type ErrorCategory = 'websocket' | 'network' | 'rate_limit' | 'model' | 'feature' | 'general' | 'unknown';
 
 /**
  * Configuration for Crypto15MLStrategyService
@@ -76,7 +82,7 @@ export interface Crypto15MLConfig {
   /** Dry run mode - generate signals but don't execute trades */
   dryRun?: boolean;
   /** Optional logger instance for dependency injection (useful for testing) */
-  logger?: StrategyLogger;
+  logger?: IStrategyLogger;
 }
 
 /**
@@ -374,7 +380,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
   private running = false;
 
   /** Structured JSON logger for Railway-compatible logging */
-  private readonly logger: StrategyLogger;
+  private readonly logger: IStrategyLogger;
 
   constructor(
     private marketService: MarketService,
@@ -1102,7 +1108,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       features,
     };
 
-    // Guard to avoid object allocation when logging is disabled
+    // Guard to avoid log context object allocation when logging is disabled
     if (this.logger.isEnabled()) {
       this.logger.info(LogEvents.SIGNAL_GENERATED, {
         marketId: tracker.conditionId,
@@ -1112,7 +1118,6 @@ export class Crypto15MLStrategyService extends EventEmitter {
         side,
         confidence: prediction.probability,
         entryPrice,
-        modelProbability: prediction.probability,
         imputedFeatures: prediction.imputedCount,
         linearCombination: prediction.linearCombination,
       });
@@ -1351,7 +1356,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
   /**
    * Classify an error into a category for filtering
    */
-  private classifyError(error: unknown): string {
+  private classifyError(error: unknown): ErrorCategory {
     if (!(error instanceof Error)) return 'unknown';
     const msg = error.message.toLowerCase();
     if (msg.includes('websocket')) return 'websocket';

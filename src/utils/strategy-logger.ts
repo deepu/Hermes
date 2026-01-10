@@ -24,6 +24,40 @@
 export type LogLevel = 'INFO' | 'WARN' | 'ERROR';
 
 /**
+ * Standard event names for consistent filtering
+ */
+export const LogEvents = {
+  // Strategy Lifecycle
+  STRATEGY_STARTED: 'strategy_started',
+  STRATEGY_STOPPED: 'strategy_stopped',
+  MODELS_LOADED: 'models_loaded',
+  PRICE_SUBSCRIPTION_ACTIVE: 'price_subscription_active',
+
+  // Market Discovery
+  MARKET_ADDED: 'market_added',
+  MARKET_REMOVED: 'market_removed',
+  TRACKERS_CLEANED: 'trackers_cleaned',
+
+  // Signals
+  SIGNAL_GENERATED: 'signal_generated',
+  SIGNAL_REJECTED: 'signal_rejected',
+
+  // Executions
+  EXECUTION_SUCCESS: 'execution_success',
+  EXECUTION_FAILED: 'execution_failed',
+
+  // Paper Trading (Dry Run)
+  PAPER_POSITION: 'paper_position',
+  PAPER_POSITION_EVICTED: 'paper_position_evicted',
+  PAPER_SETTLEMENT: 'paper_settlement',
+
+  // General
+  ERROR: 'error',
+} as const;
+
+export type LogEventType = (typeof LogEvents)[keyof typeof LogEvents];
+
+/**
  * Base log entry with required fields
  */
 export interface BaseLogEntry {
@@ -34,7 +68,7 @@ export interface BaseLogEntry {
   /** Strategy name (e.g., 'Crypto15ML') */
   strategy: string;
   /** Event type for filtering (e.g., 'signal_generated', 'execution_success') */
-  event: string;
+  event: LogEventType;
   /** Railway service name */
   _service: string;
   /** Railway app name */
@@ -61,8 +95,6 @@ export interface LogContext {
   confidence?: number;
   /** Entry price (0-1) */
   entryPrice?: number;
-  /** Model probability (0-1) */
-  modelProbability?: number;
   /** Number of imputed features */
   imputedFeatures?: number;
   /** Order ID */
@@ -116,53 +148,25 @@ export interface StrategyLoggerConfig {
   environment?: string;
 }
 
+// ============================================================================
+// IStrategyLogger Interface
+// ============================================================================
+
 /**
- * Immutable config without enabled flag (for internal use)
+ * Interface for strategy loggers
+ *
+ * Enables dependency injection and testability.
  */
-interface ImmutableLoggerConfig {
-  readonly strategy: string;
-  readonly service: string;
-  readonly app: string;
-  readonly environment: string;
+export interface IStrategyLogger {
+  /** Log an INFO level message */
+  info(event: LogEventType, context?: LogContext): void;
+  /** Log a WARN level message */
+  warn(event: LogEventType, context?: LogContext): void;
+  /** Log an ERROR level message */
+  error(event: LogEventType, context?: LogContext): void;
+  /** Check if logging is enabled */
+  isEnabled(): boolean;
 }
-
-// ============================================================================
-// Log Event Constants
-// ============================================================================
-
-/**
- * Standard event names for consistent filtering
- */
-export const LogEvents = {
-  // Strategy Lifecycle
-  STRATEGY_STARTED: 'strategy_started',
-  STRATEGY_STOPPED: 'strategy_stopped',
-  MODELS_LOADED: 'models_loaded',
-  PRICE_SUBSCRIPTION_ACTIVE: 'price_subscription_active',
-
-  // Market Discovery
-  MARKET_ADDED: 'market_added',
-  MARKET_REMOVED: 'market_removed',
-  TRACKERS_CLEANED: 'trackers_cleaned',
-
-  // Signals
-  SIGNAL_GENERATED: 'signal_generated',
-  SIGNAL_REJECTED: 'signal_rejected',
-
-  // Executions
-  EXECUTION_SUCCESS: 'execution_success',
-  EXECUTION_FAILED: 'execution_failed',
-
-  // Paper Trading (Dry Run)
-  PAPER_POSITION: 'paper_position',
-  PAPER_POSITION_EVICTED: 'paper_position_evicted',
-  PAPER_SETTLEMENT: 'paper_settlement',
-
-  // General
-  ERROR: 'error',
-} as const;
-
-export type LogEventType = (typeof LogEvents)[keyof typeof LogEvents];
 
 // ============================================================================
 // StrategyLogger Implementation
@@ -190,9 +194,14 @@ const MAX_ERROR_MESSAGE_LENGTH = 200;
  * // Outputs:
  * // {"timestamp":"2026-01-08T14:23:45.123Z","level":"INFO","strategy":"Crypto15ML",...}
  */
-export class StrategyLogger {
-  private readonly config: ImmutableLoggerConfig;
-  private enabled: boolean;
+export class StrategyLogger implements IStrategyLogger {
+  private readonly config: {
+    readonly strategy: string;
+    readonly service: string;
+    readonly app: string;
+    readonly environment: string;
+  };
+  private readonly enabled: boolean;
 
   constructor(config: StrategyLoggerConfig) {
     this.enabled = config.enabled ?? true;
@@ -254,13 +263,6 @@ export class StrategyLogger {
   }
 
   /**
-   * Enable or disable logging at runtime
-   */
-  setEnabled(enabled: boolean): void {
-    this.enabled = enabled;
-  }
-
-  /**
    * Sanitize error message to prevent log bloat and sensitive data leakage
    */
   static sanitizeErrorMessage(error: unknown): string {
@@ -279,13 +281,17 @@ export class StrategyLogger {
    * Core logging method
    *
    * Creates a structured JSON log entry and emits to stdout.
+   * Base fields are applied after context to prevent override attacks.
    */
   private log(level: LogLevel, event: LogEventType, context?: LogContext): void {
     if (!this.enabled) {
       return;
     }
 
+    // Spread context first, then base fields to prevent context from overriding
+    // critical log metadata (timestamp, level, event, strategy, etc.)
     const entry: LogEntry = {
+      ...context,
       timestamp: new Date().toISOString(),
       level,
       strategy: this.config.strategy,
@@ -293,7 +299,6 @@ export class StrategyLogger {
       _service: this.config.service,
       _app: this.config.app,
       _env: this.config.environment,
-      ...context,
     };
 
     // Emit as single-line JSON for Railway parsing
@@ -310,7 +315,7 @@ export class StrategyLogger {
  */
 export function createCrypto15MLLogger(
   options?: Partial<Omit<StrategyLoggerConfig, 'strategy'>>
-): StrategyLogger {
+): IStrategyLogger {
   return new StrategyLogger({
     strategy: 'Crypto15ML',
     ...options,
