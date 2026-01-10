@@ -12,11 +12,7 @@ numReplicas = 1
 
 # Start command (overrides Dockerfile CMD if needed)
 # Uncomment to override:
-# startCommand = "npx tsx scripts/crypto15ml/run-strategy.ts"
-
-# Health check configuration
-healthcheckPath = "/"
-healthcheckTimeout = 30
+# startCommand = "node dist/scripts/crypto15ml/run-strategy.js"
 
 # Restart policy
 restartPolicyType = "ON_FAILURE"

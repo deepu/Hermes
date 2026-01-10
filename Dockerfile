@@ -5,12 +5,12 @@
 # Run:   docker run --env-file .env hermes
 
 # Build stage
-FROM node:22-alpine AS builder
+FROM node:22.12-alpine AS builder
 
 WORKDIR /app
 
-# Install pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Install pnpm (pinned version for reproducibility)
+RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 
 # Copy package files
 COPY package.json pnpm-lock.yaml ./
@@ -20,18 +20,22 @@ RUN pnpm install --frozen-lockfile
 
 # Copy source code
 COPY src/ ./src/
+COPY scripts/ ./scripts/
 COPY tsconfig.json ./
 
-# Build TypeScript
+# Build TypeScript (including scripts)
 RUN pnpm run build
 
 # Production stage
-FROM node:22-alpine AS production
+FROM node:22.12-alpine AS production
 
 WORKDIR /app
 
-# Install pnpm
-RUN corepack enable && corepack prepare pnpm@latest --activate
+# Create non-root user for security
+RUN addgroup -S app && adduser -S app -G app
+
+# Install pnpm (pinned version for reproducibility)
+RUN corepack enable && corepack prepare pnpm@9.15.0 --activate
 
 # Copy package files
 COPY package.json pnpm-lock.yaml ./
@@ -42,17 +46,14 @@ RUN pnpm install --frozen-lockfile --prod
 # Copy built files from builder
 COPY --from=builder /app/dist ./dist
 
-# Copy scripts and models directories
-COPY scripts/ ./scripts/
+# Copy models directory
 COPY models/ ./models/
 
 # Set environment
 ENV NODE_ENV=production
 
-# Health check endpoint (optional - strategy logs are primary health indicator)
-HEALTHCHECK --interval=30s --timeout=10s --start-period=60s --retries=3 \
-  CMD node -e "console.log('healthy')" || exit 1
+# Switch to non-root user
+USER app
 
-# Run the strategy
-# Note: tsx is used for running TypeScript directly in scripts
-CMD ["npx", "tsx", "scripts/crypto15ml/run-strategy.ts"]
+# Run the strategy using compiled JavaScript
+CMD ["node", "dist/scripts/crypto15ml/run-strategy.js"]

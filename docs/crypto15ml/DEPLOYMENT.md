@@ -62,6 +62,17 @@ ls ~/dev/argus/research/crypto_15minute/results/
 | `CRYPTO15ML_NO_THRESHOLD` | `0.30` | Maximum probability for NO signal |
 | `CRYPTO15ML_ENTRY_PRICE_CAP` | `0.70` | Maximum acceptable entry price |
 | `CRYPTO15ML_DEBUG` | `false` | Enable verbose logging |
+| `CRYPTO15ML_SYMBOLS` | `BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT` | Comma-separated list of symbols |
+| `CRYPTO15ML_HORIZON_MINUTES` | `15` | Prediction horizon in minutes |
+
+### Threshold Configuration (Advanced)
+
+| Variable | Default | Description |
+|----------|---------|-------------|
+| `CRYPTO15ML_THRESHOLD_BTC` | `0.0008` | BTC threshold (8 bps) |
+| `CRYPTO15ML_THRESHOLD_ETH` | `0.0010` | ETH threshold (10 bps) |
+| `CRYPTO15ML_THRESHOLD_SOL` | `0.0020` | SOL threshold (20 bps) |
+| `CRYPTO15ML_THRESHOLD_XRP` | `0.0015` | XRP threshold (15 bps) |
 
 ### Model Paths (usually not needed)
 
