@@ -8,8 +8,9 @@
  */
 
 import Database from 'better-sqlite3';
-import { readFileSync, existsSync, mkdirSync, statSync } from 'fs';
-import { dirname, join } from 'path';
+import type { Statement } from 'better-sqlite3';
+import { readFileSync, existsSync, mkdirSync, statSync, readdirSync } from 'fs';
+import { dirname, join, resolve } from 'path';
 import { fileURLToPath } from 'url';
 
 import type {
@@ -22,6 +23,14 @@ import type {
   DatabaseStats,
   VolatilityRegime,
   PersistenceConfig,
+  TradeSide,
+  TradeOutcomeDirection,
+} from '../types/trade-record.types.js';
+import {
+  VALID_CRYPTO_ASSETS,
+  VALID_TRADE_SIDES,
+  VALID_VOLATILITY_REGIMES,
+  VALID_TRADE_OUTCOMES,
 } from '../types/trade-record.types.js';
 import type { CryptoAsset, FeatureVector } from '../strategies/crypto15-feature-engine.js';
 
@@ -34,6 +43,62 @@ const __dirname = dirname(__filename);
 
 const MIGRATIONS_DIR = join(__dirname, 'migrations');
 
+/** Default allowed base directory for database files */
+const DEFAULT_ALLOWED_BASE_DIR = './data';
+
+// ============================================================================
+// Type Validators
+// ============================================================================
+
+/**
+ * Validate and cast a string to CryptoAsset
+ */
+function assertCryptoAsset(value: string): CryptoAsset {
+  if (!VALID_CRYPTO_ASSETS.includes(value as CryptoAsset)) {
+    throw new Error(`Invalid CryptoAsset: ${value}. Expected one of: ${VALID_CRYPTO_ASSETS.join(', ')}`);
+  }
+  return value as CryptoAsset;
+}
+
+/**
+ * Validate and cast a string to TradeSide
+ */
+function assertTradeSide(value: string): TradeSide {
+  if (!VALID_TRADE_SIDES.includes(value as TradeSide)) {
+    throw new Error(`Invalid TradeSide: ${value}. Expected one of: ${VALID_TRADE_SIDES.join(', ')}`);
+  }
+  return value as TradeSide;
+}
+
+/**
+ * Validate and cast a string to VolatilityRegime (or undefined)
+ */
+function assertVolatilityRegime(value: string | null): VolatilityRegime | undefined {
+  if (value === null) return undefined;
+  if (!VALID_VOLATILITY_REGIMES.includes(value as VolatilityRegime)) {
+    throw new Error(`Invalid VolatilityRegime: ${value}. Expected one of: ${VALID_VOLATILITY_REGIMES.join(', ')}`);
+  }
+  return value as VolatilityRegime;
+}
+
+/**
+ * Validate and cast a string to TradeOutcomeDirection (or undefined)
+ */
+function assertTradeOutcome(value: string | null): TradeOutcomeDirection | undefined {
+  if (value === null) return undefined;
+  if (!VALID_TRADE_OUTCOMES.includes(value as TradeOutcomeDirection)) {
+    throw new Error(`Invalid TradeOutcome: ${value}. Expected one of: ${VALID_TRADE_OUTCOMES.join(', ')}`);
+  }
+  return value as TradeOutcomeDirection;
+}
+
+/**
+ * Convert boolean to SQLite integer
+ */
+function boolToInt(value: boolean): number {
+  return value ? 1 : 0;
+}
+
 // ============================================================================
 // TradeRepository Implementation
 // ============================================================================
@@ -44,6 +109,24 @@ export class TradeRepository implements ITradeRepository {
   private writeQueue: Array<() => void> = [];
   private isProcessingQueue = false;
 
+  // Cached prepared statements
+  private statements: {
+    insertTrade?: Statement;
+    insertFeatures?: Statement;
+    updateOutcome?: Statement;
+    insertPrice?: Statement;
+    selectByConditionId?: Statement;
+    selectById?: Statement;
+    selectPending?: Statement;
+    selectByDateRange?: Statement;
+    selectBySymbol?: Statement;
+    selectFeatures?: Statement;
+    selectPrices?: Statement;
+    selectStats?: Statement;
+    selectRegimeStats?: Statement;
+    selectCalibration?: Statement;
+  } = {};
+
   constructor(config: Partial<PersistenceConfig> = {}) {
     this.config = {
       enabled: config.enabled ?? true,
@@ -51,6 +134,21 @@ export class TradeRepository implements ITradeRepository {
       syncMode: config.syncMode ?? 'async',
       vacuumIntervalHours: config.vacuumIntervalHours ?? 24,
     };
+  }
+
+  // ============================================================================
+  // Database Access (Safe Getter)
+  // ============================================================================
+
+  /**
+   * Get the database connection, throwing if not initialized.
+   * This replaces all `this.db!` non-null assertions with a type-safe accessor.
+   */
+  private get database(): Database.Database {
+    if (!this.db) {
+      throw new Error('TradeRepository not initialized. Call initialize() first.');
+    }
+    return this.db;
   }
 
   // ============================================================================
@@ -64,6 +162,9 @@ export class TradeRepository implements ITradeRepository {
     if (!this.config.enabled) {
       return;
     }
+
+    // Validate database path is within allowed directory
+    this.validateDbPath(this.config.dbPath);
 
     // Ensure directory exists
     const dbDir = dirname(this.config.dbPath);
@@ -80,268 +181,123 @@ export class TradeRepository implements ITradeRepository {
 
     // Run migrations
     await this.runMigrations();
+
+    // Initialize prepared statements
+    this.initializeStatements();
   }
 
   /**
-   * Close the database connection
+   * Validate that the database path is within an allowed directory
    */
-  async close(): Promise<void> {
-    // Process any remaining writes
-    await this.flushWriteQueue();
+  private validateDbPath(dbPath: string): void {
+    const resolvedPath = resolve(dbPath);
+    const allowedBase = resolve(DEFAULT_ALLOWED_BASE_DIR);
 
-    if (this.db) {
-      this.db.close();
-      this.db = null;
+    // Allow paths within the data directory or test-data directory (for tests)
+    const testBase = resolve('./test-data');
+    if (!resolvedPath.startsWith(allowedBase) && !resolvedPath.startsWith(testBase)) {
+      throw new Error(
+        `Database path must be within '${DEFAULT_ALLOWED_BASE_DIR}' or './test-data' directory. ` +
+        `Got: ${dbPath} (resolved: ${resolvedPath})`
+      );
     }
   }
 
-  // ============================================================================
-  // Write Operations
-  // ============================================================================
-
   /**
-   * Record a new trade with its features
-   * @returns The database ID of the inserted trade
+   * Initialize cached prepared statements for better performance
    */
-  async recordTrade(trade: TradeRecord): Promise<number> {
-    this.ensureInitialized();
+  private initializeStatements(): void {
+    const db = this.database;
 
-    const insertTrade = (): number => {
-      const stmt = this.db!.prepare(`
-        INSERT INTO trades (
-          condition_id, slug, symbol, side, entry_price, position_size,
-          signal_timestamp, probability, linear_combination, imputed_count,
-          state_minute, hour_of_day, day_of_week, volatility_regime,
-          volatility_5m, window_open_price, entry_bid_price, entry_ask_price
-        ) VALUES (
-          @conditionId, @slug, @symbol, @side, @entryPrice, @positionSize,
-          @signalTimestamp, @probability, @linearCombination, @imputedCount,
-          @stateMinute, @hourOfDay, @dayOfWeek, @volatilityRegime,
-          @volatility5m, @windowOpenPrice, @entryBidPrice, @entryAskPrice
-        )
-      `);
+    this.statements.insertTrade = db.prepare(`
+      INSERT INTO trades (
+        condition_id, slug, symbol, side, entry_price, position_size,
+        signal_timestamp, probability, linear_combination, imputed_count,
+        state_minute, hour_of_day, day_of_week, volatility_regime,
+        volatility_5m, window_open_price, entry_bid_price, entry_ask_price
+      ) VALUES (
+        @conditionId, @slug, @symbol, @side, @entryPrice, @positionSize,
+        @signalTimestamp, @probability, @linearCombination, @imputedCount,
+        @stateMinute, @hourOfDay, @dayOfWeek, @volatilityRegime,
+        @volatility5m, @windowOpenPrice, @entryBidPrice, @entryAskPrice
+      )
+    `);
 
-      const result = stmt.run({
-        conditionId: trade.conditionId,
-        slug: trade.slug,
-        symbol: trade.symbol,
-        side: trade.side,
-        entryPrice: trade.entryPrice,
-        positionSize: trade.positionSize,
-        signalTimestamp: trade.signalTimestamp,
-        probability: trade.probability,
-        linearCombination: trade.linearCombination,
-        imputedCount: trade.imputedCount,
-        stateMinute: trade.stateMinute,
-        hourOfDay: trade.hourOfDay,
-        dayOfWeek: trade.dayOfWeek,
-        volatilityRegime: trade.volatilityRegime ?? null,
-        volatility5m: this.nullifyNaN(trade.volatility5m),
-        windowOpenPrice: this.nullifyNaN(trade.windowOpenPrice),
-        entryBidPrice: this.nullifyNaN(trade.entryBidPrice),
-        entryAskPrice: this.nullifyNaN(trade.entryAskPrice),
-      });
+    this.statements.insertFeatures = db.prepare(`
+      INSERT INTO trade_features (
+        trade_id, state_minute, minutes_remaining, hour_of_day, day_of_week,
+        return_since_open, max_run_up, max_run_down, return_1m, return_3m,
+        return_5m, volatility_5m, has_up_hit, has_down_hit,
+        first_up_hit_minute, first_down_hit_minute
+      ) VALUES (
+        @tradeId, @stateMinute, @minutesRemaining, @hourOfDay, @dayOfWeek,
+        @returnSinceOpen, @maxRunUp, @maxRunDown, @return1m, @return3m,
+        @return5m, @volatility5m, @hasUpHit, @hasDownHit,
+        @firstUpHitMinute, @firstDownHitMinute
+      )
+    `);
 
-      const tradeId = result.lastInsertRowid as number;
+    this.statements.updateOutcome = db.prepare(`
+      UPDATE trades SET
+        outcome = @outcome,
+        is_win = @isWin,
+        pnl = @pnl,
+        resolution_timestamp = @resolutionTimestamp,
+        window_close_price = @windowClosePrice,
+        time_to_up_threshold = @timeToUpThreshold,
+        time_to_down_threshold = @timeToDownThreshold,
+        max_favorable_excursion = @maxFavorableExcursion,
+        max_adverse_excursion = @maxAdverseExcursion,
+        updated_at = @updatedAt
+      WHERE condition_id = @conditionId
+    `);
 
-      // Insert features
-      this.insertFeatures(tradeId, trade.features);
+    this.statements.insertPrice = db.prepare(`
+      INSERT OR REPLACE INTO trade_prices (trade_id, minute_offset, timestamp, price)
+      VALUES (@tradeId, @minuteOffset, @timestamp, @price)
+    `);
 
-      return tradeId;
-    };
-
-    if (this.config.syncMode === 'sync') {
-      return insertTrade();
-    }
-
-    // Async mode: queue the write and return immediately
-    return new Promise((resolve) => {
-      this.queueWrite(() => {
-        const id = insertTrade();
-        resolve(id);
-      });
-    });
-  }
-
-  /**
-   * Update trade outcome on resolution
-   */
-  async updateOutcome(conditionId: string, outcome: TradeOutcome): Promise<void> {
-    this.ensureInitialized();
-
-    const update = (): void => {
-      const stmt = this.db!.prepare(`
-        UPDATE trades SET
-          outcome = @outcome,
-          is_win = @isWin,
-          pnl = @pnl,
-          resolution_timestamp = @resolutionTimestamp,
-          window_close_price = @windowClosePrice,
-          time_to_up_threshold = @timeToUpThreshold,
-          time_to_down_threshold = @timeToDownThreshold,
-          max_favorable_excursion = @maxFavorableExcursion,
-          max_adverse_excursion = @maxAdverseExcursion,
-          updated_at = @updatedAt
-        WHERE condition_id = @conditionId
-      `);
-
-      stmt.run({
-        conditionId,
-        outcome: outcome.outcome,
-        isWin: outcome.isWin ? 1 : 0,
-        pnl: outcome.pnl,
-        resolutionTimestamp: outcome.resolutionTimestamp,
-        windowClosePrice: outcome.windowClosePrice,
-        timeToUpThreshold: outcome.timeToUpThreshold ?? null,
-        timeToDownThreshold: outcome.timeToDownThreshold ?? null,
-        maxFavorableExcursion: outcome.maxFavorableExcursion,
-        maxAdverseExcursion: outcome.maxAdverseExcursion,
-        updatedAt: Date.now(),
-      });
-    };
-
-    if (this.config.syncMode === 'sync') {
-      update();
-      return;
-    }
-
-    return new Promise((resolve) => {
-      this.queueWrite(() => {
-        update();
-        resolve();
-      });
-    });
-  }
-
-  /**
-   * Record a minute price snapshot
-   */
-  async recordMinutePrice(
-    tradeId: number,
-    minute: number,
-    price: number,
-    timestamp: number
-  ): Promise<void> {
-    this.ensureInitialized();
-
-    const insert = (): void => {
-      const stmt = this.db!.prepare(`
-        INSERT OR REPLACE INTO trade_prices (trade_id, minute_offset, timestamp, price)
-        VALUES (@tradeId, @minuteOffset, @timestamp, @price)
-      `);
-
-      stmt.run({
-        tradeId,
-        minuteOffset: minute,
-        timestamp,
-        price,
-      });
-    };
-
-    if (this.config.syncMode === 'sync') {
-      insert();
-      return;
-    }
-
-    return new Promise((resolve) => {
-      this.queueWrite(() => {
-        insert();
-        resolve();
-      });
-    });
-  }
-
-  // ============================================================================
-  // Read Operations
-  // ============================================================================
-
-  /**
-   * Get trade by Polymarket condition ID
-   */
-  async getTradeByConditionId(conditionId: string): Promise<TradeRecord | null> {
-    this.ensureInitialized();
-
-    const stmt = this.db!.prepare(`
+    this.statements.selectByConditionId = db.prepare(`
       SELECT * FROM trades WHERE condition_id = ?
     `);
 
-    const row = stmt.get(conditionId) as TradeRow | undefined;
-    if (!row) return null;
-
-    return this.rowToTradeRecord(row);
-  }
-
-  /**
-   * Get trade by database ID
-   */
-  async getTradeById(id: number): Promise<TradeRecord | null> {
-    this.ensureInitialized();
-
-    const stmt = this.db!.prepare(`
+    this.statements.selectById = db.prepare(`
       SELECT * FROM trades WHERE id = ?
     `);
 
-    const row = stmt.get(id) as TradeRow | undefined;
-    if (!row) return null;
-
-    return this.rowToTradeRecord(row);
-  }
-
-  /**
-   * Get all trades awaiting resolution
-   */
-  async getPendingTrades(): Promise<TradeRecord[]> {
-    this.ensureInitialized();
-
-    const stmt = this.db!.prepare(`
-      SELECT * FROM trades WHERE outcome IS NULL ORDER BY signal_timestamp ASC
+    this.statements.selectPending = db.prepare(`
+      SELECT * FROM trades WHERE outcome IS NULL ORDER BY signal_timestamp ASC LIMIT ?
     `);
 
-    const rows = stmt.all() as TradeRow[];
-    return Promise.all(rows.map((row) => this.rowToTradeRecord(row)));
-  }
-
-  // ============================================================================
-  // Analysis Queries
-  // ============================================================================
-
-  /**
-   * Get trades within a date range
-   */
-  async getTradesByDateRange(start: Date, end: Date): Promise<TradeRecord[]> {
-    this.ensureInitialized();
-
-    const stmt = this.db!.prepare(`
+    this.statements.selectByDateRange = db.prepare(`
       SELECT * FROM trades
       WHERE signal_timestamp >= ? AND signal_timestamp <= ?
       ORDER BY signal_timestamp ASC
     `);
 
-    const rows = stmt.all(start.getTime(), end.getTime()) as TradeRow[];
-    return Promise.all(rows.map((row) => this.rowToTradeRecord(row)));
-  }
-
-  /**
-   * Get trades for a specific symbol
-   */
-  async getTradesBySymbol(symbol: CryptoAsset): Promise<TradeRecord[]> {
-    this.ensureInitialized();
-
-    const stmt = this.db!.prepare(`
+    this.statements.selectBySymbol = db.prepare(`
       SELECT * FROM trades WHERE symbol = ? ORDER BY signal_timestamp ASC
     `);
 
-    const rows = stmt.all(symbol) as TradeRow[];
-    return Promise.all(rows.map((row) => this.rowToTradeRecord(row)));
-  }
+    this.statements.selectFeatures = db.prepare(`
+      SELECT * FROM trade_features WHERE trade_id = ?
+    `);
 
-  /**
-   * Get performance statistics by volatility regime
-   */
-  async getPerformanceByRegime(regime: VolatilityRegime): Promise<RegimeStats> {
-    this.ensureInitialized();
+    this.statements.selectPrices = db.prepare(`
+      SELECT * FROM trade_prices WHERE trade_id = ? ORDER BY minute_offset ASC
+    `);
 
-    const stmt = this.db!.prepare(`
+    this.statements.selectStats = db.prepare(`
+      SELECT
+        COUNT(*) as total,
+        SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) as pending,
+        SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) as resolved,
+        MIN(signal_timestamp) as oldest,
+        MAX(signal_timestamp) as newest
+      FROM trades
+    `);
+
+    this.statements.selectRegimeStats = db.prepare(`
       SELECT
         COUNT(*) as total_trades,
         SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
@@ -352,31 +308,7 @@ export class TradeRepository implements ITradeRepository {
       WHERE volatility_regime = ? AND outcome IS NOT NULL
     `);
 
-    const row = stmt.get(regime) as {
-      total_trades: number;
-      wins: number;
-      win_rate: number | null;
-      avg_pnl: number | null;
-      total_pnl: number | null;
-    };
-
-    return {
-      regime,
-      totalTrades: row.total_trades,
-      wins: row.wins ?? 0,
-      winRate: (row.win_rate ?? 0) * 100,
-      avgPnl: row.avg_pnl ?? 0,
-      totalPnl: row.total_pnl ?? 0,
-    };
-  }
-
-  /**
-   * Get calibration data for all probability buckets
-   */
-  async getCalibrationData(): Promise<CalibrationBucket[]> {
-    this.ensureInitialized();
-
-    const stmt = this.db!.prepare(`
+    this.statements.selectCalibration = db.prepare(`
       SELECT
         CASE
           WHEN probability >= 0.75 THEN '0.75+'
@@ -400,8 +332,243 @@ export class TradeRepository implements ITradeRepository {
       GROUP BY bucket
       ORDER BY avg_predicted DESC
     `);
+  }
 
-    const rows = stmt.all() as Array<{
+  /**
+   * Close the database connection
+   */
+  async close(): Promise<void> {
+    // Process any remaining writes
+    await this.flushWriteQueue();
+
+    // Clear cached statements
+    this.statements = {};
+
+    if (this.db) {
+      this.db.close();
+      this.db = null;
+    }
+  }
+
+  // ============================================================================
+  // Write Operations
+  // ============================================================================
+
+  /**
+   * Execute a write operation, handling sync/async mode.
+   * In async mode, errors are properly propagated via promise rejection.
+   */
+  private executeWrite<T>(operation: () => T): Promise<T> {
+    if (this.config.syncMode === 'sync') {
+      return Promise.resolve(operation());
+    }
+
+    // Async mode: queue the write with proper error handling
+    return new Promise((resolve, reject) => {
+      this.queueWrite(() => {
+        try {
+          const result = operation();
+          resolve(result);
+        } catch (error) {
+          reject(error);
+        }
+      });
+    });
+  }
+
+  /**
+   * Record a new trade with its features.
+   * Uses a transaction to ensure atomicity - both trade and features are
+   * inserted together or neither is inserted.
+   * @returns The database ID of the inserted trade
+   */
+  async recordTrade(trade: TradeRecord): Promise<number> {
+    this.ensureInitialized();
+
+    return this.executeWrite(() => {
+      // Wrap in transaction for atomicity (trade + features)
+      const insertTradeWithFeatures = this.database.transaction(() => {
+        const stmt = this.statements.insertTrade!;
+
+        const result = stmt.run({
+          conditionId: trade.conditionId,
+          slug: trade.slug,
+          symbol: trade.symbol,
+          side: trade.side,
+          entryPrice: trade.entryPrice,
+          positionSize: trade.positionSize,
+          signalTimestamp: trade.signalTimestamp,
+          probability: trade.probability,
+          linearCombination: trade.linearCombination,
+          imputedCount: trade.imputedCount,
+          stateMinute: trade.stateMinute,
+          hourOfDay: trade.hourOfDay,
+          dayOfWeek: trade.dayOfWeek,
+          volatilityRegime: trade.volatilityRegime ?? null,
+          volatility5m: this.nullifyNaN(trade.volatility5m),
+          windowOpenPrice: this.nullifyNaN(trade.windowOpenPrice),
+          entryBidPrice: this.nullifyNaN(trade.entryBidPrice),
+          entryAskPrice: this.nullifyNaN(trade.entryAskPrice),
+        });
+
+        // Safely convert bigint to number
+        const tradeId = Number(result.lastInsertRowid);
+        if (!Number.isSafeInteger(tradeId)) {
+          throw new Error(`Trade ID ${result.lastInsertRowid} exceeds safe integer range`);
+        }
+
+        // Insert features (within same transaction)
+        this.insertFeatures(tradeId, trade.features);
+
+        return tradeId;
+      });
+
+      return insertTradeWithFeatures();
+    });
+  }
+
+  /**
+   * Update trade outcome on resolution
+   */
+  async updateOutcome(conditionId: string, outcome: TradeOutcome): Promise<void> {
+    this.ensureInitialized();
+
+    return this.executeWrite(() => {
+      const stmt = this.statements.updateOutcome!;
+
+      stmt.run({
+        conditionId,
+        outcome: outcome.outcome,
+        isWin: boolToInt(outcome.isWin),
+        pnl: outcome.pnl,
+        resolutionTimestamp: outcome.resolutionTimestamp,
+        windowClosePrice: outcome.windowClosePrice,
+        timeToUpThreshold: outcome.timeToUpThreshold ?? null,
+        timeToDownThreshold: outcome.timeToDownThreshold ?? null,
+        maxFavorableExcursion: outcome.maxFavorableExcursion,
+        maxAdverseExcursion: outcome.maxAdverseExcursion,
+        updatedAt: Date.now(),
+      });
+    });
+  }
+
+  /**
+   * Record a minute price snapshot
+   */
+  async recordMinutePrice(
+    tradeId: number,
+    minute: number,
+    price: number,
+    timestamp: number
+  ): Promise<void> {
+    this.ensureInitialized();
+
+    return this.executeWrite(() => {
+      const stmt = this.statements.insertPrice!;
+
+      stmt.run({
+        tradeId,
+        minuteOffset: minute,
+        timestamp,
+        price,
+      });
+    });
+  }
+
+  // ============================================================================
+  // Read Operations
+  // ============================================================================
+
+  /**
+   * Get trade by Polymarket condition ID
+   */
+  async getTradeByConditionId(conditionId: string): Promise<TradeRecord | null> {
+    this.ensureInitialized();
+
+    const row = this.statements.selectByConditionId!.get(conditionId) as TradeRow | undefined;
+    if (!row) return null;
+
+    return this.rowToTradeRecord(row);
+  }
+
+  /**
+   * Get trade by database ID
+   */
+  async getTradeById(id: number): Promise<TradeRecord | null> {
+    this.ensureInitialized();
+
+    const row = this.statements.selectById!.get(id) as TradeRow | undefined;
+    if (!row) return null;
+
+    return this.rowToTradeRecord(row);
+  }
+
+  /**
+   * Get all trades awaiting resolution
+   * @param limit Maximum number of trades to return (default: 1000)
+   */
+  async getPendingTrades(limit: number = 1000): Promise<TradeRecord[]> {
+    this.ensureInitialized();
+
+    const rows = this.statements.selectPending!.all(limit) as TradeRow[];
+    return this.rowsToTradeRecords(rows);
+  }
+
+  // ============================================================================
+  // Analysis Queries
+  // ============================================================================
+
+  /**
+   * Get trades within a date range
+   */
+  async getTradesByDateRange(start: Date, end: Date): Promise<TradeRecord[]> {
+    this.ensureInitialized();
+
+    const rows = this.statements.selectByDateRange!.all(start.getTime(), end.getTime()) as TradeRow[];
+    return this.rowsToTradeRecords(rows);
+  }
+
+  /**
+   * Get trades for a specific symbol
+   */
+  async getTradesBySymbol(symbol: CryptoAsset): Promise<TradeRecord[]> {
+    this.ensureInitialized();
+
+    const rows = this.statements.selectBySymbol!.all(symbol) as TradeRow[];
+    return this.rowsToTradeRecords(rows);
+  }
+
+  /**
+   * Get performance statistics by volatility regime
+   */
+  async getPerformanceByRegime(regime: VolatilityRegime): Promise<RegimeStats> {
+    this.ensureInitialized();
+
+    const row = this.statements.selectRegimeStats!.get(regime) as {
+      total_trades: number;
+      wins: number;
+      win_rate: number | null;
+      avg_pnl: number | null;
+      total_pnl: number | null;
+    };
+
+    return {
+      regime,
+      totalTrades: row.total_trades,
+      wins: row.wins ?? 0,
+      winRate: (row.win_rate ?? 0) * 100,
+      avgPnl: row.avg_pnl ?? 0,
+      totalPnl: row.total_pnl ?? 0,
+    };
+  }
+
+  /**
+   * Get calibration data for all probability buckets
+   */
+  async getCalibrationData(): Promise<CalibrationBucket[]> {
+    this.ensureInitialized();
+
+    const rows = this.statements.selectCalibration!.all() as Array<{
       bucket: string;
       trades: number;
       avg_predicted: number;
@@ -431,7 +598,7 @@ export class TradeRepository implements ITradeRepository {
    */
   async vacuum(): Promise<void> {
     this.ensureInitialized();
-    this.db!.exec('VACUUM');
+    this.database.exec('VACUUM');
   }
 
   /**
@@ -440,17 +607,7 @@ export class TradeRepository implements ITradeRepository {
   async getStats(): Promise<DatabaseStats> {
     this.ensureInitialized();
 
-    const countStmt = this.db!.prepare(`
-      SELECT
-        COUNT(*) as total,
-        SUM(CASE WHEN outcome IS NULL THEN 1 ELSE 0 END) as pending,
-        SUM(CASE WHEN outcome IS NOT NULL THEN 1 ELSE 0 END) as resolved,
-        MIN(signal_timestamp) as oldest,
-        MAX(signal_timestamp) as newest
-      FROM trades
-    `);
-
-    const row = countStmt.get() as {
+    const row = this.statements.selectStats!.get() as {
       total: number;
       pending: number;
       resolved: number;
@@ -482,16 +639,18 @@ export class TradeRepository implements ITradeRepository {
    * Run pending migrations
    */
   private async runMigrations(): Promise<void> {
+    const db = this.database;
+
     // Get current schema version
     let currentVersion = 0;
     try {
-      const versionStmt = this.db!.prepare(
+      const versionStmt = db.prepare(
         'SELECT MAX(version) as version FROM schema_version'
       );
       const row = versionStmt.get() as { version: number | null } | undefined;
       currentVersion = row?.version ?? 0;
     } catch {
-      // Table doesn't exist yet, version is 0
+      // Schema version table doesn't exist yet, version is 0
     }
 
     // Load and run migrations
@@ -501,7 +660,7 @@ export class TradeRepository implements ITradeRepository {
       const version = this.extractMigrationVersion(file);
       if (version > currentVersion) {
         const sql = readFileSync(join(MIGRATIONS_DIR, file), 'utf-8');
-        this.db!.exec(sql);
+        db.exec(sql);
       }
     }
   }
@@ -510,9 +669,8 @@ export class TradeRepository implements ITradeRepository {
    * Get sorted list of migration files
    */
   private getMigrationFiles(): string[] {
-    const { readdirSync } = require('fs');
     try {
-      const files = readdirSync(MIGRATIONS_DIR) as string[];
+      const files = readdirSync(MIGRATIONS_DIR);
       return files
         .filter((f: string) => f.endsWith('.sql'))
         .sort((a: string, b: string) => {
@@ -521,6 +679,7 @@ export class TradeRepository implements ITradeRepository {
           return versionA - versionB;
         });
     } catch {
+      // Migrations directory doesn't exist
       return [];
     }
   }
@@ -538,7 +697,7 @@ export class TradeRepository implements ITradeRepository {
   // ============================================================================
 
   /**
-   * Ensure database is initialized
+   * Ensure database is initialized (for methods that don't use this.database getter)
    */
   private ensureInitialized(): void {
     if (!this.db) {
@@ -560,19 +719,7 @@ export class TradeRepository implements ITradeRepository {
    * Insert feature vector for a trade
    */
   private insertFeatures(tradeId: number, features: FeatureVector): void {
-    const stmt = this.db!.prepare(`
-      INSERT INTO trade_features (
-        trade_id, state_minute, minutes_remaining, hour_of_day, day_of_week,
-        return_since_open, max_run_up, max_run_down, return_1m, return_3m,
-        return_5m, volatility_5m, has_up_hit, has_down_hit,
-        first_up_hit_minute, first_down_hit_minute
-      ) VALUES (
-        @tradeId, @stateMinute, @minutesRemaining, @hourOfDay, @dayOfWeek,
-        @returnSinceOpen, @maxRunUp, @maxRunDown, @return1m, @return3m,
-        @return5m, @volatility5m, @hasUpHit, @hasDownHit,
-        @firstUpHitMinute, @firstDownHitMinute
-      )
-    `);
+    const stmt = this.statements.insertFeatures!;
 
     stmt.run({
       tradeId,
@@ -587,24 +734,78 @@ export class TradeRepository implements ITradeRepository {
       return3m: this.nullifyNaN(features.return3m),
       return5m: this.nullifyNaN(features.return5m),
       volatility5m: this.nullifyNaN(features.volatility5m),
-      hasUpHit: features.hasUpHit ? 1 : 0,
-      hasDownHit: features.hasDownHit ? 1 : 0,
+      hasUpHit: boolToInt(features.hasUpHit),
+      hasDownHit: boolToInt(features.hasDownHit),
       firstUpHitMinute: this.nullifyNaN(features.firstUpHitMinute),
       firstDownHitMinute: this.nullifyNaN(features.firstDownHitMinute),
     });
   }
 
   /**
-   * Get features for a trade
+   * Batch fetch features for multiple trades (fixes N+1 query)
    */
-  private getFeatures(tradeId: number): FeatureVector | null {
-    const stmt = this.db!.prepare(`
-      SELECT * FROM trade_features WHERE trade_id = ?
+  private batchGetFeatures(tradeIds: number[]): Map<number, FeatureRow> {
+    if (tradeIds.length === 0) return new Map();
+
+    const placeholders = tradeIds.map(() => '?').join(',');
+    const stmt = this.database.prepare(`
+      SELECT * FROM trade_features WHERE trade_id IN (${placeholders})
     `);
 
-    const row = stmt.get(tradeId) as FeatureRow | undefined;
-    if (!row) return null;
+    const rows = stmt.all(...tradeIds) as FeatureRow[];
+    const map = new Map<number, FeatureRow>();
+    for (const row of rows) {
+      map.set(row.trade_id, row);
+    }
+    return map;
+  }
 
+  /**
+   * Batch fetch minute prices for multiple trades (fixes N+1 query)
+   */
+  private batchGetPrices(tradeIds: number[]): Map<number, PriceRow[]> {
+    if (tradeIds.length === 0) return new Map();
+
+    const placeholders = tradeIds.map(() => '?').join(',');
+    const stmt = this.database.prepare(`
+      SELECT * FROM trade_prices WHERE trade_id IN (${placeholders}) ORDER BY minute_offset ASC
+    `);
+
+    const rows = stmt.all(...tradeIds) as PriceRow[];
+    const map = new Map<number, PriceRow[]>();
+
+    for (const row of rows) {
+      const existing = map.get(row.trade_id) || [];
+      existing.push(row);
+      map.set(row.trade_id, existing);
+    }
+    return map;
+  }
+
+  /**
+   * Get features for a single trade
+   */
+  private getFeatures(tradeId: number): FeatureRow | null {
+    const row = this.statements.selectFeatures!.get(tradeId) as FeatureRow | undefined;
+    return row ?? null;
+  }
+
+  /**
+   * Get minute prices for a single trade
+   */
+  private getMinutePrices(tradeId: number): MinutePrice[] {
+    const rows = this.statements.selectPrices!.all(tradeId) as PriceRow[];
+    return rows.map((row) => ({
+      minuteOffset: row.minute_offset,
+      timestamp: row.timestamp,
+      price: row.price,
+    }));
+  }
+
+  /**
+   * Convert a feature row to FeatureVector
+   */
+  private featureRowToVector(row: FeatureRow, symbol: CryptoAsset, timestamp: number): FeatureVector {
     return {
       stateMinute: row.state_minute,
       minutesRemaining: row.minutes_remaining,
@@ -621,61 +822,85 @@ export class TradeRepository implements ITradeRepository {
       hasDownHit: row.has_down_hit === 1,
       firstUpHitMinute: row.first_up_hit_minute ?? NaN,
       firstDownHitMinute: row.first_down_hit_minute ?? NaN,
-      asset: 'BTC' as CryptoAsset, // Will be overwritten from trade row
-      timestamp: 0, // Will be overwritten from trade row
+      asset: symbol,
+      timestamp,
     };
   }
 
   /**
-   * Get minute prices for a trade
+   * Convert multiple database rows to TradeRecords with batched queries (fixes N+1)
    */
-  private getMinutePrices(tradeId: number): MinutePrice[] {
-    const stmt = this.db!.prepare(`
-      SELECT * FROM trade_prices WHERE trade_id = ? ORDER BY minute_offset ASC
-    `);
+  private rowsToTradeRecords(rows: TradeRow[]): TradeRecord[] {
+    if (rows.length === 0) return [];
 
-    const rows = stmt.all(tradeId) as PriceRow[];
-    return rows.map((row) => ({
-      minuteOffset: row.minute_offset,
-      timestamp: row.timestamp,
-      price: row.price,
-    }));
+    const tradeIds = rows.map((r) => r.id);
+    const featuresMap = this.batchGetFeatures(tradeIds);
+    const pricesMap = this.batchGetPrices(tradeIds);
+
+    return rows.map((row) => {
+      const featureRow = featuresMap.get(row.id);
+      if (!featureRow) {
+        throw new Error(`Data integrity error: Features not found for trade ${row.id}`);
+      }
+
+      const symbol = assertCryptoAsset(row.symbol);
+      const features = this.featureRowToVector(featureRow, symbol, row.signal_timestamp);
+      const priceRows = pricesMap.get(row.id) || [];
+      const minutePrices = priceRows.map((p) => ({
+        minuteOffset: p.minute_offset,
+        timestamp: p.timestamp,
+        price: p.price,
+      }));
+
+      return this.buildTradeRecord(row, features, minutePrices);
+    });
   }
 
   /**
-   * Convert database row to TradeRecord
+   * Convert a single database row to TradeRecord
    */
-  private async rowToTradeRecord(row: TradeRow): Promise<TradeRecord> {
-    const features = this.getFeatures(row.id);
-    const minutePrices = this.getMinutePrices(row.id);
-
-    // Update feature metadata from trade row
-    if (features) {
-      features.asset = row.symbol as CryptoAsset;
-      features.timestamp = row.signal_timestamp;
+  private rowToTradeRecord(row: TradeRow): TradeRecord {
+    const featureRow = this.getFeatures(row.id);
+    if (!featureRow) {
+      throw new Error(`Data integrity error: Features not found for trade ${row.id}`);
     }
 
+    const symbol = assertCryptoAsset(row.symbol);
+    const features = this.featureRowToVector(featureRow, symbol, row.signal_timestamp);
+    const minutePrices = this.getMinutePrices(row.id);
+
+    return this.buildTradeRecord(row, features, minutePrices);
+  }
+
+  /**
+   * Build a TradeRecord from validated components
+   */
+  private buildTradeRecord(
+    row: TradeRow,
+    features: FeatureVector,
+    minutePrices: MinutePrice[]
+  ): TradeRecord {
     return {
       id: row.id,
       conditionId: row.condition_id,
       slug: row.slug,
-      symbol: row.symbol as CryptoAsset,
-      side: row.side as 'YES' | 'NO',
+      symbol: assertCryptoAsset(row.symbol),
+      side: assertTradeSide(row.side),
       entryPrice: row.entry_price,
       positionSize: row.position_size,
       signalTimestamp: row.signal_timestamp,
       probability: row.probability,
       linearCombination: row.linear_combination,
       imputedCount: row.imputed_count,
-      features: features!,
-      outcome: row.outcome as 'UP' | 'DOWN' | undefined,
+      features,
+      outcome: assertTradeOutcome(row.outcome),
       isWin: row.is_win === null ? undefined : row.is_win === 1,
       pnl: row.pnl ?? undefined,
       resolutionTimestamp: row.resolution_timestamp ?? undefined,
       stateMinute: row.state_minute,
       hourOfDay: row.hour_of_day,
       dayOfWeek: row.day_of_week,
-      volatilityRegime: row.volatility_regime as VolatilityRegime | undefined,
+      volatilityRegime: assertVolatilityRegime(row.volatility_regime),
       volatility5m: row.volatility_5m ?? undefined,
       timeToUpThreshold: row.time_to_up_threshold ?? undefined,
       timeToDownThreshold: row.time_to_down_threshold ?? undefined,
@@ -737,7 +962,8 @@ export class TradeRepository implements ITradeRepository {
         try {
           operation();
         } catch (error) {
-          console.error('TradeRepository write error:', error);
+          const message = error instanceof Error ? error.message : String(error);
+          console.error('TradeRepository write error:', message);
         }
       }
       this.isProcessingQueue = false;

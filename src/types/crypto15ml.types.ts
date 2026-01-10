@@ -71,4 +71,10 @@ export type {
   TradeSide,
   PersistenceConfig,
 } from './trade-record.types.js';
-export { DEFAULT_PERSISTENCE_CONFIG } from './trade-record.types.js';
+export {
+  DEFAULT_PERSISTENCE_CONFIG,
+  VALID_CRYPTO_ASSETS,
+  VALID_TRADE_SIDES,
+  VALID_VOLATILITY_REGIMES,
+  VALID_TRADE_OUTCOMES,
+} from './trade-record.types.js';

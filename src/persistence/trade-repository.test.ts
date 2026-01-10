@@ -7,10 +7,10 @@
  */
 
 import { describe, it, expect, beforeEach, afterEach } from 'vitest';
-import { existsSync, unlinkSync, mkdirSync, rmSync } from 'fs';
+import { existsSync, unlinkSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { TradeRepository } from './trade-repository.js';
-import type { TradeRecord, TradeOutcome } from '../types/trade-record.types.js';
+import type { TradeRecord, TradeOutcome, PersistenceConfig } from '../types/trade-record.types.js';
 import type { FeatureVector, CryptoAsset } from '../strategies/crypto15-feature-engine.js';
 
 // ============================================================================
@@ -79,6 +79,54 @@ function createTestOutcome(overrides: Partial<TradeOutcome> = {}): TradeOutcome 
 }
 
 // ============================================================================
+// Test Setup Helpers (extracted to reduce duplication)
+// ============================================================================
+
+/**
+ * Clean up database files (main db + WAL + SHM)
+ */
+function cleanupDatabaseFiles(basePath: string): void {
+  const filesToRemove = [basePath, `${basePath}-wal`, `${basePath}-shm`];
+  for (const file of filesToRemove) {
+    if (existsSync(file)) {
+      unlinkSync(file);
+    }
+  }
+}
+
+/**
+ * Setup test repository with specified sync mode
+ */
+async function setupTestRepository(
+  syncMode: PersistenceConfig['syncMode']
+): Promise<TradeRepository> {
+  // Ensure test directory exists
+  const testDir = dirname(TEST_DB_PATH);
+  if (!existsSync(testDir)) {
+    mkdirSync(testDir, { recursive: true });
+  }
+
+  // Clean up any existing test database
+  cleanupDatabaseFiles(TEST_DB_PATH);
+
+  const repository = new TradeRepository({
+    dbPath: TEST_DB_PATH,
+    syncMode,
+  });
+
+  await repository.initialize();
+  return repository;
+}
+
+/**
+ * Teardown test repository
+ */
+async function teardownTestRepository(repository: TradeRepository): Promise<void> {
+  await repository.close();
+  cleanupDatabaseFiles(TEST_DB_PATH);
+}
+
+// ============================================================================
 // Test Suite
 // ============================================================================
 
@@ -86,45 +134,11 @@ describe('TradeRepository', () => {
   let repository: TradeRepository;
 
   beforeEach(async () => {
-    // Ensure test directory exists
-    const testDir = dirname(TEST_DB_PATH);
-    if (!existsSync(testDir)) {
-      mkdirSync(testDir, { recursive: true });
-    }
-
-    // Clean up any existing test database
-    if (existsSync(TEST_DB_PATH)) {
-      unlinkSync(TEST_DB_PATH);
-    }
-    // Also clean WAL and SHM files
-    if (existsSync(`${TEST_DB_PATH}-wal`)) {
-      unlinkSync(`${TEST_DB_PATH}-wal`);
-    }
-    if (existsSync(`${TEST_DB_PATH}-shm`)) {
-      unlinkSync(`${TEST_DB_PATH}-shm`);
-    }
-
-    repository = new TradeRepository({
-      dbPath: TEST_DB_PATH,
-      syncMode: 'sync', // Use sync mode for predictable testing
-    });
-
-    await repository.initialize();
+    repository = await setupTestRepository('sync');
   });
 
   afterEach(async () => {
-    await repository.close();
-
-    // Clean up test database
-    if (existsSync(TEST_DB_PATH)) {
-      unlinkSync(TEST_DB_PATH);
-    }
-    if (existsSync(`${TEST_DB_PATH}-wal`)) {
-      unlinkSync(`${TEST_DB_PATH}-wal`);
-    }
-    if (existsSync(`${TEST_DB_PATH}-shm`)) {
-      unlinkSync(`${TEST_DB_PATH}-shm`);
-    }
+    await teardownTestRepository(repository);
   });
 
   // ============================================================================
@@ -163,6 +177,17 @@ describe('TradeRepository', () => {
       await disabledRepo.initialize();
       // Should not create database file when disabled
       expect(existsSync('./test-data/disabled.db')).toBe(false);
+    });
+
+    it('should reject database paths outside allowed directories', async () => {
+      const invalidRepo = new TradeRepository({
+        dbPath: '/tmp/invalid-path.db',
+        syncMode: 'sync',
+      });
+
+      await expect(invalidRepo.initialize()).rejects.toThrow(
+        /Database path must be within/
+      );
     });
   });
 
@@ -436,6 +461,17 @@ describe('TradeRepository', () => {
 
       expect(pending).toHaveLength(0);
     });
+
+    it('should respect limit parameter', async () => {
+      // Create 5 trades
+      for (let i = 0; i < 5; i++) {
+        await repository.recordTrade(createTestTrade());
+      }
+
+      const pending = await repository.getPendingTrades(2);
+
+      expect(pending).toHaveLength(2);
+    });
   });
 
   // ============================================================================
@@ -634,6 +670,39 @@ describe('TradeRepository', () => {
       }
     });
   });
+
+  // ============================================================================
+  // Batch Query Tests (N+1 fix verification)
+  // ============================================================================
+
+  describe('batch queries', () => {
+    it('should efficiently fetch multiple trades with getPendingTrades', async () => {
+      // Create multiple trades
+      for (let i = 0; i < 10; i++) {
+        await repository.recordTrade(createTestTrade());
+      }
+
+      // This should use batch queries internally
+      const trades = await repository.getPendingTrades();
+
+      expect(trades).toHaveLength(10);
+      // All trades should have features
+      expect(trades.every((t) => t.features !== null)).toBe(true);
+    });
+
+    it('should efficiently fetch multiple trades with getTradesBySymbol', async () => {
+      // Create trades for different symbols
+      for (let i = 0; i < 5; i++) {
+        await repository.recordTrade(createTestTrade({ symbol: 'BTC' as CryptoAsset }));
+        await repository.recordTrade(createTestTrade({ symbol: 'ETH' as CryptoAsset }));
+      }
+
+      const btcTrades = await repository.getTradesBySymbol('BTC');
+
+      expect(btcTrades).toHaveLength(5);
+      expect(btcTrades.every((t) => t.features !== null)).toBe(true);
+    });
+  });
 });
 
 // ============================================================================
@@ -644,43 +713,11 @@ describe('TradeRepository (async mode)', () => {
   let repository: TradeRepository;
 
   beforeEach(async () => {
-    // Ensure test directory exists
-    const testDir = dirname(TEST_DB_PATH);
-    if (!existsSync(testDir)) {
-      mkdirSync(testDir, { recursive: true });
-    }
-
-    // Clean up any existing test database
-    if (existsSync(TEST_DB_PATH)) {
-      unlinkSync(TEST_DB_PATH);
-    }
-    if (existsSync(`${TEST_DB_PATH}-wal`)) {
-      unlinkSync(`${TEST_DB_PATH}-wal`);
-    }
-    if (existsSync(`${TEST_DB_PATH}-shm`)) {
-      unlinkSync(`${TEST_DB_PATH}-shm`);
-    }
-
-    repository = new TradeRepository({
-      dbPath: TEST_DB_PATH,
-      syncMode: 'async', // Use async mode
-    });
-
-    await repository.initialize();
+    repository = await setupTestRepository('async');
   });
 
   afterEach(async () => {
-    await repository.close();
-
-    if (existsSync(TEST_DB_PATH)) {
-      unlinkSync(TEST_DB_PATH);
-    }
-    if (existsSync(`${TEST_DB_PATH}-wal`)) {
-      unlinkSync(`${TEST_DB_PATH}-wal`);
-    }
-    if (existsSync(`${TEST_DB_PATH}-shm`)) {
-      unlinkSync(`${TEST_DB_PATH}-shm`);
-    }
+    await teardownTestRepository(repository);
   });
 
   it('should complete writes asynchronously', async () => {

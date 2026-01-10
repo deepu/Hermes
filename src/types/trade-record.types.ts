@@ -10,23 +10,39 @@
 import type { CryptoAsset, FeatureVector } from '../strategies/crypto15-feature-engine.js';
 
 // ============================================================================
+// Validation Constants (for runtime type checking)
+// ============================================================================
+
+/** Valid crypto assets for runtime validation */
+export const VALID_CRYPTO_ASSETS = ['BTC', 'ETH', 'SOL', 'XRP'] as const;
+
+/** Valid trade sides for runtime validation */
+export const VALID_TRADE_SIDES = ['YES', 'NO'] as const;
+
+/** Valid volatility regimes for runtime validation */
+export const VALID_VOLATILITY_REGIMES = ['low', 'mid', 'high'] as const;
+
+/** Valid trade outcomes for runtime validation */
+export const VALID_TRADE_OUTCOMES = ['UP', 'DOWN'] as const;
+
+// ============================================================================
 // Core Trade Record Types
 // ============================================================================
 
 /**
  * Volatility regime classification
  */
-export type VolatilityRegime = 'low' | 'mid' | 'high';
+export type VolatilityRegime = (typeof VALID_VOLATILITY_REGIMES)[number];
 
 /**
  * Trade outcome direction
  */
-export type TradeOutcomeDirection = 'UP' | 'DOWN';
+export type TradeOutcomeDirection = (typeof VALID_TRADE_OUTCOMES)[number];
 
 /**
  * Trade side
  */
-export type TradeSide = 'YES' | 'NO';
+export type TradeSide = (typeof VALID_TRADE_SIDES)[number];
 
 /**
  * Complete trade record with all tiers of data
@@ -238,8 +254,8 @@ export interface ITradeRepository {
   // === Read Operations ===
   /** Get trade by Polymarket condition ID */
   getTradeByConditionId(conditionId: string): Promise<TradeRecord | null>;
-  /** Get all trades awaiting resolution */
-  getPendingTrades(): Promise<TradeRecord[]>;
+  /** Get all trades awaiting resolution (with optional limit, default 1000) */
+  getPendingTrades(limit?: number): Promise<TradeRecord[]>;
   /** Get trade by database ID */
   getTradeById(id: number): Promise<TradeRecord | null>;
 
@@ -279,11 +295,11 @@ export interface PersistenceConfig {
 }
 
 /**
- * Default persistence configuration
+ * Default persistence configuration (immutable)
  */
-export const DEFAULT_PERSISTENCE_CONFIG: PersistenceConfig = {
+export const DEFAULT_PERSISTENCE_CONFIG = {
   enabled: true,
   dbPath: './data/crypto15ml/trades.db',
   syncMode: 'async',
   vacuumIntervalHours: 24,
-};
+} as const satisfies PersistenceConfig;
