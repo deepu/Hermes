@@ -549,6 +549,38 @@ export class TradeRepository implements ITradeRepository {
     });
   }
 
+  /**
+   * Record multiple minute price snapshots in a single batch operation
+   *
+   * More efficient than multiple individual recordMinutePrice calls
+   * when persisting prices collected before trade was recorded.
+   * Uses a single transaction for all inserts.
+   */
+  async recordMinutePrices(
+    tradeId: number,
+    prices: ReadonlyArray<MinutePrice>
+  ): Promise<void> {
+    this.ensureInitialized();
+
+    if (prices.length === 0) {
+      return;
+    }
+
+    return this.executeWrite(() => {
+      const stmt = this.getStatement('insertPrice');
+
+      // Run all inserts in a single transaction (already in executeWrite context)
+      for (const mp of prices) {
+        stmt.run({
+          tradeId,
+          minuteOffset: mp.minuteOffset,
+          timestamp: mp.timestamp,
+          price: mp.price,
+        });
+      }
+    });
+  }
+
   // ============================================================================
   // Read Operations
   // ============================================================================
