@@ -10,73 +10,15 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, unlinkSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { TradeRepository } from './trade-repository.js';
-import type { TradeRecord, TradeOutcome, PersistenceConfig } from '../types/trade-record.types.js';
-import type { FeatureVector, CryptoAsset } from '../strategies/crypto15-feature-engine.js';
+import type { PersistenceConfig } from '../types/trade-record.types.js';
+import type { CryptoAsset } from '../strategies/crypto15-feature-engine.js';
+import { createTestTrade, createTestOutcome, createTestFeatures } from './test-fixtures.js';
 
 // ============================================================================
-// Test Fixtures
+// Test Configuration
 // ============================================================================
 
 const TEST_DB_PATH = './test-data/test-trades.db';
-
-function createTestFeatures(overrides: Partial<FeatureVector> = {}): FeatureVector {
-  return {
-    stateMinute: 5,
-    minutesRemaining: 10,
-    hourOfDay: 14,
-    dayOfWeek: 3,
-    returnSinceOpen: 0.0005,
-    maxRunUp: 0.0008,
-    maxRunDown: -0.0003,
-    return1m: 0.0002,
-    return3m: 0.0004,
-    return5m: 0.0006,
-    volatility5m: 0.0012,
-    hasUpHit: false,
-    hasDownHit: false,
-    firstUpHitMinute: NaN,
-    firstDownHitMinute: NaN,
-    asset: 'BTC' as CryptoAsset,
-    timestamp: Date.now(),
-    ...overrides,
-  };
-}
-
-function createTestTrade(overrides: Partial<TradeRecord> = {}): TradeRecord {
-  return {
-    conditionId: `test-cond-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    slug: 'btc-updown-15m-test',
-    symbol: 'BTC' as CryptoAsset,
-    side: 'YES',
-    entryPrice: 0.65,
-    positionSize: 100,
-    signalTimestamp: Date.now(),
-    probability: 0.72,
-    linearCombination: 0.94,
-    imputedCount: 0,
-    features: createTestFeatures(),
-    stateMinute: 5,
-    hourOfDay: 14,
-    dayOfWeek: 3,
-    volatilityRegime: 'mid',
-    volatility5m: 0.0012,
-    windowOpenPrice: 50000,
-    ...overrides,
-  };
-}
-
-function createTestOutcome(overrides: Partial<TradeOutcome> = {}): TradeOutcome {
-  return {
-    outcome: 'UP',
-    isWin: true,
-    pnl: 53.85,
-    resolutionTimestamp: Date.now(),
-    windowClosePrice: 50100,
-    maxFavorableExcursion: 0.003,
-    maxAdverseExcursion: -0.001,
-    ...overrides,
-  };
-}
 
 // ============================================================================
 // Test Setup Helpers (extracted to reduce duplication)
@@ -562,6 +504,128 @@ describe('TradeRepository', () => {
 
       expect(calibration.length).toBeGreaterThan(0);
       expect(calibration.some((b) => b.bucket === '0.75+')).toBe(true);
+    });
+  });
+
+  describe('getSymbolStats', () => {
+    it('should calculate symbol statistics correctly', async () => {
+      // Create trades for BTC with different outcomes
+      for (let i = 0; i < 4; i++) {
+        const trade = createTestTrade({ symbol: 'BTC' as CryptoAsset });
+        await repository.recordTrade(trade);
+        await repository.updateOutcome(
+          trade.conditionId,
+          createTestOutcome({
+            isWin: i < 3, // 3 wins, 1 loss
+            pnl: i < 3 ? 50 : -65,
+          })
+        );
+      }
+
+      const stats = await repository.getSymbolStats('BTC');
+
+      expect(stats.symbol).toBe('BTC');
+      expect(stats.totalTrades).toBe(4);
+      expect(stats.wins).toBe(3);
+      expect(stats.winRate).toBeCloseTo(75, 0);
+      expect(stats.totalPnl).toBe(3 * 50 - 65); // 150 - 65 = 85
+      expect(stats.avgPnl).toBeCloseTo(85 / 4, 1);
+    });
+
+    it('should return zeros for symbol with no resolved trades', async () => {
+      // Create an unresolved trade for ETH
+      const trade = createTestTrade({ symbol: 'ETH' as CryptoAsset });
+      await repository.recordTrade(trade);
+
+      const stats = await repository.getSymbolStats('ETH');
+
+      expect(stats.symbol).toBe('ETH');
+      expect(stats.totalTrades).toBe(0);
+      expect(stats.wins).toBe(0);
+      expect(stats.winRate).toBe(0);
+      expect(stats.totalPnl).toBe(0);
+    });
+  });
+
+  describe('getAllSymbolStats', () => {
+    it('should return statistics for all symbols with trades', async () => {
+      // Create resolved trades for different symbols
+      const symbols: CryptoAsset[] = ['BTC', 'ETH', 'SOL'];
+
+      for (const symbol of symbols) {
+        const trade = createTestTrade({ symbol });
+        await repository.recordTrade(trade);
+        await repository.updateOutcome(
+          trade.conditionId,
+          createTestOutcome({ isWin: true, pnl: 50 })
+        );
+      }
+
+      const allStats = await repository.getAllSymbolStats();
+
+      expect(allStats).toHaveLength(3);
+      expect(allStats.every((s) => s.totalTrades === 1)).toBe(true);
+      expect(allStats.every((s) => s.wins === 1)).toBe(true);
+    });
+
+    it('should exclude symbols with only unresolved trades', async () => {
+      // Create resolved trade for BTC
+      const btcTrade = createTestTrade({ symbol: 'BTC' as CryptoAsset });
+      await repository.recordTrade(btcTrade);
+      await repository.updateOutcome(btcTrade.conditionId, createTestOutcome());
+
+      // Create unresolved trade for ETH
+      const ethTrade = createTestTrade({ symbol: 'ETH' as CryptoAsset });
+      await repository.recordTrade(ethTrade);
+
+      const allStats = await repository.getAllSymbolStats();
+
+      expect(allStats).toHaveLength(1);
+      expect(allStats[0].symbol).toBe('BTC');
+    });
+  });
+
+  describe('getAllRegimeStats', () => {
+    it('should return statistics for all volatility regimes', async () => {
+      // Create resolved trades for each regime
+      const regimes: Array<'low' | 'mid' | 'high'> = ['low', 'mid', 'high'];
+
+      for (const regime of regimes) {
+        const trade = createTestTrade({ volatilityRegime: regime });
+        await repository.recordTrade(trade);
+        await repository.updateOutcome(
+          trade.conditionId,
+          createTestOutcome({ isWin: regime === 'mid', pnl: regime === 'mid' ? 50 : -30 })
+        );
+      }
+
+      const allStats = await repository.getAllRegimeStats();
+
+      expect(allStats).toHaveLength(3);
+      expect(allStats.some((s) => s.regime === 'low')).toBe(true);
+      expect(allStats.some((s) => s.regime === 'mid')).toBe(true);
+      expect(allStats.some((s) => s.regime === 'high')).toBe(true);
+
+      const midStats = allStats.find((s) => s.regime === 'mid');
+      expect(midStats?.wins).toBe(1);
+      expect(midStats?.totalPnl).toBe(50);
+    });
+
+    it('should exclude trades without volatility regime', async () => {
+      // Create trade without regime
+      const tradeNoRegime = createTestTrade({ volatilityRegime: undefined });
+      await repository.recordTrade(tradeNoRegime);
+      await repository.updateOutcome(tradeNoRegime.conditionId, createTestOutcome());
+
+      // Create trade with regime
+      const tradeWithRegime = createTestTrade({ volatilityRegime: 'high' });
+      await repository.recordTrade(tradeWithRegime);
+      await repository.updateOutcome(tradeWithRegime.conditionId, createTestOutcome());
+
+      const allStats = await repository.getAllRegimeStats();
+
+      expect(allStats).toHaveLength(1);
+      expect(allStats[0].regime).toBe('high');
     });
   });
 

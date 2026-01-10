@@ -19,6 +19,7 @@ import type {
   MinutePrice,
   ITradeRepository,
   RegimeStats,
+  SymbolStats,
   CalibrationBucket,
   DatabaseStats,
   VolatilityRegime,
@@ -99,6 +100,7 @@ const tradeOutcomeAsserter = createAsserter<TradeOutcomeDirection>('TradeOutcome
 const assertCryptoAsset = cryptoAssetAsserter.assert;
 const assertTradeSide = tradeSideAsserter.assert;
 const assertVolatilityRegime = volatilityRegimeAsserter.assertNullable;
+const assertVolatilityRegimeRequired = volatilityRegimeAsserter.assert;
 const assertTradeOutcome = tradeOutcomeAsserter.assertNullable;
 
 /**
@@ -133,6 +135,9 @@ export class TradeRepository implements ITradeRepository {
     selectPrices?: Statement;
     selectStats?: Statement;
     selectRegimeStats?: Statement;
+    selectSymbolStats?: Statement;
+    selectAllSymbolStats?: Statement;
+    selectAllRegimeStats?: Statement;
     selectCalibration?: Statement;
   } = {};
 
@@ -338,6 +343,45 @@ export class TradeRepository implements ITradeRepository {
         SUM(pnl) as total_pnl
       FROM trades
       WHERE volatility_regime = ? AND outcome IS NOT NULL
+    `);
+
+    this.statements.selectSymbolStats = db.prepare(`
+      SELECT
+        COUNT(*) as total_trades,
+        SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+        AVG(is_win) as win_rate,
+        AVG(pnl) as avg_pnl,
+        SUM(pnl) as total_pnl
+      FROM trades
+      WHERE symbol = ? AND outcome IS NOT NULL
+    `);
+
+    this.statements.selectAllSymbolStats = db.prepare(`
+      SELECT
+        symbol,
+        COUNT(*) as total_trades,
+        SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+        AVG(is_win) as win_rate,
+        AVG(pnl) as avg_pnl,
+        SUM(pnl) as total_pnl
+      FROM trades
+      WHERE outcome IS NOT NULL
+      GROUP BY symbol
+      ORDER BY total_trades DESC
+    `);
+
+    this.statements.selectAllRegimeStats = db.prepare(`
+      SELECT
+        volatility_regime,
+        COUNT(*) as total_trades,
+        SUM(CASE WHEN is_win = 1 THEN 1 ELSE 0 END) as wins,
+        AVG(is_win) as win_rate,
+        AVG(pnl) as avg_pnl,
+        SUM(pnl) as total_pnl
+      FROM trades
+      WHERE outcome IS NOT NULL AND volatility_regime IS NOT NULL
+      GROUP BY volatility_regime
+      ORDER BY total_trades DESC
     `);
 
     this.statements.selectCalibration = db.prepare(`
@@ -650,22 +694,54 @@ export class TradeRepository implements ITradeRepository {
   async getPerformanceByRegime(regime: VolatilityRegime): Promise<RegimeStats> {
     this.ensureInitialized();
 
-    const row = this.getStatement('selectRegimeStats').get(regime) as {
-      total_trades: number;
-      wins: number;
-      win_rate: number | null;
-      avg_pnl: number | null;
-      total_pnl: number | null;
-    };
+    const row = this.getStatement('selectRegimeStats').get(regime) as StatsRow | undefined;
 
     return {
       regime,
-      totalTrades: row.total_trades,
-      wins: row.wins ?? 0,
-      winRate: (row.win_rate ?? 0) * 100,
-      avgPnl: row.avg_pnl ?? 0,
-      totalPnl: row.total_pnl ?? 0,
+      ...mapBaseStats(row),
     };
+  }
+
+  /**
+   * Get performance statistics for all volatility regimes
+   */
+  async getAllRegimeStats(): Promise<RegimeStats[]> {
+    this.ensureInitialized();
+
+    const rows = this.getStatement('selectAllRegimeStats').all() as RegimeStatsRow[];
+
+    return rows.map((row): RegimeStats => ({
+      regime: assertVolatilityRegimeRequired(row.volatility_regime),
+      ...mapBaseStats(row),
+    }));
+  }
+
+  /**
+   * Get performance statistics for a specific symbol
+   */
+  async getSymbolStats(symbol: CryptoAsset): Promise<SymbolStats> {
+    this.ensureInitialized();
+
+    const row = this.getStatement('selectSymbolStats').get(symbol) as StatsRow | undefined;
+
+    return {
+      symbol,
+      ...mapBaseStats(row),
+    };
+  }
+
+  /**
+   * Get performance statistics for all symbols
+   */
+  async getAllSymbolStats(): Promise<SymbolStats[]> {
+    this.ensureInitialized();
+
+    const rows = this.getStatement('selectAllSymbolStats').all() as SymbolStatsRow[];
+
+    return rows.map((row): SymbolStats => ({
+      symbol: assertCryptoAsset(row.symbol),
+      ...mapBaseStats(row),
+    }));
   }
 
   /**
@@ -1185,6 +1261,71 @@ interface PriceRow {
   minute_offset: number;
   timestamp: number;
   price: number;
+}
+
+/**
+ * Raw stats row from database queries (shared by symbol and regime stats)
+ * Note: wins can be null when SUM() operates on zero matching rows
+ */
+interface StatsRow {
+  total_trades: number;
+  wins: number | null;
+  win_rate: number | null;
+  avg_pnl: number | null;
+  total_pnl: number | null;
+}
+
+/**
+ * Stats row with symbol identifier
+ */
+interface SymbolStatsRow extends StatsRow {
+  symbol: string;
+}
+
+/**
+ * Stats row with regime identifier
+ */
+interface RegimeStatsRow extends StatsRow {
+  volatility_regime: string;
+}
+
+/**
+ * Base statistics fields shared by symbol and regime stats
+ */
+interface BaseStats {
+  totalTrades: number;
+  wins: number;
+  winRate: number;
+  avgPnl: number;
+  totalPnl: number;
+}
+
+/**
+ * Empty stats returned when no data exists
+ */
+const EMPTY_STATS: BaseStats = {
+  totalTrades: 0,
+  wins: 0,
+  winRate: 0,
+  avgPnl: 0,
+  totalPnl: 0,
+};
+
+/**
+ * Map raw stats row to base stats fields (shared logic for symbol/regime stats)
+ * Returns zero values if row is undefined (no matching data)
+ */
+function mapBaseStats(row: StatsRow | undefined): BaseStats {
+  if (!row) {
+    return EMPTY_STATS;
+  }
+  return {
+    totalTrades: row.total_trades,
+    wins: row.wins ?? 0,
+    winRate: (row.win_rate ?? 0) * 100, // ratio to percentage
+    avgPnl: row.avg_pnl ?? 0,
+    totalPnl: row.total_pnl ?? 0,
+  };
 }
 
 // ============================================================================

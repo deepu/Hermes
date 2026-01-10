@@ -192,6 +192,24 @@ export interface RegimeStats {
 }
 
 /**
+ * Statistics for a specific symbol
+ */
+export interface SymbolStats {
+  /** Symbol (BTC, ETH, SOL, XRP) */
+  symbol: CryptoAsset;
+  /** Total number of resolved trades */
+  totalTrades: number;
+  /** Number of winning trades */
+  wins: number;
+  /** Win rate percentage (0-100) */
+  winRate: number;
+  /** Total P&L in USD */
+  totalPnl: number;
+  /** Average P&L per trade */
+  avgPnl: number;
+}
+
+/**
  * Calibration bucket for predicted vs actual win rates
  */
 export interface CalibrationBucket {
@@ -230,13 +248,13 @@ export interface DatabaseStats {
 }
 
 // ============================================================================
-// Repository Interface
+// Repository Interfaces (Split for Interface Segregation)
 // ============================================================================
 
 /**
- * Trade repository interface for persistence operations
+ * Core CRUD operations for trade persistence
  */
-export interface ITradeRepository {
+export interface ITradeRepositoryCore {
   // === Lifecycle ===
   /** Initialize the database and run migrations */
   initialize(): Promise<void>;
@@ -261,16 +279,6 @@ export interface ITradeRepository {
   /** Get trade by database ID */
   getTradeById(id: number): Promise<TradeRecord | null>;
 
-  // === Analysis Queries ===
-  /** Get trades within a date range */
-  getTradesByDateRange(start: Date, end: Date): Promise<TradeRecord[]>;
-  /** Get trades for a specific symbol */
-  getTradesBySymbol(symbol: CryptoAsset): Promise<TradeRecord[]>;
-  /** Get performance statistics by volatility regime */
-  getPerformanceByRegime(regime: VolatilityRegime): Promise<RegimeStats>;
-  /** Get calibration data for all probability buckets */
-  getCalibrationData(): Promise<CalibrationBucket[]>;
-
   // === Maintenance ===
   /** Run VACUUM to reclaim space */
   vacuum(): Promise<void>;
@@ -281,6 +289,34 @@ export interface ITradeRepository {
   /** Execute multiple operations within a single transaction */
   transaction<T>(fn: () => T): Promise<T>;
 }
+
+/**
+ * Analysis and aggregation queries for trade data
+ */
+export interface ITradeAnalytics {
+  /** Get trades within a date range */
+  getTradesByDateRange(start: Date, end: Date): Promise<TradeRecord[]>;
+  /** Get trades for a specific symbol */
+  getTradesBySymbol(symbol: CryptoAsset): Promise<TradeRecord[]>;
+  /** Get performance statistics for a specific symbol */
+  getSymbolStats(symbol: CryptoAsset): Promise<SymbolStats>;
+  /** Get performance statistics for all symbols */
+  getAllSymbolStats(): Promise<SymbolStats[]>;
+  /** Get performance statistics by volatility regime */
+  getPerformanceByRegime(regime: VolatilityRegime): Promise<RegimeStats>;
+  /** Get performance statistics for all volatility regimes */
+  getAllRegimeStats(): Promise<RegimeStats[]>;
+  /** Get calibration data for all probability buckets */
+  getCalibrationData(): Promise<CalibrationBucket[]>;
+}
+
+/**
+ * Full trade repository interface combining CRUD and analytics
+ *
+ * Use ITradeRepositoryCore for clients that only need basic persistence.
+ * Use ITradeAnalytics for clients that only need analysis queries.
+ */
+export interface ITradeRepository extends ITradeRepositoryCore, ITradeAnalytics {}
 
 // ============================================================================
 // Configuration Types
