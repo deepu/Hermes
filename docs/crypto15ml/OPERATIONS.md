@@ -40,7 +40,18 @@ async function main() {
   );
 
   // 4. Attach event handlers
-  attachEventHandlers(strategy);
+  strategy.on('signal', (signal) => {
+    console.log(`Signal: ${signal.side} ${signal.asset} @ ${signal.probability.toFixed(2)}`);
+  });
+  strategy.on('execution', (result) => {
+    console.log(`Execution: ${result.orderResult.success ? 'SUCCESS' : 'FAILED'}`);
+  });
+  strategy.on('paperPosition', (position) => {
+    console.log(`Paper Position: ${position.side} ${position.symbol} @ ${position.entryPrice}`);
+  });
+  strategy.on('error', (error) => {
+    console.error('Strategy error:', error.message);
+  });
 
   // 5. Start strategy (requires connected WebSocket)
   await strategy.start();
