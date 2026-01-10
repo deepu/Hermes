@@ -19,6 +19,12 @@
  *   CRYPTO15ML_NO_THRESHOLD - NO signal threshold (default: 0.30)
  *   CRYPTO15ML_ENTRY_PRICE_CAP - Max entry price (default: 0.70)
  *   CRYPTO15ML_DEBUG - Enable debug logging (default: false)
+ *   CRYPTO15ML_SYMBOLS - Comma-separated symbols (default: BTCUSDT,ETHUSDT,SOLUSDT,XRPUSDT)
+ *   CRYPTO15ML_HORIZON_MINUTES - Horizon in minutes (default: 15)
+ *   CRYPTO15ML_THRESHOLD_BTC - BTC threshold in bps (default: 0.0008)
+ *   CRYPTO15ML_THRESHOLD_ETH - ETH threshold in bps (default: 0.0010)
+ *   CRYPTO15ML_THRESHOLD_SOL - SOL threshold in bps (default: 0.0020)
+ *   CRYPTO15ML_THRESHOLD_XRP - XRP threshold in bps (default: 0.0015)
  *
  * Part of #11
  */
@@ -26,23 +32,33 @@
 import { PolymarketSDK } from '../../src/index.js';
 import { Crypto15MLStrategyService } from '../../src/services/crypto15-ml-strategy-service.js';
 import type { Crypto15MLConfig } from '../../src/services/crypto15-ml-strategy-service.js';
+import {
+  createCrypto15MLLogger,
+  LogEvents,
+  type IStrategyLogger,
+} from '../../src/utils/strategy-logger.js';
 
 // ============================================================================
 // Configuration
 // ============================================================================
 
+function parseBoolean(value: string | undefined, defaultValue: boolean): boolean {
+  if (value === undefined) return defaultValue;
+  return value.toLowerCase() === 'true' || value === '1';
+}
+
+function parseNumber(value: string | undefined, defaultValue: number): number {
+  if (value === undefined) return defaultValue;
+  const parsed = parseFloat(value);
+  return isNaN(parsed) ? defaultValue : parsed;
+}
+
+function parseStringArray(value: string | undefined, defaultValue: string[]): string[] {
+  if (value === undefined) return defaultValue;
+  return value.split(',').map((s) => s.trim()).filter((s) => s.length > 0);
+}
+
 function loadConfig(): Crypto15MLConfig {
-  const parseBoolean = (value: string | undefined, defaultValue: boolean): boolean => {
-    if (value === undefined) return defaultValue;
-    return value.toLowerCase() === 'true' || value === '1';
-  };
-
-  const parseNumber = (value: string | undefined, defaultValue: number): number => {
-    if (value === undefined) return defaultValue;
-    const parsed = parseFloat(value);
-    return isNaN(parsed) ? defaultValue : parsed;
-  };
-
   return {
     enabled: parseBoolean(process.env.CRYPTO15ML_ENABLED, true),
     dryRun: parseBoolean(process.env.CRYPTO15ML_DRY_RUN, true),
@@ -54,40 +70,15 @@ function loadConfig(): Crypto15MLConfig {
     noThreshold: parseNumber(process.env.CRYPTO15ML_NO_THRESHOLD, 0.30),
     entryPriceCap: parseNumber(process.env.CRYPTO15ML_ENTRY_PRICE_CAP, 0.70),
     stateMinutes: [0, 1, 2],
-    horizonMinutes: 15,
-    symbols: ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT'],
+    horizonMinutes: parseNumber(process.env.CRYPTO15ML_HORIZON_MINUTES, 15),
+    symbols: parseStringArray(process.env.CRYPTO15ML_SYMBOLS, ['BTCUSDT', 'ETHUSDT', 'SOLUSDT', 'XRPUSDT']),
     thresholdBps: {
-      BTC: 0.0008,  // 8 bps
-      ETH: 0.0010,  // 10 bps
-      SOL: 0.0020,  // 20 bps
-      XRP: 0.0015,  // 15 bps
+      BTC: parseNumber(process.env.CRYPTO15ML_THRESHOLD_BTC, 0.0008),
+      ETH: parseNumber(process.env.CRYPTO15ML_THRESHOLD_ETH, 0.0010),
+      SOL: parseNumber(process.env.CRYPTO15ML_THRESHOLD_SOL, 0.0020),
+      XRP: parseNumber(process.env.CRYPTO15ML_THRESHOLD_XRP, 0.0015),
     },
   };
-}
-
-// ============================================================================
-// Logging
-// ============================================================================
-
-interface LogEntry {
-  timestamp: string;
-  level: 'INFO' | 'WARN' | 'ERROR';
-  event: string;
-  message?: string;
-  [key: string]: unknown;
-}
-
-function log(level: LogEntry['level'], event: string, data: Record<string, unknown> = {}): void {
-  const entry: LogEntry = {
-    timestamp: new Date().toISOString(),
-    level,
-    event,
-    _service: 'hermes',
-    _app: 'crypto15ml',
-    _env: process.env.NODE_ENV || 'development',
-    ...data,
-  };
-  console.log(JSON.stringify(entry));
 }
 
 // ============================================================================
@@ -95,38 +86,46 @@ function log(level: LogEntry['level'], event: string, data: Record<string, unkno
 // ============================================================================
 
 async function main(): Promise<void> {
-  log('INFO', 'startup', { message: 'Crypto15ML Strategy starting...' });
+  // Create logger using shared infrastructure
+  const logger: IStrategyLogger = createCrypto15MLLogger({
+    app: 'crypto15ml',
+  });
+
+  logger.info(LogEvents.STRATEGY_STARTED, { message: 'Crypto15ML Strategy starting...' });
 
   // Validate environment
   const privateKey = process.env.POLYMARKET_PRIVATE_KEY;
   if (!privateKey) {
-    log('ERROR', 'config_error', { message: 'POLYMARKET_PRIVATE_KEY is required' });
+    logger.error(LogEvents.ERROR, { message: 'POLYMARKET_PRIVATE_KEY is required' });
     process.exit(1);
   }
 
   // Load configuration
   const config = loadConfig();
-  log('INFO', 'config_loaded', {
-    enabled: config.enabled,
+  logger.info(LogEvents.MODELS_LOADED, {
+    message: 'Configuration loaded',
     dryRun: config.dryRun,
-    positionSizeUsd: config.positionSizeUsd,
-    yesThreshold: config.yesThreshold,
-    noThreshold: config.noThreshold,
-    entryPriceCap: config.entryPriceCap,
-    modelPath: config.modelPath,
-    imputationPath: config.imputationPath,
   });
 
+  // Handle disabled state with proper signal handling
   if (!config.enabled) {
-    log('WARN', 'strategy_disabled', { message: 'Strategy is disabled via CRYPTO15ML_ENABLED=false' });
-    // Keep process alive but idle
-    await new Promise(() => {});
+    logger.warn(LogEvents.STRATEGY_STOPPED, { message: 'Strategy is disabled via CRYPTO15ML_ENABLED=false' });
+    // Wait for shutdown signal with proper cleanup
+    await new Promise<void>((resolve) => {
+      const handleSignal = () => {
+        logger.info(LogEvents.STRATEGY_STOPPED, { message: 'Received shutdown signal while disabled' });
+        resolve();
+      };
+      process.on('SIGINT', handleSignal);
+      process.on('SIGTERM', handleSignal);
+    });
+    process.exit(0);
   }
 
   // Initialize SDK
-  log('INFO', 'sdk_initializing', { message: 'Initializing PolymarketSDK...' });
+  logger.info(LogEvents.STRATEGY_STARTED, { message: 'Initializing PolymarketSDK...' });
   const sdk = await PolymarketSDK.create({ privateKey });
-  log('INFO', 'sdk_initialized', { message: 'SDK initialized successfully' });
+  logger.info(LogEvents.STRATEGY_STARTED, { message: 'SDK initialized successfully' });
 
   // Create strategy service
   const strategy = new Crypto15MLStrategyService(
@@ -138,29 +137,30 @@ async function main(): Promise<void> {
 
   // Attach event handlers
   strategy.on('signal', (signal) => {
-    log('INFO', 'signal_generated', {
-      conditionId: signal.conditionId,
+    logger.info(LogEvents.SIGNAL_GENERATED, {
+      marketId: signal.conditionId,
       slug: signal.slug,
-      asset: signal.asset,
+      symbol: signal.asset,
       side: signal.side,
-      probability: signal.probability,
+      confidence: signal.probability,
       entryPrice: signal.entryPrice,
       stateMinute: signal.stateMinute,
     });
   });
 
   strategy.on('execution', (result) => {
-    log('INFO', 'execution_result', {
-      conditionId: result.signal.conditionId,
+    const event = result.orderResult.success ? LogEvents.EXECUTION_SUCCESS : LogEvents.EXECUTION_FAILED;
+    logger.info(event, {
+      marketId: result.signal.conditionId,
       side: result.signal.side,
-      asset: result.signal.asset,
+      symbol: result.signal.asset,
       success: result.orderResult.success,
-      error: result.orderResult.error,
+      error: result.orderResult.errorMsg,
     });
   });
 
   strategy.on('paperPosition', (position) => {
-    log('INFO', 'paper_position', {
+    logger.info(LogEvents.PAPER_POSITION, {
       marketId: position.marketId,
       slug: position.slug,
       symbol: position.symbol,
@@ -172,63 +172,82 @@ async function main(): Promise<void> {
   });
 
   strategy.on('paperSettlement', (result) => {
-    log('INFO', 'paper_settlement', {
+    logger.info(LogEvents.PAPER_SETTLEMENT, {
       marketId: result.position.marketId,
       symbol: result.position.symbol,
       side: result.position.side,
-      outcome: result.outcome,
       pnl: result.pnl,
     });
   });
 
   strategy.on('error', (error) => {
-    log('ERROR', 'strategy_error', {
+    logger.error(LogEvents.ERROR, {
       message: error.message,
-      stack: error.stack,
+      error: error.stack,
     });
   });
 
   // Start strategy
-  log('INFO', 'strategy_starting', { message: 'Starting Crypto15ML strategy...' });
+  logger.info(LogEvents.STRATEGY_STARTED, { message: 'Starting Crypto15ML strategy...' });
   await strategy.start();
-  log('INFO', 'strategy_started', {
+  logger.info(LogEvents.STRATEGY_STARTED, {
     message: 'Strategy started successfully',
     dryRun: config.dryRun,
     trackerCount: strategy.getTrackerCount(),
   });
 
-  // Handle shutdown signals
+  // Handle shutdown signals with proper error handling
   const shutdown = async (signal: string): Promise<void> => {
-    log('INFO', 'shutdown_initiated', { signal });
+    logger.info(LogEvents.STRATEGY_STOPPED, { message: `Shutdown initiated (${signal})` });
 
     // Log final stats if in dry-run mode
     if (config.dryRun) {
       const stats = strategy.getPaperTradingStats();
-      log('INFO', 'final_stats', {
+      logger.info(LogEvents.STRATEGY_STOPPED, {
+        message: 'Final paper trading stats',
         positionCount: stats.positionCount,
-        cumulativePnL: stats.cumulativePnL,
-        winRate: stats.winRate,
-        averagePnL: stats.averagePnL,
+        pnl: stats.cumulativePnL,
       });
     }
 
     strategy.stop();
     sdk.stop();
-    log('INFO', 'shutdown_complete', { message: 'Shutdown complete' });
+    logger.info(LogEvents.STRATEGY_STOPPED, { message: 'Shutdown complete' });
     process.exit(0);
   };
 
-  process.on('SIGINT', () => shutdown('SIGINT'));
-  process.on('SIGTERM', () => shutdown('SIGTERM'));
+  // Wrap signal handlers with error handling
+  process.on('SIGINT', () => {
+    shutdown('SIGINT').catch((err) => {
+      logger.error(LogEvents.ERROR, { message: 'Shutdown error', error: String(err) });
+      process.exit(1);
+    });
+  });
+
+  process.on('SIGTERM', () => {
+    shutdown('SIGTERM').catch((err) => {
+      logger.error(LogEvents.ERROR, { message: 'Shutdown error', error: String(err) });
+      process.exit(1);
+    });
+  });
 
   // Keep alive
-  log('INFO', 'running', { message: 'Strategy is running. Press Ctrl+C to stop.' });
+  logger.info(LogEvents.STRATEGY_STARTED, { message: 'Strategy is running. Press Ctrl+C to stop.' });
 }
 
 main().catch((error) => {
-  log('ERROR', 'fatal_error', {
+  // Use console.error for fatal errors before logger might be available
+  const errorEntry = {
+    timestamp: new Date().toISOString(),
+    level: 'ERROR',
+    strategy: 'Crypto15ML',
+    event: 'error',
     message: error.message,
-    stack: error.stack,
-  });
+    error: error.stack,
+    _service: 'hermes',
+    _app: 'crypto15ml',
+    _env: process.env.NODE_ENV || 'development',
+  };
+  console.log(JSON.stringify(errorEntry));
   process.exit(1);
 });

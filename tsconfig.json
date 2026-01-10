@@ -13,8 +13,8 @@
     "declarationMap": true,
     "sourceMap": true,
     "outDir": "./dist",
-    "rootDir": "./src"
+    "rootDir": "."
   },
-  "include": ["src/**/*"],
+  "include": ["src/**/*", "scripts/crypto15ml/**/*"],
   "exclude": ["node_modules", "dist", "**/*.test.ts"]
 }
