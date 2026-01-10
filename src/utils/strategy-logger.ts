@@ -51,6 +51,12 @@ export const LogEvents = {
   PAPER_POSITION_EVICTED: 'paper_position_evicted',
   PAPER_SETTLEMENT: 'paper_settlement',
 
+  // Persistence
+  REPOSITORY_INITIALIZED: 'repository_initialized',
+  TRADE_PERSISTED: 'trade_persisted',
+  OUTCOME_PERSISTED: 'outcome_persisted',
+  PERSISTENCE_ERROR: 'persistence_error',
+
   // General
   ERROR: 'error',
 } as const;
@@ -125,6 +131,14 @@ export interface LogContext {
   dryRun?: boolean;
   /** Linear combination (z-score) */
   linearCombination?: number;
+  /** Database trade ID */
+  tradeId?: number;
+  /** Database path */
+  dbPath?: string;
+  /** Trade outcome direction */
+  outcome?: 'UP' | 'DOWN';
+  /** Whether trade was a win */
+  isWin?: boolean;
 }
 
 /**

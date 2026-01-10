@@ -8,6 +8,7 @@
  */
 
 import type { Crypto15MLConfig } from '../src/types/crypto15ml.types.js';
+import type { PersistenceConfig } from '../src/types/trade-record.types.js';
 
 /**
  * Default configuration for Crypto15ML strategy
@@ -22,6 +23,10 @@ import type { Crypto15MLConfig } from '../src/types/crypto15ml.types.js';
  * - CRYPTO15ML_NO_THRESHOLD: Probability threshold for NO signal (default: 0.30)
  * - CRYPTO15ML_ENTRY_PRICE_CAP: Maximum entry price (default: 0.70)
  * - CRYPTO15ML_DEBUG: Enable debug logging (default: false)
+ * - CRYPTO15ML_PERSISTENCE_ENABLED: Enable trade persistence (default: true)
+ * - CRYPTO15ML_PERSISTENCE_DB_PATH: Database file path (default: './data/crypto15ml/trades.db')
+ * - CRYPTO15ML_PERSISTENCE_SYNC_MODE: Write mode 'async' or 'sync' (default: 'async')
+ * - CRYPTO15ML_PERSISTENCE_VACUUM_INTERVAL: Hours between vacuum operations (default: 24)
  */
 export const crypto15mlConfig: Crypto15MLConfig = {
   // === Strategy Toggle ===
@@ -78,6 +83,17 @@ export const crypto15mlConfig: Crypto15MLConfig = {
   // === Debug Mode ===
   // Enable debug logging for development
   debug: process.env.CRYPTO15ML_DEBUG === 'true',
+
+  // === Persistence Configuration ===
+  // SQLite persistence for paper trade recording
+  persistence: {
+    enabled: process.env.CRYPTO15ML_PERSISTENCE_ENABLED !== 'false', // Default: true
+    dbPath: process.env.CRYPTO15ML_PERSISTENCE_DB_PATH || './data/crypto15ml/trades.db',
+    syncMode: (['async', 'sync'].includes(process.env.CRYPTO15ML_PERSISTENCE_SYNC_MODE ?? '')
+      ? (process.env.CRYPTO15ML_PERSISTENCE_SYNC_MODE as PersistenceConfig['syncMode'])
+      : 'async'),
+    vacuumIntervalHours: parseInt(process.env.CRYPTO15ML_PERSISTENCE_VACUUM_INTERVAL || '24', 10) || 24,
+  },
 };
 
 /**
