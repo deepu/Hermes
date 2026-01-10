@@ -33,7 +33,3 @@ coverage/
 *.tsbuildinfo
 .mcp.json
 
-# Model files (contain proprietary coefficients)
-# Keep .gitkeep and example files
-models/*.json
-!models/*.example.json

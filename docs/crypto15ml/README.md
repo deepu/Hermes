@@ -211,6 +211,7 @@ event:paper_position OR event:paper_settlement
 - [CONFIGURATION.md](./CONFIGURATION.md) - All configuration options
 - [OPERATIONS.md](./OPERATIONS.md) - Operational guide
 - [MODEL_EXPORT.md](./MODEL_EXPORT.md) - Model export from Argus
+- [DEPLOYMENT.md](./DEPLOYMENT.md) - Railway deployment guide
 
 ## Troubleshooting
 
