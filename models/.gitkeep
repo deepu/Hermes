@@ -1,0 +1,9 @@
+# Model files directory
+#
+# Place your trained model files here:
+# - crypto15ml_model.json
+# - crypto15ml_imputations.json
+#
+# See docs/crypto15ml/MODEL_EXPORT.md for export instructions.
+#
+# Note: Model files contain proprietary coefficients and are not committed to git.

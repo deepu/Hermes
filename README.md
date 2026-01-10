@@ -751,6 +751,86 @@ PRIVATE_KEY=0x... npx tsx scripts/dip-arb/redeem-positions.ts
 
 ---
 
+### Crypto15MLStrategyService
+
+**ML-Powered Trading** for Polymarket 15-minute crypto UP/DOWN markets (BTC, ETH, SOL, XRP).
+
+**Strategy**: Uses trained logistic regression model to predict crypto price direction over 15-minute windows. Generates trading signals when confidence thresholds are met.
+
+#### Quick Start
+
+```bash
+# Configure environment
+cp .env.example .env
+# Edit .env with your settings
+
+# Add model files to models/ directory
+# Run with dry-run mode first
+CRYPTO15ML_DRY_RUN=true npx tsx examples/15-crypto15ml-strategy.ts
+```
+
+#### Programmatic Usage
+
+```typescript
+import { PolymarketSDK } from '@catalyst-team/poly-sdk';
+import { Crypto15MLStrategyService } from '@catalyst-team/poly-sdk';
+import { crypto15mlConfig } from './config/crypto15ml.config';
+
+const sdk = await PolymarketSDK.create({
+  privateKey: process.env.POLYMARKET_PRIVATE_KEY,
+});
+
+const strategy = new Crypto15MLStrategyService(
+  sdk.markets,
+  sdk.tradingService,
+  sdk.realtime,
+  crypto15mlConfig
+);
+
+// Listen to events
+strategy.on('signal', (signal) => {
+  console.log(`Signal: ${signal.side} ${signal.asset} @ ${signal.probability.toFixed(2)}`);
+});
+
+strategy.on('execution', (result) => {
+  console.log(`Execution: ${result.orderResult.success ? 'SUCCESS' : 'FAILED'}`);
+});
+
+// For dry-run mode
+strategy.on('paperPosition', (position) => {
+  console.log(`Paper: ${position.side} ${position.symbol} @ ${position.entryPrice}`);
+});
+
+await strategy.start();
+
+// Get paper trading stats
+const stats = strategy.getPaperTradingStats();
+console.log(`P&L: $${stats.cumulativePnL.toFixed(2)}`);
+
+// Cleanup
+strategy.stop();
+sdk.stop();
+```
+
+#### Features
+
+| Feature | Description |
+|---------|-------------|
+| **ML Signals** | Logistic regression model trained on historical crypto data |
+| **Dry-Run Mode** | Paper trading for validation before going live |
+| **Real-Time** | WebSocket price feeds for instant signal generation |
+| **Auto-Discovery** | Automatically finds and tracks 15m crypto markets |
+| **Structured Logging** | Railway-compatible JSON logs for monitoring |
+
+#### Documentation
+
+- [README](docs/crypto15ml/README.md) - Overview and quick start
+- [Configuration](docs/crypto15ml/CONFIGURATION.md) - All config options
+- [Operations](docs/crypto15ml/OPERATIONS.md) - Monitoring and troubleshooting
+- [Model Export](docs/crypto15ml/MODEL_EXPORT.md) - Exporting models from Argus
+
+---
+
 ## Low-Level Clients
 
 For advanced users who need direct API access:
