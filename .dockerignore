@@ -1,0 +1,60 @@
+# Dependencies
+node_modules/
+
+# Build output (rebuilt in container)
+dist/
+
+# Git
+.git/
+.gitignore
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Test files
+*.test.ts
+*.spec.ts
+**/*.test.ts
+**/*.spec.ts
+vitest.config.ts
+vitest.integration.config.ts
+coverage/
+test-data/
+
+# Documentation
+docs/
+specs/
+*.md
+!README.md
+
+# Local data (mounted as volume)
+data/
+
+# Environment files (passed via --env-file)
+.env
+.env.*
+!.env.example
+
+# Scripts not needed in production
+scripts/api-verification/
+scripts/approvals/
+scripts/arb-tests/
+scripts/arb/
+scripts/archive/
+scripts/benchmark/
+scripts/deposit/
+scripts/dip-arb/
+scripts/rescue/
+scripts/research/
+scripts/smart-money/
+scripts/trading/
+scripts/verify/
+scripts/wallet/
+
+# Misc
+*.log
+.DS_Store
+Thumbs.db

@@ -1,0 +1,37 @@
+# Docker Compose for local Crypto15ML testing
+#
+# Usage:
+#   docker compose up --build       # Build and run
+#   docker compose up -d            # Run in background
+#   docker compose logs -f          # Follow logs
+#   docker compose down             # Stop and remove
+#
+# The container runs in dry-run mode by default.
+# Trades are persisted to ./data/crypto15ml/trades.db
+
+services:
+  hermes:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: hermes-crypto15ml
+    restart: unless-stopped
+    env_file:
+      - .env
+    environment:
+      # Ensure dry-run for local testing (override in .env if needed)
+      - CRYPTO15ML_DRY_RUN=true
+      - CRYPTO15ML_DEBUG=true
+      # Persistence config
+      - CRYPTO15ML_PERSISTENCE_ENABLED=true
+      - CRYPTO15ML_PERSISTENCE_DB_PATH=/app/data/crypto15ml/trades.db
+    volumes:
+      # Persist trade database across container restarts
+      - ./data:/app/data
+    # Health check - verify process is running
+    healthcheck:
+      test: ["CMD", "pgrep", "-f", "node"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 10s

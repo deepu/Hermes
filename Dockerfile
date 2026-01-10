@@ -1,8 +1,11 @@
 # Dockerfile for Hermes Crypto15ML Strategy
-# Optimized for Railway deployment
+# Optimized for Railway deployment and local testing
 #
 # Build: docker build -t hermes .
-# Run:   docker run --env-file .env hermes
+# Run:   docker run --env-file .env -v $(pwd)/data:/app/data hermes
+#
+# Or use docker-compose:
+#   docker compose up --build
 
 # Build stage
 FROM node:22.12-alpine AS builder
@@ -48,6 +51,10 @@ COPY --from=builder /app/dist ./dist
 
 # Copy models directory
 COPY models/ ./models/
+
+# Create data directory for persistence with correct ownership
+# This directory will be mounted as a volume in production
+RUN mkdir -p /app/data/crypto15ml && chown -R app:app /app/data
 
 # Set environment
 ENV NODE_ENV=production
