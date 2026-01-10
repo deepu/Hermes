@@ -1,0 +1,25 @@
+# Railway Configuration for Hermes Crypto15ML Strategy
+# See: https://docs.railway.app/reference/config-as-code
+
+[build]
+# Use Dockerfile for builds
+builder = "dockerfile"
+dockerfilePath = "Dockerfile"
+
+[deploy]
+# Number of deployment instances
+numReplicas = 1
+
+# Start command (overrides Dockerfile CMD if needed)
+# Uncomment to override:
+# startCommand = "node dist/scripts/crypto15ml/run-strategy.js"
+
+# Restart policy
+restartPolicyType = "ON_FAILURE"
+restartPolicyMaxRetries = 5
+
+# Resource limits (Railway Pro required for custom limits)
+# Uncomment if on Railway Pro:
+# [deploy.resources]
+# memory = "512Mi"
+# cpu = "0.5"

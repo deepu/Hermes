@@ -1,0 +1,46 @@
+{
+  "version": "1.0.0",
+  "generated_at": "2025-12-31T06:19:23.307955",
+  "source": "argus/research/crypto_15minute",
+  "strategy": "intrawindow_state_strategy",
+  "description": "Crypto15ML model for 15-minute crypto price prediction on Polymarket",
+  "files": {
+    "model": "crypto15ml_model.json",
+    "imputations": "crypto15ml_imputations.json"
+  },
+  "symbols": ["BTCUSDT", "ETHUSDT", "SOLUSDT", "XRPUSDT"],
+  "features": [
+    "state_minute",
+    "minutes_remaining",
+    "return_since_open",
+    "max_run_up",
+    "max_run_down",
+    "hour_of_day",
+    "minute_of_hour",
+    "day_of_week",
+    "volatility_5m",
+    "return_prev_1m",
+    "return_prev_3m",
+    "return_prev_5m",
+    "volume_zscore_15m",
+    "has_up_hit_Xbps",
+    "has_down_hit_Xbps",
+    "first_up_hit_minute_Xbps",
+    "first_down_hit_minute_Xbps"
+  ],
+  "thresholds_bps": {
+    "BTCUSDT": 8,
+    "ETHUSDT": 10,
+    "SOLUSDT": 20,
+    "XRPUSDT": 15
+  },
+  "training": {
+    "label_column": "y_15m",
+    "model_type": "logistic_regression"
+  },
+  "compatibility": {
+    "min_hermes_version": "0.4.0",
+    "crypto15ml_service_version": "1.0.0"
+  },
+  "notes": "Model coefficients are proprietary. Do not share outside the organization."
+}
