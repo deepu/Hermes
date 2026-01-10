@@ -1,0 +1,58 @@
+{
+  "version": "0.0.0-example",
+  "imputations": {
+    "BTCUSDT": {
+      "state_minute": 7,
+      "minutes_remaining": 8,
+      "return_since_open": 0.0,
+      "max_run_up": 0.001,
+      "max_run_down": -0.001,
+      "return_1m": 0.0,
+      "return_3m": 0.0,
+      "return_5m": 0.0,
+      "volatility_5m": 0.0005,
+      "first_up_hit_minute": 7,
+      "first_down_hit_minute": 7
+    },
+    "ETHUSDT": {
+      "state_minute": 7,
+      "minutes_remaining": 8,
+      "return_since_open": 0.0,
+      "max_run_up": 0.001,
+      "max_run_down": -0.001,
+      "return_1m": 0.0,
+      "return_3m": 0.0,
+      "return_5m": 0.0,
+      "volatility_5m": 0.0006,
+      "first_up_hit_minute": 7,
+      "first_down_hit_minute": 7
+    },
+    "SOLUSDT": {
+      "state_minute": 7,
+      "minutes_remaining": 8,
+      "return_since_open": 0.0,
+      "max_run_up": 0.002,
+      "max_run_down": -0.002,
+      "return_1m": 0.0,
+      "return_3m": 0.0,
+      "return_5m": 0.0,
+      "volatility_5m": 0.001,
+      "first_up_hit_minute": 7,
+      "first_down_hit_minute": 7
+    },
+    "XRPUSDT": {
+      "state_minute": 7,
+      "minutes_remaining": 8,
+      "return_since_open": 0.0,
+      "max_run_up": 0.0015,
+      "max_run_down": -0.0015,
+      "return_1m": 0.0,
+      "return_3m": 0.0,
+      "return_5m": 0.0,
+      "volatility_5m": 0.0008,
+      "first_up_hit_minute": 7,
+      "first_down_hit_minute": 7
+    }
+  },
+  "_comment": "This is an example file with placeholder values. Replace with actual median values from training data."
+}
