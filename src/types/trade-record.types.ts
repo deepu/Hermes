@@ -196,7 +196,7 @@ export interface RegimeStats {
  */
 export interface SymbolStats {
   /** Symbol (BTC, ETH, SOL, XRP) */
-  symbol: string;
+  symbol: CryptoAsset;
   /** Total number of resolved trades */
   totalTrades: number;
   /** Number of winning trades */

@@ -693,21 +693,11 @@ export class TradeRepository implements ITradeRepository {
   async getPerformanceByRegime(regime: VolatilityRegime): Promise<RegimeStats> {
     this.ensureInitialized();
 
-    const row = this.getStatement('selectRegimeStats').get(regime) as {
-      total_trades: number;
-      wins: number;
-      win_rate: number | null;
-      avg_pnl: number | null;
-      total_pnl: number | null;
-    };
+    const row = this.getStatement('selectRegimeStats').get(regime) as StatsRow;
 
     return {
       regime,
-      totalTrades: row.total_trades,
-      wins: row.wins ?? 0,
-      winRate: (row.win_rate ?? 0) * 100,
-      avgPnl: row.avg_pnl ?? 0,
-      totalPnl: row.total_pnl ?? 0,
+      ...mapBaseStats(row),
     };
   }
 
@@ -717,22 +707,11 @@ export class TradeRepository implements ITradeRepository {
   async getAllRegimeStats(): Promise<RegimeStats[]> {
     this.ensureInitialized();
 
-    const rows = this.getStatement('selectAllRegimeStats').all() as Array<{
-      volatility_regime: string;
-      total_trades: number;
-      wins: number;
-      win_rate: number | null;
-      avg_pnl: number | null;
-      total_pnl: number | null;
-    }>;
+    const rows = this.getStatement('selectAllRegimeStats').all() as RegimeStatsRow[];
 
-    return rows.map((row) => ({
-      regime: row.volatility_regime as VolatilityRegime,
-      totalTrades: row.total_trades,
-      wins: row.wins ?? 0,
-      winRate: (row.win_rate ?? 0) * 100,
-      avgPnl: row.avg_pnl ?? 0,
-      totalPnl: row.total_pnl ?? 0,
+    return rows.map((row): RegimeStats => ({
+      regime: volatilityRegimeAsserter.assert(row.volatility_regime),
+      ...mapBaseStats(row),
     }));
   }
 
@@ -742,21 +721,11 @@ export class TradeRepository implements ITradeRepository {
   async getSymbolStats(symbol: CryptoAsset): Promise<SymbolStats> {
     this.ensureInitialized();
 
-    const row = this.getStatement('selectSymbolStats').get(symbol) as {
-      total_trades: number;
-      wins: number;
-      win_rate: number | null;
-      avg_pnl: number | null;
-      total_pnl: number | null;
-    };
+    const row = this.getStatement('selectSymbolStats').get(symbol) as StatsRow;
 
     return {
       symbol,
-      totalTrades: row.total_trades,
-      wins: row.wins ?? 0,
-      winRate: (row.win_rate ?? 0) * 100,
-      totalPnl: row.total_pnl ?? 0,
-      avgPnl: row.avg_pnl ?? 0,
+      ...mapBaseStats(row),
     };
   }
 
@@ -766,22 +735,11 @@ export class TradeRepository implements ITradeRepository {
   async getAllSymbolStats(): Promise<SymbolStats[]> {
     this.ensureInitialized();
 
-    const rows = this.getStatement('selectAllSymbolStats').all() as Array<{
-      symbol: string;
-      total_trades: number;
-      wins: number;
-      win_rate: number | null;
-      avg_pnl: number | null;
-      total_pnl: number | null;
-    }>;
+    const rows = this.getStatement('selectAllSymbolStats').all() as SymbolStatsRow[];
 
-    return rows.map((row) => ({
-      symbol: row.symbol,
-      totalTrades: row.total_trades,
-      wins: row.wins ?? 0,
-      winRate: (row.win_rate ?? 0) * 100,
-      totalPnl: row.total_pnl ?? 0,
-      avgPnl: row.avg_pnl ?? 0,
+    return rows.map((row): SymbolStats => ({
+      symbol: assertCryptoAsset(row.symbol),
+      ...mapBaseStats(row),
     }));
   }
 
@@ -1302,6 +1260,54 @@ interface PriceRow {
   minute_offset: number;
   timestamp: number;
   price: number;
+}
+
+/**
+ * Raw stats row from database queries (shared by symbol and regime stats)
+ * Note: wins can be null when SUM() operates on zero matching rows
+ */
+interface StatsRow {
+  total_trades: number;
+  wins: number | null;
+  win_rate: number | null;
+  avg_pnl: number | null;
+  total_pnl: number | null;
+}
+
+/**
+ * Stats row with symbol identifier
+ */
+interface SymbolStatsRow extends StatsRow {
+  symbol: string;
+}
+
+/**
+ * Stats row with regime identifier
+ */
+interface RegimeStatsRow extends StatsRow {
+  volatility_regime: string;
+}
+
+/** Multiplier to convert decimal win rate to percentage */
+const PERCENTAGE_MULTIPLIER = 100;
+
+/**
+ * Map raw stats row to base stats fields (shared logic for symbol/regime stats)
+ */
+function mapBaseStats(row: StatsRow): {
+  totalTrades: number;
+  wins: number;
+  winRate: number;
+  avgPnl: number;
+  totalPnl: number;
+} {
+  return {
+    totalTrades: row.total_trades,
+    wins: row.wins ?? 0,
+    winRate: (row.win_rate ?? 0) * PERCENTAGE_MULTIPLIER,
+    avgPnl: row.avg_pnl ?? 0,
+    totalPnl: row.total_pnl ?? 0,
+  };
 }
 
 // ============================================================================

@@ -1,14 +1,14 @@
 /**
  * TradeRepository Integration Tests
  *
- * End-to-end tests for the trade persistence layer, testing the full lifecycle
- * of trade recording, resolution, and analysis queries.
- *
- * These tests use a real SQLite database and verify:
+ * End-to-end tests for the trade persistence layer, testing:
  * - Full trade lifecycle (record -> update outcome -> query)
- * - Analysis query correctness with realistic data
- * - Performance with multiple records
  * - Data integrity across related tables
+ * - Concurrent access patterns
+ * - Edge cases with realistic data
+ *
+ * Note: Query correctness is covered by unit tests. These tests focus on
+ * integration concerns that unit tests cannot cover.
  *
  * Run with: pnpm test:integration
  *
@@ -19,77 +19,15 @@ import { describe, it, expect, beforeEach, afterEach, beforeAll, afterAll } from
 import { existsSync, unlinkSync, mkdirSync, rmSync } from 'fs';
 import { dirname } from 'path';
 import { TradeRepository } from './trade-repository.js';
-import type { TradeRecord, TradeOutcome, VolatilityRegime } from '../types/trade-record.types.js';
-import type { FeatureVector, CryptoAsset } from '../strategies/crypto15-feature-engine.js';
+import type { TradeRecord, VolatilityRegime } from '../types/trade-record.types.js';
+import type { CryptoAsset } from '../strategies/crypto15-feature-engine.js';
+import { createTestTrade, createTestOutcome } from './test-fixtures.js';
 
 // ============================================================================
 // Test Configuration
 // ============================================================================
 
 const INTEGRATION_DB_PATH = './test-data/integration/trades-integration.db';
-
-// ============================================================================
-// Test Fixtures
-// ============================================================================
-
-function createTestFeatures(overrides: Partial<FeatureVector> = {}): FeatureVector {
-  return {
-    stateMinute: 5,
-    minutesRemaining: 10,
-    hourOfDay: 14,
-    dayOfWeek: 3,
-    returnSinceOpen: 0.0005,
-    maxRunUp: 0.0008,
-    maxRunDown: -0.0003,
-    return1m: 0.0002,
-    return3m: 0.0004,
-    return5m: 0.0006,
-    volatility5m: 0.0012,
-    hasUpHit: false,
-    hasDownHit: false,
-    firstUpHitMinute: NaN,
-    firstDownHitMinute: NaN,
-    asset: 'BTC' as CryptoAsset,
-    timestamp: Date.now(),
-    ...overrides,
-  };
-}
-
-function createTestTrade(overrides: Partial<TradeRecord> = {}): TradeRecord {
-  return {
-    conditionId: `int-cond-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
-    slug: 'btc-updown-15m-integration',
-    symbol: 'BTC' as CryptoAsset,
-    side: 'YES',
-    entryPrice: 0.65,
-    positionSize: 100,
-    signalTimestamp: Date.now(),
-    probability: 0.72,
-    linearCombination: 0.94,
-    imputedCount: 0,
-    features: createTestFeatures(),
-    stateMinute: 5,
-    hourOfDay: 14,
-    dayOfWeek: 3,
-    volatilityRegime: 'mid',
-    volatility5m: 0.0012,
-    windowOpenPrice: 50000,
-    ...overrides,
-  };
-}
-
-function createTestOutcome(overrides: Partial<TradeOutcome> = {}): TradeOutcome {
-  return {
-    outcome: 'UP',
-    isWin: true,
-    pnl: 53.85,
-    resolutionTimestamp: Date.now(),
-    windowClosePrice: 50100,
-    maxFavorableExcursion: 0.003,
-    maxAdverseExcursion: -0.001,
-    ...overrides,
-  };
-}
 
 // ============================================================================
 // Setup Helpers
@@ -216,123 +154,10 @@ describe('TradeRepository Integration Tests', () => {
   });
 
   // ============================================================================
-  // Analysis Query Integration Tests
-  // ============================================================================
-
-  describe('Analysis Queries with Realistic Data', () => {
-    beforeEach(async () => {
-      // Populate database with realistic test data
-      const symbols: CryptoAsset[] = ['BTC', 'ETH', 'SOL', 'XRP'];
-      const regimes: VolatilityRegime[] = ['low', 'mid', 'high'];
-      const probabilities = [0.75, 0.72, 0.68, 0.55, 0.45, 0.35];
-
-      let baseTimestamp = Date.now() - 7 * 24 * 60 * 60 * 1000; // 7 days ago
-
-      // Create 24 trades (4 symbols × 6 probability levels)
-      for (const symbol of symbols) {
-        for (let i = 0; i < probabilities.length; i++) {
-          const prob = probabilities[i];
-          const regime = regimes[i % 3];
-          const isWin = prob > 0.5; // Simplified win logic for testing
-          const pnl = isWin ? 50 : -65;
-
-          const trade = createTestTrade({
-            symbol,
-            probability: prob,
-            volatilityRegime: regime,
-            signalTimestamp: baseTimestamp,
-            hourOfDay: i % 24,
-            dayOfWeek: i % 7,
-            stateMinute: i % 15,
-            side: prob > 0.5 ? 'YES' : 'NO',
-          });
-
-          await repository.recordTrade(trade);
-          await repository.updateOutcome(
-            trade.conditionId,
-            createTestOutcome({ isWin, pnl, outcome: isWin ? 'UP' : 'DOWN' })
-          );
-
-          baseTimestamp += 60 * 60 * 1000; // 1 hour apart
-        }
-      }
-    });
-
-    it('should return correct symbol statistics', async () => {
-      const btcStats = await repository.getSymbolStats('BTC');
-
-      expect(btcStats.symbol).toBe('BTC');
-      expect(btcStats.totalTrades).toBe(6); // 6 trades per symbol
-      // With probs [0.75, 0.72, 0.68, 0.55, 0.45, 0.35], wins are those > 0.5 = 4 wins
-      expect(btcStats.wins).toBe(4);
-      expect(btcStats.winRate).toBeCloseTo((4 / 6) * 100, 0);
-    });
-
-    it('should return correct all symbol statistics', async () => {
-      const allStats = await repository.getAllSymbolStats();
-
-      expect(allStats).toHaveLength(4); // BTC, ETH, SOL, XRP
-      expect(allStats.every((s) => s.totalTrades === 6)).toBe(true);
-
-      // Total trades across all symbols
-      const totalTrades = allStats.reduce((sum, s) => sum + s.totalTrades, 0);
-      expect(totalTrades).toBe(24);
-    });
-
-    it('should return correct regime statistics', async () => {
-      const allRegimeStats = await repository.getAllRegimeStats();
-
-      // With 24 trades and 3 regimes, each regime gets ~8 trades
-      // (6 per symbol, i % 3 assigns regime)
-      expect(allRegimeStats).toHaveLength(3);
-
-      const totalTrades = allRegimeStats.reduce((sum, s) => sum + s.totalTrades, 0);
-      expect(totalTrades).toBe(24);
-    });
-
-    it('should return correct calibration data', async () => {
-      const calibration = await repository.getCalibrationData();
-
-      // Should have buckets for the YES trades (prob > 0.5)
-      expect(calibration.length).toBeGreaterThan(0);
-
-      // Each bucket should have expected structure
-      for (const bucket of calibration) {
-        expect(bucket.bucket).toBeDefined();
-        expect(bucket.trades).toBeGreaterThan(0);
-        expect(bucket.avgPredicted).toBeGreaterThanOrEqual(0);
-        expect(bucket.avgPredicted).toBeLessThanOrEqual(1);
-        expect(typeof bucket.actualWinRate).toBe('number');
-        expect(typeof bucket.calibrationGap).toBe('number');
-      }
-    });
-
-    it('should return correct date range queries', async () => {
-      const stats = await repository.getStats();
-      expect(stats.totalTrades).toBe(24);
-
-      // Query for all trades (last 8 days - covers the full range)
-      const now = Date.now();
-      const eightDaysAgo = new Date(now - 8 * 24 * 60 * 60 * 1000);
-      const allTrades = await repository.getTradesByDateRange(eightDaysAgo, new Date(now));
-      expect(allTrades).toHaveLength(24);
-
-      // Query for a narrower window (last 12 hours from the oldest trade)
-      // Trades are created starting 7 days ago with 1 hour intervals
-      const oldestTimestamp = now - 7 * 24 * 60 * 60 * 1000; // 7 days ago
-      const narrowStart = new Date(oldestTimestamp);
-      const narrowEnd = new Date(oldestTimestamp + 12 * 60 * 60 * 1000); // 12 hours after start
-      const narrowTrades = await repository.getTradesByDateRange(narrowStart, narrowEnd);
-
-      // Should get about 12 trades (12 hours * 1 trade/hour)
-      expect(narrowTrades.length).toBeGreaterThan(0);
-      expect(narrowTrades.length).toBeLessThanOrEqual(13); // Allow for timing variance
-    });
-  });
-
-  // ============================================================================
   // Performance Tests
   // ============================================================================
+  // Note: Query correctness tests are in unit tests. These tests focus on
+  // performance characteristics that only show up with real database I/O.
 
   describe('Performance with Multiple Records', () => {
     it('should efficiently batch fetch trades', async () => {
@@ -356,7 +181,8 @@ describe('TradeRepository Integration Tests', () => {
       const fetchTime = Date.now() - startTime;
 
       expect(pending).toHaveLength(100);
-      expect(fetchTime).toBeLessThan(1000); // Should complete in under 1 second
+      // SQLite batch fetch of 100 records should be fast (<100ms for local file)
+      expect(fetchTime).toBeLessThan(500);
 
       // All trades should have features loaded (batch query)
       expect(pending.every((t) => t.features !== null && t.features !== undefined)).toBe(true);
@@ -482,23 +308,8 @@ describe('TradeRepository Integration Tests', () => {
       expect(stats.totalPnl).toBe(-250);
     });
 
-    it('should handle transactions correctly', async () => {
-      const trade1 = createTestTrade();
-      const trade2 = createTestTrade();
-
-      // Use transaction to record multiple trades
-      await repository.transaction(() => {
-        // Note: recordTrade is async, but inside transaction we're using sync mode
-        // This tests the transaction wrapper
-        return 'completed';
-      });
-
-      // Manually record trades to verify transaction capability
-      await repository.recordTrade(trade1);
-      await repository.recordTrade(trade2);
-
-      const stats = await repository.getStats();
-      expect(stats.totalTrades).toBe(2);
-    });
+    // Note: Transaction tests removed - the current transaction() method doesn't support
+    // async callbacks, making it incompatible with async repository methods like recordTrade.
+    // A proper transaction test can be added if transaction() is refactored to support async.
   });
 });
