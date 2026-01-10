@@ -322,6 +322,6 @@ If issues occur:
 ## Security Notes
 
 1. **Never commit private keys** - Use Railway's secret variables
-2. **Model files are gitignored** - Contain proprietary coefficients
+2. **Model files are committed to the repository** - They contain proprietary coefficients but are small enough to be included
 3. **Use Railway's encrypted variables** for sensitive data
 4. **Limit wallet balance** to minimize exposure

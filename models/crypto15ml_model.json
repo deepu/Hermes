@@ -170,35 +170,5 @@
         "first_down_hit_minute_15bps"
       ]
     }
-  ],
-  "imputations": {
-    "BTCUSDT": {
-      "volatility_5m": 0.0003113076445650124,
-      "return_prev_1m": 0.0,
-      "return_prev_3m": 0.0,
-      "return_prev_5m": 0.0,
-      "volume_zscore_15m": -0.29295228688452873
-    },
-    "ETHUSDT": {
-      "volatility_5m": 0.0003525513413702103,
-      "return_prev_1m": 0.0,
-      "return_prev_3m": 0.0,
-      "return_prev_5m": 4.85157981078288e-06,
-      "volume_zscore_15m": -0.3119672787689699
-    },
-    "SOLUSDT": {
-      "volatility_5m": 0.0008538405960661069,
-      "return_prev_1m": 0.0,
-      "return_prev_3m": 0.0,
-      "return_prev_5m": 0.0,
-      "volume_zscore_15m": -0.31987107784335667
-    },
-    "XRPUSDT": {
-      "volatility_5m": 0.0005322326880935829,
-      "return_prev_1m": 0.0,
-      "return_prev_3m": 0.0,
-      "return_prev_5m": 0.0,
-      "volume_zscore_15m": -0.28927091461319054
-    }
-  }
+  ]
 }
