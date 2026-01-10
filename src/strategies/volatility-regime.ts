@@ -8,7 +8,7 @@
  */
 
 import type { VolatilityRegime } from '../types/trade-record.types.js';
-import type { CryptoAsset } from '../strategies/crypto15-feature-engine.js';
+import type { CryptoAsset } from './crypto15-feature-engine.js';
 
 // ============================================================================
 // Threshold Configuration
@@ -24,36 +24,40 @@ import type { CryptoAsset } from '../strategies/crypto15-feature-engine.js';
  * - volatility >= high => 'high' regime
  * - otherwise          => 'mid' regime
  */
-interface VolatilityThresholds {
+export interface VolatilityThresholds {
   readonly low: number;
   readonly high: number;
 }
 
 /**
+ * Normalize symbol by stripping USDT suffix.
+ * Allows single threshold definition per base asset.
+ */
+function normalizeSymbol(symbol: string): string {
+  return symbol.replace(/USDT$/, '');
+}
+
+/**
  * Per-symbol volatility thresholds.
- * Uses BTCUSDT-style symbols as keys for flexibility.
+ * Base symbols only - USDT variants are normalized before lookup.
  */
 const VOLATILITY_THRESHOLDS: Readonly<Record<string, VolatilityThresholds>> = {
   // BTC: Most stable of the group
   BTC: { low: 0.0005, high: 0.0015 },
-  BTCUSDT: { low: 0.0005, high: 0.0015 },
 
   // ETH: Slightly more volatile than BTC
   ETH: { low: 0.0007, high: 0.0020 },
-  ETHUSDT: { low: 0.0007, high: 0.0020 },
 
   // SOL: High volatility asset
   SOL: { low: 0.0015, high: 0.0040 },
-  SOLUSDT: { low: 0.0015, high: 0.0040 },
 
   // XRP: Medium-high volatility
   XRP: { low: 0.0010, high: 0.0030 },
-  XRPUSDT: { low: 0.0010, high: 0.0030 },
 };
 
 /**
  * Default thresholds for unknown symbols.
- * Conservative middle-ground values.
+ * Conservative middle-ground values based on median of known assets.
  */
 const DEFAULT_THRESHOLDS: Readonly<VolatilityThresholds> = {
   low: 0.001,
@@ -70,9 +74,10 @@ const DEFAULT_THRESHOLDS: Readonly<VolatilityThresholds> = {
  * Uses per-symbol thresholds calibrated from historical data. Falls back to
  * default thresholds for unknown symbols.
  *
- * @param volatility5m - 5-minute rolling volatility (std dev of returns)
+ * @param volatility5m - 5-minute rolling volatility (std dev of returns). Must be a finite non-negative number.
  * @param symbol - Crypto asset symbol (e.g., 'BTC', 'BTCUSDT')
  * @returns Volatility regime: 'low', 'mid', or 'high'
+ * @throws Error if volatility5m is NaN, Infinity, or negative
  *
  * @example
  * classifyVolatilityRegime(0.0003, 'BTC')  // => 'low'
@@ -83,7 +88,14 @@ export function classifyVolatilityRegime(
   volatility5m: number,
   symbol: CryptoAsset | string
 ): VolatilityRegime {
-  const thresholds = VOLATILITY_THRESHOLDS[symbol] ?? DEFAULT_THRESHOLDS;
+  if (!Number.isFinite(volatility5m) || volatility5m < 0) {
+    throw new Error(
+      `Invalid volatility value: ${volatility5m}. Must be a finite non-negative number.`
+    );
+  }
+
+  const normalized = normalizeSymbol(String(symbol));
+  const thresholds = VOLATILITY_THRESHOLDS[normalized] ?? DEFAULT_THRESHOLDS;
 
   if (volatility5m <= thresholds.low) {
     return 'low';
@@ -98,15 +110,16 @@ export function classifyVolatilityRegime(
 
 /**
  * Get the volatility thresholds for a given symbol.
- * Useful for debugging and testing.
+ * Exposed for testing to avoid duplicating threshold values in tests.
  *
  * @param symbol - Crypto asset symbol
- * @returns The thresholds used for classification
+ * @returns The thresholds used for classification (readonly)
  */
 export function getVolatilityThresholds(
   symbol: CryptoAsset | string
-): VolatilityThresholds {
-  return VOLATILITY_THRESHOLDS[symbol] ?? DEFAULT_THRESHOLDS;
+): Readonly<VolatilityThresholds> {
+  const normalized = normalizeSymbol(String(symbol));
+  return VOLATILITY_THRESHOLDS[normalized] ?? DEFAULT_THRESHOLDS;
 }
 
 /**
@@ -116,5 +129,6 @@ export function getVolatilityThresholds(
  * @returns true if custom thresholds exist
  */
 export function hasCustomThresholds(symbol: CryptoAsset | string): boolean {
-  return symbol in VOLATILITY_THRESHOLDS;
+  const normalized = normalizeSymbol(String(symbol));
+  return Object.hasOwn(VOLATILITY_THRESHOLDS, normalized);
 }
