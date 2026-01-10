@@ -321,6 +321,23 @@ export type {
   TokenBalances,
 } from './services/onchain-service.js';
 
+// Trade Persistence (Crypto15ML)
+export { TradeRepository } from './persistence/trade-repository.js';
+export type {
+  TradeRecord,
+  TradeOutcome,
+  MinutePrice,
+  ITradeRepository,
+  RegimeStats,
+  CalibrationBucket,
+  DatabaseStats,
+  VolatilityRegime,
+  TradeOutcomeDirection,
+  TradeSide,
+  PersistenceConfig,
+} from './types/trade-record.types.js';
+export { DEFAULT_PERSISTENCE_CONFIG } from './types/trade-record.types.js';
+
 // Price Utilities
 export {
   roundPrice,

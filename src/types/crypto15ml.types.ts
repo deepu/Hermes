@@ -56,3 +56,19 @@ export type {
 } from '../utils/strategy-logger.js';
 
 export { LogEvents } from '../utils/strategy-logger.js';
+
+// Re-export persistence types for Crypto15ML consumers
+export type {
+  TradeRecord,
+  TradeOutcome,
+  MinutePrice,
+  ITradeRepository,
+  RegimeStats,
+  CalibrationBucket,
+  DatabaseStats,
+  VolatilityRegime,
+  TradeOutcomeDirection,
+  TradeSide,
+  PersistenceConfig,
+} from './trade-record.types.js';
+export { DEFAULT_PERSISTENCE_CONFIG } from './trade-record.types.js';
