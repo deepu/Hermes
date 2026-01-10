@@ -35,12 +35,18 @@ export interface BaseLogEntry {
   strategy: string;
   /** Event type for filtering (e.g., 'signal_generated', 'execution_success') */
   event: string;
+  /** Railway service name */
+  _service: string;
+  /** Railway app name */
+  _app: string;
+  /** Railway environment */
+  _env: string;
 }
 
 /**
- * Extended log entry with optional context fields
+ * Context fields for log entries (excludes base fields)
  */
-export interface LogEntry extends BaseLogEntry {
+export interface LogContext {
   /** Market condition ID */
   marketId?: string;
   /** Binance symbol (e.g., 'BTCUSDT') */
@@ -67,8 +73,16 @@ export interface LogEntry extends BaseLogEntry {
   errorCode?: string;
   /** Human-readable message */
   message?: string;
+  /** Number of models loaded */
+  modelCount?: number;
   /** Number of trackers */
   trackerCount?: number;
+  /** Number of positions */
+  positionCount?: number;
+  /** Number of items removed (for cleanup events) */
+  removedCount?: number;
+  /** Number of items remaining (for cleanup events) */
+  remainingCount?: number;
   /** Was trade successful */
   success?: boolean;
   /** P&L value */
@@ -79,9 +93,12 @@ export interface LogEntry extends BaseLogEntry {
   dryRun?: boolean;
   /** Linear combination (z-score) */
   linearCombination?: number;
-  /** Additional context (for extensibility) */
-  [key: string]: unknown;
 }
+
+/**
+ * Full log entry combining base fields and context
+ */
+export interface LogEntry extends BaseLogEntry, LogContext {}
 
 /**
  * Configuration for StrategyLogger
@@ -99,9 +116,60 @@ export interface StrategyLoggerConfig {
   environment?: string;
 }
 
+/**
+ * Immutable config without enabled flag (for internal use)
+ */
+interface ImmutableLoggerConfig {
+  readonly strategy: string;
+  readonly service: string;
+  readonly app: string;
+  readonly environment: string;
+}
+
+// ============================================================================
+// Log Event Constants
+// ============================================================================
+
+/**
+ * Standard event names for consistent filtering
+ */
+export const LogEvents = {
+  // Strategy Lifecycle
+  STRATEGY_STARTED: 'strategy_started',
+  STRATEGY_STOPPED: 'strategy_stopped',
+  MODELS_LOADED: 'models_loaded',
+  PRICE_SUBSCRIPTION_ACTIVE: 'price_subscription_active',
+
+  // Market Discovery
+  MARKET_ADDED: 'market_added',
+  MARKET_REMOVED: 'market_removed',
+  TRACKERS_CLEANED: 'trackers_cleaned',
+
+  // Signals
+  SIGNAL_GENERATED: 'signal_generated',
+  SIGNAL_REJECTED: 'signal_rejected',
+
+  // Executions
+  EXECUTION_SUCCESS: 'execution_success',
+  EXECUTION_FAILED: 'execution_failed',
+
+  // Paper Trading (Dry Run)
+  PAPER_POSITION: 'paper_position',
+  PAPER_POSITION_EVICTED: 'paper_position_evicted',
+  PAPER_SETTLEMENT: 'paper_settlement',
+
+  // General
+  ERROR: 'error',
+} as const;
+
+export type LogEventType = (typeof LogEvents)[keyof typeof LogEvents];
+
 // ============================================================================
 // StrategyLogger Implementation
 // ============================================================================
+
+/** Maximum error message length to prevent log bloat */
+const MAX_ERROR_MESSAGE_LENGTH = 200;
 
 /**
  * Structured JSON logger for strategy services
@@ -112,7 +180,7 @@ export interface StrategyLoggerConfig {
  * @example
  * const logger = new StrategyLogger({ strategy: 'Crypto15ML' });
  *
- * logger.info('signal_generated', {
+ * logger.info(LogEvents.SIGNAL_GENERATED, {
  *   marketId: '0xabc123',
  *   symbol: 'BTCUSDT',
  *   side: 'YES',
@@ -123,12 +191,13 @@ export interface StrategyLoggerConfig {
  * // {"timestamp":"2026-01-08T14:23:45.123Z","level":"INFO","strategy":"Crypto15ML",...}
  */
 export class StrategyLogger {
-  private readonly config: Required<StrategyLoggerConfig>;
+  private readonly config: ImmutableLoggerConfig;
+  private enabled: boolean;
 
   constructor(config: StrategyLoggerConfig) {
+    this.enabled = config.enabled ?? true;
     this.config = {
       strategy: config.strategy,
-      enabled: config.enabled ?? true,
       service: config.service ?? 'hermes',
       app: config.app ?? 'trading',
       environment: config.environment ?? process.env.NODE_ENV ?? 'development',
@@ -148,7 +217,7 @@ export class StrategyLogger {
    * - Order executed successfully
    * - Market added/removed
    */
-  info(event: string, context?: Partial<LogEntry>): void {
+  info(event: LogEventType, context?: LogContext): void {
     this.log('INFO', event, context);
   }
 
@@ -160,7 +229,7 @@ export class StrategyLogger {
    * - Order partially filled
    * - Transient errors that will be retried
    */
-  warn(event: string, context?: Partial<LogEntry>): void {
+  warn(event: LogEventType, context?: LogContext): void {
     this.log('WARN', event, context);
   }
 
@@ -173,7 +242,7 @@ export class StrategyLogger {
    * - Model inference error
    * - Order execution failure
    */
-  error(event: string, context?: Partial<LogEntry>): void {
+  error(event: LogEventType, context?: LogContext): void {
     this.log('ERROR', event, context);
   }
 
@@ -181,14 +250,25 @@ export class StrategyLogger {
    * Check if logging is enabled
    */
   isEnabled(): boolean {
-    return this.config.enabled;
+    return this.enabled;
   }
 
   /**
    * Enable or disable logging at runtime
    */
   setEnabled(enabled: boolean): void {
-    (this.config as { enabled: boolean }).enabled = enabled;
+    this.enabled = enabled;
+  }
+
+  /**
+   * Sanitize error message to prevent log bloat and sensitive data leakage
+   */
+  static sanitizeErrorMessage(error: unknown): string {
+    const msg = error instanceof Error ? error.message : String(error);
+    if (msg.length > MAX_ERROR_MESSAGE_LENGTH) {
+      return msg.substring(0, MAX_ERROR_MESSAGE_LENGTH) + '...';
+    }
+    return msg;
   }
 
   // ============================================================================
@@ -200,8 +280,8 @@ export class StrategyLogger {
    *
    * Creates a structured JSON log entry and emits to stdout.
    */
-  private log(level: LogLevel, event: string, context?: Partial<LogEntry>): void {
-    if (!this.config.enabled) {
+  private log(level: LogLevel, event: LogEventType, context?: LogContext): void {
+    if (!this.enabled) {
       return;
     }
 
@@ -210,7 +290,6 @@ export class StrategyLogger {
       level,
       strategy: this.config.strategy,
       event,
-      // Railway metadata
       _service: this.config.service,
       _app: this.config.app,
       _env: this.config.environment,
@@ -237,51 +316,3 @@ export function createCrypto15MLLogger(
     ...options,
   });
 }
-
-// ============================================================================
-// Log Event Constants
-// ============================================================================
-
-/**
- * Standard event names for consistent filtering
- */
-export const LogEvents = {
-  // Strategy Lifecycle
-  STRATEGY_STARTED: 'strategy_started',
-  STRATEGY_STOPPED: 'strategy_stopped',
-  MODELS_LOADED: 'models_loaded',
-  PRICE_SUBSCRIPTION_ACTIVE: 'price_subscription_active',
-
-  // Market Discovery
-  MARKET_ADDED: 'market_added',
-  MARKET_REMOVED: 'market_removed',
-  PREDICTIVE_SCAN: 'predictive_scan',
-  REACTIVE_SCAN: 'reactive_scan',
-
-  // Signals
-  SIGNAL_GENERATED: 'signal_generated',
-  SIGNAL_REJECTED: 'signal_rejected',
-
-  // Executions
-  EXECUTION_SUCCESS: 'execution_success',
-  EXECUTION_FAILED: 'execution_failed',
-  ORDER_PLACED: 'order_placed',
-
-  // Paper Trading (Dry Run)
-  PAPER_POSITION: 'paper_position',
-  PAPER_SETTLEMENT: 'paper_settlement',
-
-  // Errors
-  WEBSOCKET_DISCONNECTED: 'websocket_disconnected',
-  WEBSOCKET_RECONNECTED: 'websocket_reconnected',
-  API_RATE_LIMIT: 'api_rate_limit',
-  MODEL_INFERENCE_ERROR: 'model_inference_error',
-  FEATURE_COMPUTATION_ERROR: 'feature_computation_error',
-  PRICE_VALIDATION_ERROR: 'price_validation_error',
-
-  // General
-  ERROR: 'error',
-  WARNING: 'warning',
-} as const;
-
-export type LogEventType = (typeof LogEvents)[keyof typeof LogEvents];

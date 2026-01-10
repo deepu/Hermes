@@ -33,7 +33,7 @@ import { loadModelsWithImputations } from '../strategies/model-loader.js';
 import {
   createCrypto15MLLogger,
   LogEvents,
-  type StrategyLogger,
+  StrategyLogger,
 } from '../utils/strategy-logger.js';
 import type { MarketService } from './market-service.js';
 import type { TradingService, OrderResult } from './trading-service.js';
@@ -75,6 +75,8 @@ export interface Crypto15MLConfig {
   debug?: boolean;
   /** Dry run mode - generate signals but don't execute trades */
   dryRun?: boolean;
+  /** Optional logger instance for dependency injection (useful for testing) */
+  logger?: StrategyLogger;
 }
 
 /**
@@ -396,8 +398,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
       thresholdBps: { ...config.thresholdBps },
     };
 
-    // Initialize structured logger (enabled when debug is true)
-    this.logger = createCrypto15MLLogger({
+    // Use injected logger or create default (enabled when debug is true)
+    this.logger = config.logger ?? createCrypto15MLLogger({
       enabled: config.debug ?? false,
     });
 
@@ -485,12 +487,10 @@ export class Crypto15MLStrategyService extends EventEmitter {
    */
   async start(): Promise<void> {
     if (this.running) {
-      this.log('Already running');
       return;
     }
 
     if (!this.config.enabled) {
-      this.log('Strategy is disabled');
       return;
     }
 
@@ -499,11 +499,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
       throw new Error('RealtimeService must be connected before starting Crypto15MLStrategyService');
     }
 
-    this.log('Starting Crypto15MLStrategyService...');
-
     try {
       // Load models with imputations
-      this.log('Loading models...');
       this.models = await loadModelsWithImputations(
         this.config.modelPath,
         this.config.imputationPath
@@ -511,7 +508,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
       this.logger.info(LogEvents.MODELS_LOADED, {
         message: `Loaded ${this.models.size} models`,
-        trackerCount: this.models.size,
+        modelCount: this.models.size,
       });
 
       // Subscribe to price updates
@@ -604,13 +601,11 @@ export class Crypto15MLStrategyService extends EventEmitter {
       return;
     }
 
-    this.log('Stopping Crypto15MLStrategyService...');
-
     // Log paper trading summary if in dry-run mode
     if (this.config.dryRun) {
       this.logger.info(LogEvents.STRATEGY_STOPPED, {
         dryRun: true,
-        trackerCount: this.paperPositions.size,
+        positionCount: this.paperPositions.size,
         pnl: this.paperPnL,
         message: `Final stats: ${this.paperPositions.size} open positions, cumulative P&L: ${this.formatPnL(this.paperPnL)}`,
       });
@@ -708,8 +703,6 @@ export class Crypto15MLStrategyService extends EventEmitter {
       (_, i) => currentWindowStart + WINDOW_MS * i
     );
 
-    this.log(`Predictive scan: checking ${windowsToCheck.length} windows for ${SUPPORTED_COINS.length} coins`);
-
     // Build list of slugs to check (excluding already tracked)
     const slugsToCheck: string[] = [];
     for (const windowStartMs of windowsToCheck) {
@@ -723,7 +716,6 @@ export class Crypto15MLStrategyService extends EventEmitter {
     }
 
     if (slugsToCheck.length === 0) {
-      this.log('Predictive scan: all markets already tracked');
       return;
     }
 
@@ -742,14 +734,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
         if (unifiedMarket && unifiedMarket.active && !unifiedMarket.closed) {
           await this.addMarketTrackerFromUnified(unifiedMarket);
         }
-      } else {
-        // Market doesn't exist yet - expected for future windows
-        // Only log in debug mode to avoid noise
-        if (this.config.debug) {
-          const reason = result.reason instanceof Error ? result.reason.message : String(result.reason);
-          this.log(`Predictive scan: market not found (expected): ${reason}`);
-        }
       }
+      // Market doesn't exist yet for future windows - this is expected behavior
     }
   }
 
@@ -759,8 +745,6 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Runs every 1 minute as a safety net to catch any markets missed by predictive scan.
    */
   async scanActiveMarkets(): Promise<void> {
-    this.log('Reactive scan: discovering active crypto 15m markets');
-
     try {
       const markets = await this.marketService.scanCryptoShortTermMarkets({
         minMinutesUntilEnd: 1,
@@ -797,10 +781,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
     let unifiedMarket: UnifiedMarket;
     try {
       unifiedMarket = await this.marketService.getMarket(market.conditionId);
-    } catch (error) {
-      const msg = error instanceof Error ? error.message : String(error);
-      this.log(`Could not fetch full market data for ${market.slug}: ${msg}`);
-      return;
+    } catch {
+      return; // Could not fetch full market data - skip this market
     }
 
     await this.addMarketTrackerFromUnified(unifiedMarket);
@@ -821,21 +803,18 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     const asset = this.inferAssetFromSlug(unifiedMarket.slug);
     if (!asset) {
-      this.log(`Could not infer asset from slug: ${unifiedMarket.slug}`);
-      return;
+      return; // Could not infer asset from slug
     }
 
     const symbol = ASSET_TO_SYMBOL[asset];
     if (!this.config.symbols.includes(symbol)) {
-      this.log(`Symbol ${symbol} not in configured symbols, skipping`);
-      return;
+      return; // Symbol not in configured symbols
     }
 
     // Find tokens by outcome name for robustness against API changes
     // Crypto markets use 'Up'/'Down', but we also check 'Yes'/'No' for compatibility
     if (!unifiedMarket.tokens || unifiedMarket.tokens.length < 2) {
-      this.log(`Market ${unifiedMarket.slug} does not have required tokens`);
-      return;
+      return; // Market does not have required tokens
     }
 
     const yesToken = unifiedMarket.tokens.find(
@@ -846,15 +825,13 @@ export class Crypto15MLStrategyService extends EventEmitter {
     );
 
     if (!yesToken?.tokenId || !noToken?.tokenId) {
-      this.log(`Could not get token IDs for market ${unifiedMarket.slug}`);
-      return;
+      return; // Could not get token IDs for market
     }
 
     // Validate endDate exists
     const endTime = unifiedMarket.endDate?.getTime();
     if (!endTime || endTime <= Date.now()) {
-      this.log(`Market ${unifiedMarket.slug} has invalid or past endDate`);
-      return;
+      return; // Market has invalid or past endDate
     }
 
     const tracker: MarketTracker = {
@@ -958,8 +935,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     // Validate price data to prevent manipulation
     if (!this.isValidPrice(price, asset)) {
-      this.log(`Invalid price rejected for ${asset}: ${price}`);
-      return;
+      return; // Invalid price rejected
     }
 
     // Use secondary index for O(1) lookup of trackers by symbol
@@ -1027,10 +1003,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
       return { yes: yesToken.price, no: noToken.price };
     } catch {
-      // Non-critical failure - log only in debug mode
-      if (this.config.debug) {
-        this.log(`Could not refresh prices for ${tracker.slug}`);
-      }
+      // Non-critical failure - use cached prices
       return null;
     }
   }
@@ -1076,8 +1049,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
     // Get model for this symbol
     const model = this.models.get(tracker.symbol);
     if (!model) {
-      this.log(`No model found for symbol ${tracker.symbol}`);
-      return;
+      return; // No model found for symbol - skip evaluation
     }
 
     // Run prediction
@@ -1130,18 +1102,21 @@ export class Crypto15MLStrategyService extends EventEmitter {
       features,
     };
 
-    this.logger.info(LogEvents.SIGNAL_GENERATED, {
-      marketId: tracker.conditionId,
-      slug: tracker.slug,
-      symbol: tracker.symbol,
-      stateMinute: features.stateMinute,
-      side,
-      confidence: prediction.probability,
-      entryPrice,
-      modelProbability: prediction.probability,
-      imputedFeatures: prediction.imputedCount,
-      linearCombination: prediction.linearCombination,
-    });
+    // Guard to avoid object allocation when logging is disabled
+    if (this.logger.isEnabled()) {
+      this.logger.info(LogEvents.SIGNAL_GENERATED, {
+        marketId: tracker.conditionId,
+        slug: tracker.slug,
+        symbol: tracker.symbol,
+        stateMinute: features.stateMinute,
+        side,
+        confidence: prediction.probability,
+        entryPrice,
+        modelProbability: prediction.probability,
+        imputedFeatures: prediction.imputedCount,
+        linearCombination: prediction.linearCombination,
+      });
+    }
 
     // Mark as traded BEFORE async execution to prevent race conditions
     // This ensures rapid price updates don't trigger duplicate trades
@@ -1249,7 +1224,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
           marketId: tracker.conditionId,
           slug: tracker.slug,
           symbol: tracker.symbol,
-          error: error instanceof Error ? error.message : String(error),
+          error: StrategyLogger.sanitizeErrorMessage(error),
           errorCode: 'transient',
           message: 'Transient error, will retry',
         });
@@ -1318,6 +1293,15 @@ export class Crypto15MLStrategyService extends EventEmitter {
         traded: tracker.traded,
       });
     }
+
+    // Log cleanup summary if any trackers were removed
+    if (expired.length > 0) {
+      this.logger.info(LogEvents.TRACKERS_CLEANED, {
+        removedCount: expired.length,
+        remainingCount: this.trackers.size,
+        message: `Cleaned up ${expired.length} expired trackers`,
+      });
+    }
   }
 
   // ============================================================================
@@ -1353,23 +1337,12 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
-   * Log a message if debug is enabled (legacy method for simple messages)
-   *
-   * @deprecated Use structured logging methods instead for new code
-   */
-  private log(message: string): void {
-    if (this.config.debug) {
-      console.log(`[Crypto15ML] ${message}`);
-    }
-  }
-
-  /**
    * Handle an error by emitting it and logging with structured format
    */
   private handleError(error: unknown): void {
     const errorObj = error instanceof Error ? error : new Error(String(error));
     this.logger.error(LogEvents.ERROR, {
-      error: errorObj.message,
+      error: StrategyLogger.sanitizeErrorMessage(errorObj),
       errorCode: this.classifyError(error),
     });
     this.emit('error', errorObj);
@@ -1440,7 +1413,14 @@ export class Crypto15MLStrategyService extends EventEmitter {
     if (this.paperPositions.size >= Crypto15MLStrategyService.MAX_PAPER_POSITIONS) {
       const oldestKey = this.paperPositions.keys().next().value;
       if (oldestKey) {
+        const evictedPosition = this.paperPositions.get(oldestKey);
         this.paperPositions.delete(oldestKey);
+        this.logger.warn(LogEvents.PAPER_POSITION_EVICTED, {
+          marketId: oldestKey,
+          slug: evictedPosition?.slug,
+          message: `Evicted oldest paper position due to limit of ${Crypto15MLStrategyService.MAX_PAPER_POSITIONS}`,
+          dryRun: true,
+        });
       }
     }
 
@@ -1572,7 +1552,6 @@ export class Crypto15MLStrategyService extends EventEmitter {
       },
     });
 
-    this.log('[DRY-RUN] Subscribed to market resolution events');
   }
 
   /**
@@ -1607,8 +1586,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
   private parseMarketOutcome(event: { data?: Record<string, unknown> }): 'UP' | 'DOWN' | null {
     // Guard against malformed events
     if (!event?.data || typeof event.data !== 'object') {
-      this.log(`[DRY-RUN] Malformed event data, skipping resolution`);
-      return null;
+      return null; // Malformed event data
     }
 
     const data = event.data;
@@ -1622,7 +1600,6 @@ export class Crypto15MLStrategyService extends EventEmitter {
     }
 
     // Could not determine outcome - skip this resolution
-    this.log(`[DRY-RUN] Could not parse outcome from event data, skipping resolution`);
     return null;
   }
 

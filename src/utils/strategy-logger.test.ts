@@ -10,6 +10,7 @@ import {
   createCrypto15MLLogger,
   LogEvents,
   type LogEntry,
+  type LogContext,
 } from './strategy-logger.js';
 
 describe('StrategyLogger', () => {
@@ -36,7 +37,7 @@ describe('StrategyLogger', () => {
 
     it('should use default values for optional config', () => {
       const logger = new StrategyLogger({ strategy: 'Test' });
-      logger.info('test_event', {});
+      logger.info(LogEvents.STRATEGY_STARTED, {});
 
       expect(consoleSpy).toHaveBeenCalledTimes(1);
       const logOutput = JSON.parse(consoleSpy.mock.calls[0][0] as string);
@@ -120,9 +121,9 @@ describe('StrategyLogger', () => {
   describe('disabled logging', () => {
     it('should not log when disabled', () => {
       const logger = new StrategyLogger({ strategy: 'Test', enabled: false });
-      logger.info('test_event', {});
-      logger.warn('test_warn', {});
-      logger.error('test_error', {});
+      logger.info(LogEvents.STRATEGY_STARTED, {});
+      logger.warn(LogEvents.SIGNAL_REJECTED, {});
+      logger.error(LogEvents.ERROR, {});
 
       expect(consoleSpy).not.toHaveBeenCalled();
     });
@@ -130,15 +131,15 @@ describe('StrategyLogger', () => {
     it('should support runtime enable/disable', () => {
       const logger = new StrategyLogger({ strategy: 'Test', enabled: true });
 
-      logger.info('first', {});
+      logger.info(LogEvents.STRATEGY_STARTED, {});
       expect(consoleSpy).toHaveBeenCalledTimes(1);
 
       logger.setEnabled(false);
-      logger.info('second', {});
+      logger.info(LogEvents.STRATEGY_STOPPED, {});
       expect(consoleSpy).toHaveBeenCalledTimes(1); // Still 1
 
       logger.setEnabled(true);
-      logger.info('third', {});
+      logger.info(LogEvents.MODELS_LOADED, {});
       expect(consoleSpy).toHaveBeenCalledTimes(2);
     });
   });
@@ -151,7 +152,7 @@ describe('StrategyLogger', () => {
         app: 'trading',
         environment: 'production',
       });
-      logger.info('test', {});
+      logger.info(LogEvents.STRATEGY_STARTED, {});
 
       const logOutput: LogEntry = JSON.parse(consoleSpy.mock.calls[0][0] as string);
       expect(logOutput._service).toBe('hermes');
@@ -163,7 +164,7 @@ describe('StrategyLogger', () => {
   describe('JSON format', () => {
     it('should output valid single-line JSON', () => {
       const logger = new StrategyLogger({ strategy: 'Test' });
-      logger.info('event', { key: 'value' });
+      logger.info(LogEvents.STRATEGY_STARTED, { message: 'test value' });
 
       const output = consoleSpy.mock.calls[0][0] as string;
 
@@ -176,12 +177,33 @@ describe('StrategyLogger', () => {
 
     it('should handle special characters in strings', () => {
       const logger = new StrategyLogger({ strategy: 'Test' });
-      logger.info('event', { message: 'Line1\nLine2\tTabbed' });
+      logger.info(LogEvents.STRATEGY_STARTED, { message: 'Line1\nLine2\tTabbed' });
 
       const output = consoleSpy.mock.calls[0][0] as string;
       const parsed = JSON.parse(output);
 
       expect(parsed.message).toBe('Line1\nLine2\tTabbed');
+    });
+  });
+
+  describe('sanitizeErrorMessage', () => {
+    it('should truncate long error messages', () => {
+      const longMessage = 'a'.repeat(300);
+      const result = StrategyLogger.sanitizeErrorMessage(new Error(longMessage));
+      expect(result.length).toBe(203); // 200 + '...'
+      expect(result.endsWith('...')).toBe(true);
+    });
+
+    it('should not truncate short error messages', () => {
+      const shortMessage = 'Short error';
+      const result = StrategyLogger.sanitizeErrorMessage(new Error(shortMessage));
+      expect(result).toBe(shortMessage);
+    });
+
+    it('should handle non-Error values', () => {
+      expect(StrategyLogger.sanitizeErrorMessage('string error')).toBe('string error');
+      expect(StrategyLogger.sanitizeErrorMessage(123)).toBe('123');
+      expect(StrategyLogger.sanitizeErrorMessage(null)).toBe('null');
     });
   });
 });
@@ -199,7 +221,7 @@ describe('createCrypto15MLLogger', () => {
 
   it('should create logger with Crypto15ML strategy name', () => {
     const logger = createCrypto15MLLogger();
-    logger.info('test', {});
+    logger.info(LogEvents.STRATEGY_STARTED, {});
 
     const logOutput = JSON.parse(consoleSpy.mock.calls[0][0] as string);
     expect(logOutput.strategy).toBe('Crypto15ML');
@@ -207,7 +229,7 @@ describe('createCrypto15MLLogger', () => {
 
   it('should allow overriding options except strategy', () => {
     const logger = createCrypto15MLLogger({ enabled: true, service: 'custom-service' });
-    logger.info('test', {});
+    logger.info(LogEvents.STRATEGY_STARTED, {});
 
     const logOutput = JSON.parse(consoleSpy.mock.calls[0][0] as string);
     expect(logOutput.strategy).toBe('Crypto15ML');
@@ -217,17 +239,47 @@ describe('createCrypto15MLLogger', () => {
 
 describe('LogEvents', () => {
   it('should have all expected event types', () => {
+    // Strategy Lifecycle
     expect(LogEvents.STRATEGY_STARTED).toBe('strategy_started');
     expect(LogEvents.STRATEGY_STOPPED).toBe('strategy_stopped');
     expect(LogEvents.MODELS_LOADED).toBe('models_loaded');
-    expect(LogEvents.SIGNAL_GENERATED).toBe('signal_generated');
-    expect(LogEvents.SIGNAL_REJECTED).toBe('signal_rejected');
-    expect(LogEvents.EXECUTION_SUCCESS).toBe('execution_success');
-    expect(LogEvents.EXECUTION_FAILED).toBe('execution_failed');
+    expect(LogEvents.PRICE_SUBSCRIPTION_ACTIVE).toBe('price_subscription_active');
+
+    // Market Discovery
     expect(LogEvents.MARKET_ADDED).toBe('market_added');
     expect(LogEvents.MARKET_REMOVED).toBe('market_removed');
+    expect(LogEvents.TRACKERS_CLEANED).toBe('trackers_cleaned');
+
+    // Signals
+    expect(LogEvents.SIGNAL_GENERATED).toBe('signal_generated');
+    expect(LogEvents.SIGNAL_REJECTED).toBe('signal_rejected');
+
+    // Executions
+    expect(LogEvents.EXECUTION_SUCCESS).toBe('execution_success');
+    expect(LogEvents.EXECUTION_FAILED).toBe('execution_failed');
+
+    // Paper Trading
     expect(LogEvents.PAPER_POSITION).toBe('paper_position');
+    expect(LogEvents.PAPER_POSITION_EVICTED).toBe('paper_position_evicted');
     expect(LogEvents.PAPER_SETTLEMENT).toBe('paper_settlement');
+
+    // General
     expect(LogEvents.ERROR).toBe('error');
+  });
+});
+
+describe('LogContext type safety', () => {
+  it('should only allow defined fields', () => {
+    // This is a compile-time check - if LogContext had an index signature,
+    // this would allow any field. Now it only allows defined fields.
+    const context: LogContext = {
+      marketId: '0xabc',
+      symbol: 'BTCUSDT',
+      confidence: 0.75,
+      // @ts-expect-error - unknownField is not a valid LogContext property
+      unknownField: 'should fail',
+    };
+    // Runtime check - the object is still created but TS should flag it
+    expect(context.marketId).toBe('0xabc');
   });
 });
