@@ -41,7 +41,7 @@ import type { TradingService, OrderResult } from './trading-service.js';
 import type { RealtimeServiceV2, CryptoPrice, Subscription } from './realtime-service-v2.js';
 import type { GammaMarket } from '../clients/gamma-api.js';
 import type { UnifiedMarket } from '../core/types.js';
-import type { ITradeRepository, TradeRecord, TradeOutcome, PersistenceConfig } from '../types/trade-record.types.js';
+import type { ITradeRepository, TradeRecord, TradeOutcome, PersistenceConfig, MinutePrice } from '../types/trade-record.types.js';
 
 // ============================================================================
 // Types
@@ -179,18 +179,6 @@ export interface PaperTradingStats {
 }
 
 /**
- * Minute price snapshot during trade window
- */
-interface TrackerMinutePrice {
-  /** Minute offset within window (0-14) */
-  minuteOffset: number;
-  /** Unix ms timestamp */
-  timestamp: number;
-  /** Spot price at this minute */
-  price: number;
-}
-
-/**
  * Token lookup result for YES/NO tokens
  */
 interface TokenLookupResult {
@@ -223,7 +211,7 @@ interface MarketTracker {
   /** When this tracker was created */
   createdAt: number;
   /** Minute-level prices recorded during window, keyed by minuteOffset (0-14) for O(1) lookup */
-  minutePrices: Map<number, TrackerMinutePrice>;
+  minutePrices: Map<number, MinutePrice>;
   /** Database trade ID (set after persistence, used for recording minute prices) */
   tradeId?: number;
 }
@@ -288,6 +276,9 @@ const WINDOW_MINUTES = 15;
 
 /** Window duration in milliseconds */
 const WINDOW_MS = WINDOW_MINUTES * 60 * 1000;
+
+/** Maximum minute offset (0-indexed, so 14 for 15-minute window) */
+const MAX_MINUTE_OFFSET = WINDOW_MINUTES - 1;
 
 /** Predictive scan interval (10 minutes) */
 const PREDICTIVE_SCAN_INTERVAL_MS = 10 * 60 * 1000;
@@ -471,7 +462,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
     if (config.entryPriceCap < 0 || config.entryPriceCap > 1) {
       throw new Error('entryPriceCap must be between 0 and 1');
     }
-    if (config.stateMinutes.some(m => m < 0 || m > 14)) {
+    if (config.stateMinutes.some(m => m < 0 || m > MAX_MINUTE_OFFSET)) {
       throw new Error('stateMinutes values must be between 0 and 14');
     }
     if (config.symbols.length === 0) {
@@ -1037,7 +1028,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
     timestamp: number
   ): void {
     // Validate minuteOffset is within valid range (0-14 for 15-minute window)
-    if (minuteOffset < 0 || minuteOffset > 14) {
+    if (minuteOffset < 0 || minuteOffset > MAX_MINUTE_OFFSET) {
       this.logger.error(LogEvents.PERSISTENCE_ERROR, {
         marketId: tracker.conditionId,
         minuteOffset,
@@ -1066,18 +1057,18 @@ export class Crypto15MLStrategyService extends EventEmitter {
     // If we have a trade ID and repository, persist to database
     if (tradeId !== undefined && repo) {
       // Use setImmediate to avoid blocking the trading hot path
-      setImmediate(async () => {
-        try {
-          await repo.recordMinutePrice(tradeId, minuteOffset, price, timestamp);
-        } catch (error) {
-          // Log error but don't crash - minute price persistence is non-critical
-          this.logger.error(LogEvents.PERSISTENCE_ERROR, {
-            marketId,
-            minuteOffset,
-            error: error instanceof Error ? error.message : String(error),
-            message: 'Failed to persist minute price',
+      // Use promise chaining instead of async wrapper to avoid unhandled rejections
+      setImmediate(() => {
+        repo.recordMinutePrice(tradeId, minuteOffset, price, timestamp)
+          .catch(error => {
+            // Log error but don't crash - minute price persistence is non-critical
+            this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+              marketId,
+              minuteOffset,
+              error: error instanceof Error ? error.message : String(error),
+              message: 'Failed to persist minute price',
+            });
           });
-        }
       });
     }
   }
@@ -1580,32 +1571,34 @@ export class Crypto15MLStrategyService extends EventEmitter {
     const conditionId = signal.conditionId;
 
     // Use setImmediate to avoid blocking the trading hot path
-    setImmediate(async () => {
-      try {
-        const tradeId = await repo.recordTrade(tradeRecord);
-        this.persistedTrades.add(conditionId);
+    // Use promise chaining instead of async wrapper to avoid unhandled rejections
+    setImmediate(() => {
+      repo.recordTrade(tradeRecord)
+        .then(tradeId => {
+          this.persistedTrades.add(conditionId);
 
-        // Store tradeId on tracker for future minute price persistence
-        tracker.tradeId = tradeId;
+          // Store tradeId on tracker for future minute price persistence
+          tracker.tradeId = tradeId;
 
-        this.logger.info(LogEvents.TRADE_PERSISTED, {
-          marketId: conditionId,
-          slug: signal.slug,
-          tradeId,
-          message: `Trade persisted with ID ${tradeId}`,
+          this.logger.info(LogEvents.TRADE_PERSISTED, {
+            marketId: conditionId,
+            slug: signal.slug,
+            tradeId,
+            message: `Trade persisted with ID ${tradeId}`,
+          });
+
+          // Persist any minute prices that were collected before trade was recorded
+          return this.persistExistingMinutePrices(tracker, tradeId);
+        })
+        .catch(error => {
+          // Log error but don't crash - persistence is non-critical
+          this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+            marketId: conditionId,
+            slug: signal.slug,
+            error: error instanceof Error ? error.message : String(error),
+            message: 'Failed to persist trade',
+          });
         });
-
-        // Persist any minute prices that were collected before trade was recorded
-        await this.persistExistingMinutePrices(tracker, tradeId);
-      } catch (error) {
-        // Log error but don't crash - persistence is non-critical
-        this.logger.error(LogEvents.PERSISTENCE_ERROR, {
-          marketId: conditionId,
-          slug: signal.slug,
-          error: error instanceof Error ? error.message : String(error),
-          message: 'Failed to persist trade',
-        });
-      }
     });
   }
 
@@ -1614,8 +1607,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
    *
    * This handles the case where minute prices are recorded at minute boundaries
    * before the trade signal is generated (which happens at state minutes 0, 1, 2).
-   * Uses Promise.all for parallel database writes with individual error handling
-   * to ensure all prices are attempted even if some fail.
+   * Uses batch insert for efficiency (single DB operation instead of N).
    */
   private async persistExistingMinutePrices(
     tracker: MarketTracker,
@@ -1630,36 +1622,22 @@ export class Crypto15MLStrategyService extends EventEmitter {
     const minutePricesArray = Array.from(tracker.minutePrices.values());
 
     try {
-      // Persist all collected minute prices in parallel, handling individual errors
-      // so that failure of one price doesn't prevent others from being persisted
-      const persistPromises = minutePricesArray.map(mp =>
-        repo.recordMinutePrice(tradeId, mp.minuteOffset, mp.price, mp.timestamp)
-          .catch(error => {
-            // Log individual price persistence failure but continue with others
-            this.logger.error(LogEvents.PERSISTENCE_ERROR, {
-              marketId,
-              tradeId,
-              minuteOffset: mp.minuteOffset,
-              error: error instanceof Error ? error.message : String(error),
-              message: 'Failed to persist single minute price',
-            });
-          })
-      );
-      await Promise.all(persistPromises);
+      // Use batch insert for efficiency (single DB transaction)
+      await repo.recordMinutePrices(tradeId, minutePricesArray);
 
       this.logger.info(LogEvents.TRADE_PERSISTED, {
         marketId,
         tradeId,
         minutePriceCount: minutePricesArray.length,
-        message: `Attempted to persist ${minutePricesArray.length} existing minute prices`,
+        message: `Persisted ${minutePricesArray.length} existing minute prices`,
       });
     } catch (error) {
-      // This catch is for truly unexpected errors (e.g., Promise.all itself failing)
+      // Log error but don't crash - minute price persistence is non-critical
       this.logger.error(LogEvents.PERSISTENCE_ERROR, {
         marketId,
         tradeId,
         error: error instanceof Error ? error.message : String(error),
-        message: 'Unexpected error while persisting existing minute prices',
+        message: 'Failed to persist existing minute prices',
       });
     }
   }
@@ -1790,7 +1768,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
    *
    * @returns true if the minute value is a valid number (threshold was hit)
    */
-  private isThresholdHit(minute: number): minute is number {
+  private isValidThresholdMinute(minute: number): boolean {
     return !Number.isNaN(minute) && Number.isFinite(minute);
   }
 
@@ -1809,10 +1787,10 @@ export class Crypto15MLStrategyService extends EventEmitter {
     }
 
     return {
-      timeToUpThreshold: this.isThresholdHit(windowState.firstUpHitMinute)
+      timeToUpThreshold: this.isValidThresholdMinute(windowState.firstUpHitMinute)
         ? windowState.firstUpHitMinute
         : undefined,
-      timeToDownThreshold: this.isThresholdHit(windowState.firstDownHitMinute)
+      timeToDownThreshold: this.isValidThresholdMinute(windowState.firstDownHitMinute)
         ? windowState.firstDownHitMinute
         : undefined,
     };
@@ -1826,9 +1804,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Uses O(1) Map lookup.
    */
   private getWindowClosePrice(tracker: MarketTracker): number | undefined {
-    // Window minute 14 is the last minute (0-indexed, 15 minute window)
+    // Window close is the last minute (0-indexed, 15 minute window)
     // O(1) lookup using Map.get instead of O(n) array.find
-    return tracker.minutePrices.get(14)?.price;
+    return tracker.minutePrices.get(MAX_MINUTE_OFFSET)?.price;
   }
 
   /**
@@ -1847,28 +1825,30 @@ export class Crypto15MLStrategyService extends EventEmitter {
     }
 
     // Use setImmediate to avoid blocking
-    setImmediate(async () => {
-      try {
-        await repo.updateOutcome(conditionId, outcome);
-
-        this.logger.info(LogEvents.OUTCOME_PERSISTED, {
-          marketId: conditionId,
-          outcome: outcome.outcome,
-          isWin: outcome.isWin,
-          pnl: outcome.pnl,
-          message: `Outcome persisted: ${outcome.outcome} (${outcome.isWin ? 'WIN' : 'LOSS'})`,
+    // Use promise chaining instead of async wrapper to avoid unhandled rejections
+    setImmediate(() => {
+      repo.updateOutcome(conditionId, outcome)
+        .then(() => {
+          this.logger.info(LogEvents.OUTCOME_PERSISTED, {
+            marketId: conditionId,
+            outcome: outcome.outcome,
+            isWin: outcome.isWin,
+            pnl: outcome.pnl,
+            message: `Outcome persisted: ${outcome.outcome} (${outcome.isWin ? 'WIN' : 'LOSS'})`,
+          });
+        })
+        .catch(error => {
+          // Log error but don't crash - persistence is non-critical
+          this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+            marketId: conditionId,
+            error: error instanceof Error ? error.message : String(error),
+            message: 'Failed to persist outcome',
+          });
+        })
+        .finally(() => {
+          // Always clean up tracking entry to prevent memory leaks
+          this.persistedTrades.delete(conditionId);
         });
-      } catch (error) {
-        // Log error but don't crash - persistence is non-critical
-        this.logger.error(LogEvents.PERSISTENCE_ERROR, {
-          marketId: conditionId,
-          error: error instanceof Error ? error.message : String(error),
-          message: 'Failed to persist outcome',
-        });
-      } finally {
-        // Always clean up tracking entry to prevent memory leaks
-        this.persistedTrades.delete(conditionId);
-      }
     });
   }
 

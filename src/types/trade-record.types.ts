@@ -134,15 +134,15 @@ export interface TradeRecord {
 }
 
 /**
- * Minute-level price snapshot during trade window
+ * Minute-level price snapshot during trade window (immutable after creation)
  */
 export interface MinutePrice {
   /** Minute offset within window (0-14) */
-  minuteOffset: number;
+  readonly minuteOffset: number;
   /** Unix ms timestamp */
-  timestamp: number;
+  readonly timestamp: number;
   /** Spot price at this minute */
-  price: number;
+  readonly price: number;
 }
 
 /**
@@ -250,6 +250,8 @@ export interface ITradeRepository {
   updateOutcome(conditionId: string, outcome: TradeOutcome): Promise<void>;
   /** Record a minute price snapshot */
   recordMinutePrice(tradeId: number, minute: number, price: number, timestamp: number): Promise<void>;
+  /** Record multiple minute price snapshots in a single batch operation */
+  recordMinutePrices(tradeId: number, prices: ReadonlyArray<MinutePrice>): Promise<void>;
 
   // === Read Operations ===
   /** Get trade by Polymarket condition ID */

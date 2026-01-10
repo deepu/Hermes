@@ -255,6 +255,50 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
   };
 }
 
+/**
+ * Mock trade repository type with accessible mock functions
+ */
+type MockTradeRepository = ITradeRepository & {
+  initialize: ReturnType<typeof vi.fn>;
+  close: ReturnType<typeof vi.fn>;
+  recordTrade: ReturnType<typeof vi.fn>;
+  updateOutcome: ReturnType<typeof vi.fn>;
+  recordMinutePrice: ReturnType<typeof vi.fn>;
+  recordMinutePrices: ReturnType<typeof vi.fn>;
+};
+
+/**
+ * Create a mock trade repository with all required ITradeRepository methods.
+ * Returns a properly typed mock that can be passed directly to the service
+ * without 'as any' type assertions.
+ */
+function createMockTradeRepository(): MockTradeRepository {
+  return {
+    // Lifecycle
+    initialize: vi.fn().mockResolvedValue(undefined),
+    close: vi.fn().mockResolvedValue(undefined),
+    // Write operations
+    recordTrade: vi.fn().mockResolvedValue(1),
+    updateOutcome: vi.fn().mockResolvedValue(undefined),
+    recordMinutePrice: vi.fn().mockResolvedValue(undefined),
+    recordMinutePrices: vi.fn().mockResolvedValue(undefined),
+    // Read operations (not used in current tests, but required by interface)
+    getTradeByConditionId: vi.fn().mockResolvedValue(null),
+    getPendingTrades: vi.fn().mockResolvedValue([]),
+    getTradeById: vi.fn().mockResolvedValue(null),
+    // Analysis queries
+    getTradesByDateRange: vi.fn().mockResolvedValue([]),
+    getTradesBySymbol: vi.fn().mockResolvedValue([]),
+    getPerformanceByRegime: vi.fn().mockResolvedValue({ regime: 'mid', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
+    getCalibrationData: vi.fn().mockResolvedValue([]),
+    // Maintenance
+    vacuum: vi.fn().mockResolvedValue(undefined),
+    getStats: vi.fn().mockResolvedValue({ totalTrades: 0, pendingTrades: 0, resolvedTrades: 0, dbSizeBytes: 0 }),
+    // Transaction support
+    transaction: vi.fn().mockImplementation(<T>(fn: () => T) => Promise.resolve(fn())),
+  };
+}
+
 // ============================================================================
 // Test Helpers
 // ============================================================================
@@ -1805,43 +1849,6 @@ describe('Crypto15MLStrategyService Integration', () => {
   describe('Trade Persistence Integration', () => {
     const MODEL_INTERCEPT_YES = 3.0;
 
-    /**
-     * Create a mock trade repository with all required ITradeRepository methods.
-     * Returns a properly typed mock that can be passed directly to the service
-     * without 'as any' type assertions.
-     */
-    function createMockTradeRepository(): ITradeRepository & {
-      initialize: ReturnType<typeof vi.fn>;
-      close: ReturnType<typeof vi.fn>;
-      recordTrade: ReturnType<typeof vi.fn>;
-      updateOutcome: ReturnType<typeof vi.fn>;
-      recordMinutePrice: ReturnType<typeof vi.fn>;
-    } {
-      return {
-        // Lifecycle
-        initialize: vi.fn().mockResolvedValue(undefined),
-        close: vi.fn().mockResolvedValue(undefined),
-        // Write operations
-        recordTrade: vi.fn().mockResolvedValue(1),
-        updateOutcome: vi.fn().mockResolvedValue(undefined),
-        recordMinutePrice: vi.fn().mockResolvedValue(undefined),
-        // Read operations (not used in current tests, but required by interface)
-        getTradeByConditionId: vi.fn().mockResolvedValue(null),
-        getPendingTrades: vi.fn().mockResolvedValue([]),
-        getTradeById: vi.fn().mockResolvedValue(null),
-        // Analysis queries
-        getTradesByDateRange: vi.fn().mockResolvedValue([]),
-        getTradesBySymbol: vi.fn().mockResolvedValue([]),
-        getPerformanceByRegime: vi.fn().mockResolvedValue({ regime: 'mid', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
-        getCalibrationData: vi.fn().mockResolvedValue([]),
-        // Maintenance
-        vacuum: vi.fn().mockResolvedValue(undefined),
-        getStats: vi.fn().mockResolvedValue({ totalTrades: 0, pendingTrades: 0, resolvedTrades: 0, dbSizeBytes: 0 }),
-        // Transaction support
-        transaction: vi.fn().mockImplementation(<T>(fn: () => T) => Promise.resolve(fn())),
-      };
-    }
-
     it('should initialize repository on start when persistence is enabled', async () => {
       const mockRepo = createMockTradeRepository();
 
@@ -2131,45 +2138,8 @@ describe('Crypto15MLStrategyService Integration', () => {
   describe('Minute Price Tracking', () => {
     const MODEL_INTERCEPT_YES = 3.0;
 
-    /**
-     * Create a mock trade repository with all required ITradeRepository methods.
-     * This is the same as createMockTradeRepository in the persistence tests
-     * but defined locally for test isolation.
-     */
-    function createMockTradeRepositoryForMinutePrices(): ITradeRepository & {
-      initialize: ReturnType<typeof vi.fn>;
-      close: ReturnType<typeof vi.fn>;
-      recordTrade: ReturnType<typeof vi.fn>;
-      updateOutcome: ReturnType<typeof vi.fn>;
-      recordMinutePrice: ReturnType<typeof vi.fn>;
-    } {
-      return {
-        // Lifecycle
-        initialize: vi.fn().mockResolvedValue(undefined),
-        close: vi.fn().mockResolvedValue(undefined),
-        // Write operations
-        recordTrade: vi.fn().mockResolvedValue(1),
-        updateOutcome: vi.fn().mockResolvedValue(undefined),
-        recordMinutePrice: vi.fn().mockResolvedValue(undefined),
-        // Read operations (required by interface)
-        getTradeByConditionId: vi.fn().mockResolvedValue(null),
-        getPendingTrades: vi.fn().mockResolvedValue([]),
-        getTradeById: vi.fn().mockResolvedValue(null),
-        // Analysis queries
-        getTradesByDateRange: vi.fn().mockResolvedValue([]),
-        getTradesBySymbol: vi.fn().mockResolvedValue([]),
-        getPerformanceByRegime: vi.fn().mockResolvedValue({ regime: 'mid', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
-        getCalibrationData: vi.fn().mockResolvedValue([]),
-        // Maintenance
-        vacuum: vi.fn().mockResolvedValue(undefined),
-        getStats: vi.fn().mockResolvedValue({ totalTrades: 0, pendingTrades: 0, resolvedTrades: 0, dbSizeBytes: 0 }),
-        // Transaction support
-        transaction: vi.fn().mockImplementation(<T>(fn: () => T) => Promise.resolve(fn())),
-      };
-    }
-
     it('should record minute prices at each minute boundary', async () => {
-      const mockRepo = createMockTradeRepositoryForMinutePrices();
+      const mockRepo = createMockTradeRepository();
       testModelIntercept = MODEL_INTERCEPT_YES;
 
       // Setup market
@@ -2211,31 +2181,39 @@ describe('Crypto15MLStrategyService Integration', () => {
       // Allow async operations to settle
       await vi.advanceTimersByTimeAsync(200);
 
-      // recordMinutePrice should be called for each minute (0-4)
-      // With stateMinutes=[0,1,2] default, signal fires at minute 0, which triggers
-      // batch persist of minute 0. Then minutes 1-4 are persisted individually.
-      // Total: 5 calls (one per minute boundary: 0, 1, 2, 3, 4)
-      const calls = mockRepo.recordMinutePrice.mock.calls;
-      expect(calls.length).toBe(5);
+      // With stateMinutes=[0,1,2] default, signal fires at minute 0, which triggers:
+      // 1. Batch persist of minute 0 via recordMinutePrices (1 call with 1 price)
+      // 2. Individual persists for minutes 1-4 via recordMinutePrice (4 calls)
+
+      // Check batch call first (minute 0 collected before trade was persisted)
+      expect(mockRepo.recordMinutePrices).toHaveBeenCalledTimes(1);
+      const batchCall = mockRepo.recordMinutePrices.mock.calls[0] as [number, Array<{minuteOffset: number}>];
+      expect(batchCall[0]).toBe(1); // tradeId
+      expect(batchCall[1].length).toBe(1); // 1 price (minute 0)
+      expect(batchCall[1][0].minuteOffset).toBe(0);
+
+      // Check individual calls for minutes 1-4
+      const individualCalls = mockRepo.recordMinutePrice.mock.calls;
+      expect(individualCalls.length).toBe(4); // Minutes 1, 2, 3, 4
 
       // Verify call parameters are valid: [tradeId, minuteOffset, price, timestamp]
-      for (const call of calls) {
+      for (const call of individualCalls) {
         expect(call).toHaveLength(4);
         expect(typeof call[0]).toBe('number'); // tradeId
-        expect(call[1]).toBeGreaterThanOrEqual(0); // minuteOffset >= 0
+        expect(call[1]).toBeGreaterThanOrEqual(1); // minuteOffset >= 1
         expect(call[1]).toBeLessThanOrEqual(14); // minuteOffset <= 14
         expect(typeof call[2]).toBe('number'); // price
         expect(typeof call[3]).toBe('number'); // timestamp
       }
 
-      // Verify each minute offset 0-4 was called exactly once
-      const minuteOffsets = calls.map((call: unknown[]) => call[1] as number);
-      expect(new Set(minuteOffsets).size).toBe(5); // All unique
-      expect(minuteOffsets.sort()).toEqual([0, 1, 2, 3, 4]);
+      // Verify each minute offset 1-4 was called exactly once
+      const minuteOffsets = individualCalls.map((call: unknown[]) => call[1] as number);
+      expect(new Set(minuteOffsets).size).toBe(4); // All unique
+      expect(minuteOffsets.sort()).toEqual([1, 2, 3, 4]);
     });
 
     it('should persist existing minute prices when trade is recorded', async () => {
-      const mockRepo = createMockTradeRepositoryForMinutePrices();
+      const mockRepo = createMockTradeRepository();
       testModelIntercept = MODEL_INTERCEPT_YES;
 
       // Setup market
@@ -2281,20 +2259,23 @@ describe('Crypto15MLStrategyService Integration', () => {
       // Trade should have been recorded
       expect(mockRepo.recordTrade).toHaveBeenCalledTimes(1);
 
-      // Existing minute prices (0, 1, 2) should have been persisted after trade
+      // Existing minute prices (0, 1, 2) should have been batch persisted after trade
       // With stateMinutes=[2], signal fires at minute 2, which triggers batch persist
-      // of all collected prices (minutes 0, 1, 2) = 3 calls
-      const calls = mockRepo.recordMinutePrice.mock.calls;
-      expect(calls.length).toBe(3); // Exactly 3 minute prices persisted
+      // of all collected prices (minutes 0, 1, 2) via recordMinutePrices
+      expect(mockRepo.recordMinutePrices).toHaveBeenCalledTimes(1);
+
+      const batchCall = mockRepo.recordMinutePrices.mock.calls[0] as [number, Array<{minuteOffset: number}>];
+      expect(batchCall[0]).toBe(1); // tradeId
+      expect(batchCall[1].length).toBe(3); // 3 prices (minutes 0, 1, 2)
 
       // Verify each minute offset is unique and within 0-2 range
-      const minuteOffsets = calls.map((call: unknown[]) => call[1] as number);
+      const minuteOffsets = batchCall[1].map(mp => mp.minuteOffset);
       expect(new Set(minuteOffsets).size).toBe(3); // All unique
-      expect(minuteOffsets.every((m: number) => m >= 0 && m <= 2)).toBe(true);
+      expect(minuteOffsets.every(m => m >= 0 && m <= 2)).toBe(true);
     });
 
     it('should include timing metrics in outcome when market resolves', async () => {
-      const mockRepo = createMockTradeRepositoryForMinutePrices();
+      const mockRepo = createMockTradeRepository();
       testModelIntercept = MODEL_INTERCEPT_YES;
 
       // Setup market
@@ -2352,7 +2333,7 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should not record duplicate minute prices for same minute offset', async () => {
-      const mockRepo = createMockTradeRepositoryForMinutePrices();
+      const mockRepo = createMockTradeRepository();
       testModelIntercept = MODEL_INTERCEPT_YES;
 
       // Setup market
@@ -2399,23 +2380,22 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await vi.advanceTimersByTimeAsync(200);
 
-      // Only one price at minute 0 should be recorded (after trade is persisted)
-      // The duplicate detection in recordMinutePrice should prevent multiple entries
-      const calls = mockRepo.recordMinutePrice.mock.calls;
+      // Only one price at minute 0 should be recorded (in the batch)
+      // The duplicate detection in Map prevents multiple entries for same minute
+      // Since all prices are at minute 0 and the signal fires at minute 0,
+      // the batch persist will have exactly 1 price for minute 0
+      expect(mockRepo.recordMinutePrices).toHaveBeenCalledTimes(1);
 
-      // Filter calls with minute offset 0 using safer indexing
-      const minute0Calls = calls.filter((call: unknown[]) => {
-        // Each call should be [tradeId, minuteOffset, price, timestamp]
-        if (!Array.isArray(call) || call.length < 2) return false;
-        return call[1] === 0;
-      });
+      const batchCall = mockRepo.recordMinutePrices.mock.calls[0] as [number, Array<{minuteOffset: number}>];
+      const prices = batchCall[1];
 
-      // Should have exactly 1 call for minute 0 - duplicate detection prevents more
-      expect(minute0Calls.length).toBe(1);
+      // Should have exactly 1 price in the batch - duplicate detection prevents more
+      expect(prices.length).toBe(1);
+      expect(prices[0].minuteOffset).toBe(0);
     });
 
     it('should handle minute price persistence errors gracefully', async () => {
-      const mockRepo = createMockTradeRepositoryForMinutePrices();
+      const mockRepo = createMockTradeRepository();
       mockRepo.recordMinutePrice.mockRejectedValue(new Error('Minute price write failed'));
       testModelIntercept = MODEL_INTERCEPT_YES;
 
@@ -2458,7 +2438,7 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should include window close price in outcome when available', async () => {
-      const mockRepo = createMockTradeRepositoryForMinutePrices();
+      const mockRepo = createMockTradeRepository();
       testModelIntercept = MODEL_INTERCEPT_YES;
 
       // Setup market
