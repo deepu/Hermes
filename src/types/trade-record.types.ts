@@ -248,13 +248,13 @@ export interface DatabaseStats {
 }
 
 // ============================================================================
-// Repository Interface
+// Repository Interfaces (Split for Interface Segregation)
 // ============================================================================
 
 /**
- * Trade repository interface for persistence operations
+ * Core CRUD operations for trade persistence
  */
-export interface ITradeRepository {
+export interface ITradeRepositoryCore {
   // === Lifecycle ===
   /** Initialize the database and run migrations */
   initialize(): Promise<void>;
@@ -279,7 +279,21 @@ export interface ITradeRepository {
   /** Get trade by database ID */
   getTradeById(id: number): Promise<TradeRecord | null>;
 
-  // === Analysis Queries ===
+  // === Maintenance ===
+  /** Run VACUUM to reclaim space */
+  vacuum(): Promise<void>;
+  /** Get database statistics */
+  getStats(): Promise<DatabaseStats>;
+
+  // === Transaction Support ===
+  /** Execute multiple operations within a single transaction */
+  transaction<T>(fn: () => T): Promise<T>;
+}
+
+/**
+ * Analysis and aggregation queries for trade data
+ */
+export interface ITradeAnalytics {
   /** Get trades within a date range */
   getTradesByDateRange(start: Date, end: Date): Promise<TradeRecord[]>;
   /** Get trades for a specific symbol */
@@ -294,17 +308,15 @@ export interface ITradeRepository {
   getAllRegimeStats(): Promise<RegimeStats[]>;
   /** Get calibration data for all probability buckets */
   getCalibrationData(): Promise<CalibrationBucket[]>;
-
-  // === Maintenance ===
-  /** Run VACUUM to reclaim space */
-  vacuum(): Promise<void>;
-  /** Get database statistics */
-  getStats(): Promise<DatabaseStats>;
-
-  // === Transaction Support ===
-  /** Execute multiple operations within a single transaction */
-  transaction<T>(fn: () => T): Promise<T>;
 }
+
+/**
+ * Full trade repository interface combining CRUD and analytics
+ *
+ * Use ITradeRepositoryCore for clients that only need basic persistence.
+ * Use ITradeAnalytics for clients that only need analysis queries.
+ */
+export interface ITradeRepository extends ITradeRepositoryCore, ITradeAnalytics {}
 
 // ============================================================================
 // Configuration Types

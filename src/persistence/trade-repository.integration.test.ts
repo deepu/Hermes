@@ -308,8 +308,8 @@ describe('TradeRepository Integration Tests', () => {
       expect(stats.totalPnl).toBe(-250);
     });
 
-    // Note: Transaction tests removed - the current transaction() method doesn't support
-    // async callbacks, making it incompatible with async repository methods like recordTrade.
-    // A proper transaction test can be added if transaction() is refactored to support async.
+    // TODO(#36): Add transaction rollback tests once transaction() supports async callbacks.
+    // Current transaction() method is sync-only, incompatible with async repository methods.
+    // Tracking issue needed to refactor transaction() for async support.
   });
 });
