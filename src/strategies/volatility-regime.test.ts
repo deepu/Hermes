@@ -11,27 +11,37 @@ import {
   classifyVolatilityRegime,
   getVolatilityThresholds,
   hasCustomThresholds,
+  KNOWN_VOLATILITY_SYMBOLS,
+  type KnownVolatilitySymbol,
 } from './volatility-regime.js';
-import type { CryptoAsset } from './crypto15-feature-engine.js';
 
 // ============================================================================
-// Test Data
+// Test Data (derived from actual thresholds to prevent drift)
 // ============================================================================
 
-const KNOWN_SYMBOLS: CryptoAsset[] = ['BTC', 'ETH', 'SOL', 'XRP'];
-
-// Test values for each symbol (values clearly in each regime)
-const SYMBOL_TEST_DATA: Array<{
-  symbol: CryptoAsset;
+/**
+ * Generate test data derived from actual thresholds.
+ * This ensures test values stay in sync with implementation.
+ */
+function generateSymbolTestData(): Array<{
+  symbol: KnownVolatilitySymbol;
   lowVal: number;
   midVal: number;
   highVal: number;
-}> = [
-  { symbol: 'BTC', lowVal: 0.0001, midVal: 0.0010, highVal: 0.0020 },
-  { symbol: 'ETH', lowVal: 0.0002, midVal: 0.0015, highVal: 0.0030 },
-  { symbol: 'SOL', lowVal: 0.0010, midVal: 0.0025, highVal: 0.0060 },
-  { symbol: 'XRP', lowVal: 0.0005, midVal: 0.0020, highVal: 0.0050 },
-];
+}> {
+  return KNOWN_VOLATILITY_SYMBOLS.map((symbol) => {
+    const { low, high } = getVolatilityThresholds(symbol);
+    return {
+      symbol,
+      // Values clearly within each regime (derived from thresholds)
+      lowVal: low * 0.5, // Half of low threshold (clearly low)
+      midVal: (low + high) / 2, // Midpoint between thresholds (clearly mid)
+      highVal: high * 1.5, // 1.5x high threshold (clearly high)
+    };
+  });
+}
+
+const SYMBOL_TEST_DATA = generateSymbolTestData();
 
 // ============================================================================
 // Test Suite
@@ -117,37 +127,37 @@ describe('classifyVolatilityRegime', () => {
   // ==========================================================================
 
   describe('edge cases', () => {
-    it.each(KNOWN_SYMBOLS)('should handle zero volatility for %s', (symbol) => {
+    it.each(KNOWN_VOLATILITY_SYMBOLS)('should handle zero volatility for %s', (symbol) => {
       expect(classifyVolatilityRegime(0, symbol)).toBe('low');
     });
 
-    it.each(KNOWN_SYMBOLS)('should handle very high volatility for %s', (symbol) => {
+    it.each(KNOWN_VOLATILITY_SYMBOLS)('should handle very high volatility for %s', (symbol) => {
       expect(classifyVolatilityRegime(1.0, symbol)).toBe('high');
     });
 
     it('should throw on negative volatility', () => {
       expect(() => classifyVolatilityRegime(-0.001, 'BTC')).toThrow(
-        'Invalid volatility value: -0.001'
+        'Invalid volatility value. Must be a finite non-negative number.'
       );
     });
 
     it('should throw on NaN volatility', () => {
       expect(() => classifyVolatilityRegime(NaN, 'BTC')).toThrow(
-        'Invalid volatility value: NaN'
+        'Invalid volatility value. Must be a finite non-negative number.'
       );
     });
 
     it('should throw on Infinity volatility', () => {
       expect(() => classifyVolatilityRegime(Infinity, 'BTC')).toThrow(
-        'Invalid volatility value: Infinity'
+        'Invalid volatility value. Must be a finite non-negative number.'
       );
       expect(() => classifyVolatilityRegime(-Infinity, 'BTC')).toThrow(
-        'Invalid volatility value: -Infinity'
+        'Invalid volatility value. Must be a finite non-negative number.'
       );
     });
 
     it('should handle exact boundary values', () => {
-      for (const symbol of KNOWN_SYMBOLS) {
+      for (const symbol of KNOWN_VOLATILITY_SYMBOLS) {
         const { low, high } = getVolatilityThresholds(symbol);
         expect(classifyVolatilityRegime(low, symbol)).toBe('low');
         expect(classifyVolatilityRegime(high, symbol)).toBe('high');
@@ -155,7 +165,7 @@ describe('classifyVolatilityRegime', () => {
     });
 
     it('should handle values just above low threshold', () => {
-      for (const symbol of KNOWN_SYMBOLS) {
+      for (const symbol of KNOWN_VOLATILITY_SYMBOLS) {
         const { low } = getVolatilityThresholds(symbol);
         const justAboveLow = low + Number.EPSILON;
         expect(classifyVolatilityRegime(justAboveLow, symbol)).toBe('mid');
@@ -163,7 +173,7 @@ describe('classifyVolatilityRegime', () => {
     });
 
     it('should handle values just below high threshold', () => {
-      for (const symbol of KNOWN_SYMBOLS) {
+      for (const symbol of KNOWN_VOLATILITY_SYMBOLS) {
         const { high } = getVolatilityThresholds(symbol);
         const justBelowHigh = high - Number.EPSILON;
         expect(classifyVolatilityRegime(justBelowHigh, symbol)).toBe('mid');
@@ -202,11 +212,11 @@ describe('getVolatilityThresholds', () => {
 });
 
 describe('hasCustomThresholds', () => {
-  it.each(KNOWN_SYMBOLS)('should return true for %s', (symbol) => {
+  it.each(KNOWN_VOLATILITY_SYMBOLS)('should return true for %s', (symbol) => {
     expect(hasCustomThresholds(symbol)).toBe(true);
   });
 
-  it.each(KNOWN_SYMBOLS)(
+  it.each(KNOWN_VOLATILITY_SYMBOLS)(
     'should return true for %sUSDT (normalized to base symbol)',
     (symbol) => {
       expect(hasCustomThresholds(`${symbol}USDT`)).toBe(true);
