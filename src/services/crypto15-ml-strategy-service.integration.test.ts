@@ -1804,24 +1804,13 @@ describe('Crypto15MLStrategyService Integration', () => {
   describe('Trade Persistence Integration', () => {
     const MODEL_INTERCEPT_YES = 3.0;
 
-    // Mock trade repository
+    // Mock trade repository - only includes methods actually used in tests
     function createMockTradeRepository() {
       return {
         initialize: vi.fn().mockResolvedValue(undefined),
         close: vi.fn().mockResolvedValue(undefined),
         recordTrade: vi.fn().mockResolvedValue(1),
         updateOutcome: vi.fn().mockResolvedValue(undefined),
-        getTradeByConditionId: vi.fn().mockResolvedValue(null),
-        getPendingTrades: vi.fn().mockResolvedValue([]),
-        getTradeById: vi.fn().mockResolvedValue(null),
-        getTradesByDateRange: vi.fn().mockResolvedValue([]),
-        getTradesBySymbol: vi.fn().mockResolvedValue([]),
-        getPerformanceByRegime: vi.fn().mockResolvedValue({ regime: 'mid', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
-        getCalibrationData: vi.fn().mockResolvedValue([]),
-        vacuum: vi.fn().mockResolvedValue(undefined),
-        getStats: vi.fn().mockResolvedValue({ totalTrades: 0, pendingTrades: 0, resolvedTrades: 0, dbSizeBytes: 0 }),
-        transaction: vi.fn((fn) => fn()),
-        recordMinutePrice: vi.fn().mockResolvedValue(undefined),
       };
     }
 

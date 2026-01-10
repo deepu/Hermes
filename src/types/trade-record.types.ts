@@ -157,8 +157,8 @@ export interface TradeOutcome {
   pnl: number;
   /** Unix ms when resolved */
   resolutionTimestamp: number;
-  /** Price at window close */
-  windowClosePrice: number;
+  /** Price at window close (undefined if not available) */
+  windowClosePrice?: number;
   /** Minutes to hit up threshold */
   timeToUpThreshold?: number;
   /** Minutes to hit down threshold */

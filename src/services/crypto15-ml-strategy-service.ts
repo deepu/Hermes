@@ -383,8 +383,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
   /** Trade repository for persistence (injected via constructor) */
   private tradeRepository: ITradeRepository | null = null;
 
-  /** Map conditionId -> database trade ID for outcome updates */
-  private tradeIdMap: Map<string, number> = new Map();
+  /** Set of conditionIds that have been successfully persisted */
+  private persistedTrades: Set<string> = new Set();
 
   private running = false;
 
@@ -535,7 +535,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
         await this.tradeRepository.initialize();
         this.logger.info(LogEvents.REPOSITORY_INITIALIZED, {
           message: 'Trade repository initialized',
-          dbPath: this.config.persistence?.dbPath ?? 'default',
+          dbPath: this.config.persistence?.dbPath ?? './data/crypto15ml/trades.db',
         });
       }
 
@@ -679,8 +679,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
     this.paperPositions.clear();
     this.paperPnL = 0;
 
-    // Clear trade ID map
-    this.tradeIdMap.clear();
+    // Clear persisted trades set
+    this.persistedTrades.clear();
 
     // Close trade repository (fire-and-forget, errors logged internally)
     if (this.tradeRepository) {
@@ -1472,20 +1472,22 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Errors are logged but don't crash the service.
    */
   private persistTrade(signal: Signal, tracker: MarketTracker): void {
-    if (!this.tradeRepository) {
+    const repo = this.tradeRepository;
+    if (!repo) {
       return; // Persistence not enabled
     }
 
     const tradeRecord = this.signalToTradeRecord(signal, tracker);
+    const conditionId = signal.conditionId;
 
     // Use setImmediate to avoid blocking the trading hot path
     setImmediate(async () => {
       try {
-        const tradeId = await this.tradeRepository!.recordTrade(tradeRecord);
-        this.tradeIdMap.set(signal.conditionId, tradeId);
+        const tradeId = await repo.recordTrade(tradeRecord);
+        this.persistedTrades.add(conditionId);
 
         this.logger.info(LogEvents.TRADE_PERSISTED, {
-          marketId: signal.conditionId,
+          marketId: conditionId,
           slug: signal.slug,
           tradeId,
           message: `Trade persisted with ID ${tradeId}`,
@@ -1493,7 +1495,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       } catch (error) {
         // Log error but don't crash - persistence is non-critical
         this.logger.error(LogEvents.PERSISTENCE_ERROR, {
-          marketId: signal.conditionId,
+          marketId: conditionId,
           slug: signal.slug,
           error: error instanceof Error ? error.message : String(error),
           message: 'Failed to persist trade',
@@ -1509,7 +1511,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Emits 'paperPosition' event for tracking.
    * If persistence is enabled, also persists to database.
    */
-  private recordPaperPosition(signal: Signal, tracker?: MarketTracker): void {
+  private recordPaperPosition(signal: Signal, tracker: MarketTracker): void {
     // Guard: prevent overwriting existing position
     if (this.paperPositions.has(signal.conditionId)) {
       this.logger.warn(LogEvents.PAPER_POSITION, {
@@ -1562,10 +1564,8 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     this.emit('paperPosition', position);
 
-    // Persist trade to database if repository is available and tracker is provided
-    if (tracker) {
-      this.persistTrade(signal, tracker);
-    }
+    // Persist trade to database if repository is available
+    this.persistTrade(signal, tracker);
   }
 
   /**
@@ -1595,42 +1595,30 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
-   * Calculate Maximum Favorable Excursion (MFE) for a position
+   * Calculate Maximum Favorable and Adverse Excursions for a position
    *
-   * MFE is the best price move in the trade's favor during the window.
-   * For YES positions: max run-up (price went up in our favor)
-   * For NO positions: max run-down (price went down in our favor)
+   * MFE (Maximum Favorable Excursion): Best price move in trade's favor
+   * MAE (Maximum Adverse Excursion): Worst price move against trade
+   *
+   * For YES positions: run-up is favorable, run-down is adverse
+   * For NO positions: run-down is favorable, run-up is adverse
    */
-  private calculateMFE(tracker: MarketTracker, side: 'YES' | 'NO'): number {
+  private calculateExcursions(
+    tracker: MarketTracker,
+    side: 'YES' | 'NO'
+  ): { mfe: number; mae: number } {
     const windowState = tracker.featureEngine.getState().windowState;
-    if (!windowState) return 0;
-
-    // For YES position, we want the price to go UP (run-up is favorable)
-    // For NO position, we want the price to go DOWN (run-down is favorable)
-    if (side === 'YES') {
-      return Math.abs(windowState.maxRunUp);
-    } else {
-      return Math.abs(windowState.maxRunDown);
+    if (!windowState) {
+      return { mfe: 0, mae: 0 };
     }
-  }
 
-  /**
-   * Calculate Maximum Adverse Excursion (MAE) for a position
-   *
-   * MAE is the worst price move against the trade during the window.
-   * For YES positions: max run-down (price went down against us)
-   * For NO positions: max run-up (price went up against us)
-   */
-  private calculateMAE(tracker: MarketTracker, side: 'YES' | 'NO'): number {
-    const windowState = tracker.featureEngine.getState().windowState;
-    if (!windowState) return 0;
+    const runUp = Math.abs(windowState.maxRunUp);
+    const runDown = Math.abs(windowState.maxRunDown);
 
-    // For YES position, run-down is adverse (price went against us)
-    // For NO position, run-up is adverse (price went against us)
     if (side === 'YES') {
-      return Math.abs(windowState.maxRunDown);
+      return { mfe: runUp, mae: runDown };
     } else {
-      return Math.abs(windowState.maxRunUp);
+      return { mfe: runDown, mae: runUp };
     }
   }
 
@@ -1638,19 +1626,21 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Persist outcome update to the database asynchronously
    *
    * Uses setImmediate to avoid blocking. Errors are logged but don't crash.
+   * Always cleans up persistedTrades entry regardless of success/failure.
    */
   private persistOutcome(
     conditionId: string,
     outcome: TradeOutcome
   ): void {
-    if (!this.tradeRepository) {
+    const repo = this.tradeRepository;
+    if (!repo) {
       return; // Persistence not enabled
     }
 
     // Use setImmediate to avoid blocking
     setImmediate(async () => {
       try {
-        await this.tradeRepository!.updateOutcome(conditionId, outcome);
+        await repo.updateOutcome(conditionId, outcome);
 
         this.logger.info(LogEvents.OUTCOME_PERSISTED, {
           marketId: conditionId,
@@ -1659,9 +1649,6 @@ export class Crypto15MLStrategyService extends EventEmitter {
           pnl: outcome.pnl,
           message: `Outcome persisted: ${outcome.outcome} (${outcome.isWin ? 'WIN' : 'LOSS'})`,
         });
-
-        // Clean up trade ID mapping
-        this.tradeIdMap.delete(conditionId);
       } catch (error) {
         // Log error but don't crash - persistence is non-critical
         this.logger.error(LogEvents.PERSISTENCE_ERROR, {
@@ -1669,6 +1656,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
           error: error instanceof Error ? error.message : String(error),
           message: 'Failed to persist outcome',
         });
+      } finally {
+        // Always clean up tracking entry to prevent memory leaks
+        this.persistedTrades.delete(conditionId);
       }
     });
   }
@@ -1714,23 +1704,21 @@ export class Crypto15MLStrategyService extends EventEmitter {
     this.emit('paperSettlement', settlement);
 
     // Persist outcome to database if we have a tracked trade
-    if (this.tradeIdMap.has(conditionId)) {
-      // Get tracker for MFE/MAE calculation (may be null if already cleaned up)
+    if (this.persistedTrades.has(conditionId)) {
+      // Get tracker for excursion calculation (may be null if already cleaned up)
       const tracker = this.trackers.get(conditionId);
-      const mfe = tracker ? this.calculateMFE(tracker, position.side) : 0;
-      const mae = tracker ? this.calculateMAE(tracker, position.side) : 0;
-      // Note: windowClosePrice not available from feature engine at resolution time
-      // The minute price tracking (Issue #27) will capture this data
-      const windowClosePrice = 0;
+      const excursions = tracker
+        ? this.calculateExcursions(tracker, position.side)
+        : { mfe: 0, mae: 0 };
 
       const tradeOutcome: TradeOutcome = {
         outcome,
         isWin: won,
         pnl,
         resolutionTimestamp: Date.now(),
-        windowClosePrice,
-        maxFavorableExcursion: mfe,
-        maxAdverseExcursion: mae,
+        // windowClosePrice: not available at resolution time (Issue #27 will add minute price tracking)
+        maxFavorableExcursion: excursions.mfe,
+        maxAdverseExcursion: excursions.mae,
       };
 
       this.persistOutcome(conditionId, tradeOutcome);

@@ -89,8 +89,10 @@ export const crypto15mlConfig: Crypto15MLConfig = {
   persistence: {
     enabled: process.env.CRYPTO15ML_PERSISTENCE_ENABLED !== 'false', // Default: true
     dbPath: process.env.CRYPTO15ML_PERSISTENCE_DB_PATH || './data/crypto15ml/trades.db',
-    syncMode: (process.env.CRYPTO15ML_PERSISTENCE_SYNC_MODE as PersistenceConfig['syncMode']) || 'async',
-    vacuumIntervalHours: parseInt(process.env.CRYPTO15ML_PERSISTENCE_VACUUM_INTERVAL || '24', 10),
+    syncMode: (['async', 'sync'].includes(process.env.CRYPTO15ML_PERSISTENCE_SYNC_MODE ?? '')
+      ? (process.env.CRYPTO15ML_PERSISTENCE_SYNC_MODE as PersistenceConfig['syncMode'])
+      : 'async'),
+    vacuumIntervalHours: parseInt(process.env.CRYPTO15ML_PERSISTENCE_VACUUM_INTERVAL || '24', 10) || 24,
   },
 };
 
