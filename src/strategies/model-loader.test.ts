@@ -340,7 +340,8 @@ describe('Model Loader', () => {
       const config = btcModel.getConfig();
 
       expect(config.featureMedians.volatility_5m).toBe(0.0012);
-      expect(config.featureMedians.return_prev_5m).toBe(0.0);
+      // Note: return_prev_5m is mapped to return_5m by model-loader
+      expect(config.featureMedians.return_5m).toBe(0.0);
       expect(config.featureMedians.rsi_14).toBe(50.0);
     });
 
@@ -354,9 +355,10 @@ describe('Model Loader', () => {
       const btcModel = models.get('BTCUSDT')!;
 
       // Predict with all values provided
+      // Note: model-loader maps return_prev_5m to return_5m, so use mapped name
       const result1 = btcModel.predict({
         volatility_5m: 0.001,
-        return_prev_5m: 0.01,
+        return_5m: 0.01,
         rsi_14: 55,
       });
       expect(result1.imputedCount).toBe(0);
@@ -366,7 +368,7 @@ describe('Model Loader', () => {
       // Predict with missing value (should use imputation)
       const result2 = btcModel.predict({
         volatility_5m: 0.001,
-        return_prev_5m: 0.01,
+        return_5m: 0.01,
         // rsi_14 is missing
       });
       expect(result2.imputedCount).toBe(1);

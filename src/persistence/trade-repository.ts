@@ -41,7 +41,13 @@ import {
   VALID_TRADE_OUTCOMES,
   VALID_EVALUATION_DECISIONS,
 } from '../types/trade-record.types.js';
-import type { CryptoAsset, FeatureVector } from '../strategies/crypto15-feature-engine.js';
+import {
+  MINUTE_MS,
+  HOUR_MS,
+  DEFAULT_MINUTE_OF_HOUR,
+  type CryptoAsset,
+  type FeatureVector,
+} from '../strategies/crypto15-feature-engine.js';
 
 // ============================================================================
 // Constants
@@ -1454,10 +1460,17 @@ export class TradeRepository implements ITradeRepository {
    * Convert a feature row to FeatureVector
    */
   private featureRowToVector(row: FeatureRow, symbol: CryptoAsset, timestamp: number): FeatureVector {
+    // Compute minuteOfHour from timestamp if available, otherwise use default
+    // Note: minute_of_hour not stored in DB - derive from timestamp or use mid-hour default
+    const minuteOfHour = timestamp > 0
+      ? Math.floor((timestamp % HOUR_MS) / MINUTE_MS)
+      : DEFAULT_MINUTE_OF_HOUR;
+
     return {
       stateMinute: row.state_minute,
       minutesRemaining: row.minutes_remaining,
       hourOfDay: row.hour_of_day,
+      minuteOfHour,
       dayOfWeek: row.day_of_week,
       returnSinceOpen: row.return_since_open ?? NaN,
       maxRunUp: row.max_run_up ?? NaN,

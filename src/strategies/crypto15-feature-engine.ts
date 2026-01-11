@@ -49,6 +49,8 @@ export interface FeatureVector {
   minutesRemaining: number;
   /** Hour of day (0-23, UTC) */
   hourOfDay: number;
+  /** Minute within the hour (0-59, UTC) */
+  minuteOfHour: number;
   /** Day of week (0=Sunday, 6=Saturday) */
   dayOfWeek: number;
 
@@ -132,13 +134,16 @@ const WINDOW_MS = WINDOW_MINUTES * 60 * 1000;
 const BUFFER_SIZE = 32;
 
 /** Milliseconds per minute */
-const MINUTE_MS = 60 * 1000;
+export const MINUTE_MS = 60 * 1000;
 
 /** Milliseconds per hour */
-const HOUR_MS = 60 * MINUTE_MS;
+export const HOUR_MS = 60 * MINUTE_MS;
 
 /** Milliseconds per day */
-const DAY_MS = 24 * HOUR_MS;
+export const DAY_MS = 24 * HOUR_MS;
+
+/** Default minute of hour for legacy data without timestamp (mid-hour) */
+export const DEFAULT_MINUTE_OF_HOUR = 30;
 
 /**
  * Unix epoch day-of-week offset.
@@ -254,6 +259,7 @@ export class Crypto15FeatureEngine {
       state_minute: features.stateMinute,
       minutes_remaining: features.minutesRemaining,
       hour_of_day: features.hourOfDay,
+      minute_of_hour: features.minuteOfHour,
       day_of_week: features.dayOfWeek,
       return_since_open: features.returnSinceOpen,
       max_run_up: features.maxRunUp,
@@ -372,6 +378,7 @@ export class Crypto15FeatureEngine {
   ): FeatureVector {
     // Extract UTC time components directly from timestamp (avoid Date allocation)
     const hourOfDay = Math.floor((timestamp % DAY_MS) / HOUR_MS);
+    const minuteOfHour = Math.floor((timestamp % HOUR_MS) / MINUTE_MS);
     const dayOfWeek = (Math.floor(timestamp / DAY_MS) + EPOCH_DAY_OF_WEEK) % 7;
 
     // Calculate lagged returns
@@ -392,6 +399,7 @@ export class Crypto15FeatureEngine {
       stateMinute: windowIndex,
       minutesRemaining: WINDOW_MINUTES - windowIndex,
       hourOfDay,
+      minuteOfHour,
       dayOfWeek,
 
       // Return features

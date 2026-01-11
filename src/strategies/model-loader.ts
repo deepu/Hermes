@@ -158,6 +158,74 @@ function extractAsset(
 }
 
 /**
+ * Feature name mapping from model file format to feature engine format.
+ *
+ * The trained model (from Argus) uses different feature names than the
+ * Crypto15FeatureEngine produces. This mapping translates model feature names
+ * to engine feature names at load time for seamless integration.
+ *
+ * Pattern-based mappings (handled dynamically):
+ * - has_up_hit_Xbps -> has_up_hit (threshold suffix stripped)
+ * - has_down_hit_Xbps -> has_down_hit
+ * - first_up_hit_minute_Xbps -> first_up_hit_minute
+ * - first_down_hit_minute_Xbps -> first_down_hit_minute
+ */
+const FEATURE_NAME_MAP: Record<string, string> = {
+  // Return features - model uses "prev" suffix
+  return_prev_1m: 'return_1m',
+  return_prev_3m: 'return_3m',
+  return_prev_5m: 'return_5m',
+};
+
+/**
+ * Pattern for threshold-suffixed feature names (e.g., has_up_hit_8bps)
+ * Matches: has_up_hit_Xbps, has_down_hit_Xbps, first_up_hit_minute_Xbps, first_down_hit_minute_Xbps
+ */
+const THRESHOLD_SUFFIX_PATTERN = /^(has_up_hit|has_down_hit|first_up_hit_minute|first_down_hit_minute)_\d+bps$/;
+
+/**
+ * Map a model feature name to the corresponding feature engine name.
+ * Returns the original name if no mapping exists.
+ */
+function mapFeatureName(modelFeatureName: string): string {
+  // Check static mapping first
+  if (FEATURE_NAME_MAP[modelFeatureName]) {
+    return FEATURE_NAME_MAP[modelFeatureName];
+  }
+
+  // Check for threshold-suffixed pattern (e.g., has_up_hit_8bps -> has_up_hit)
+  const match = modelFeatureName.match(THRESHOLD_SUFFIX_PATTERN);
+  if (match) {
+    return match[1]; // Return base name without suffix
+  }
+
+  // No mapping needed
+  return modelFeatureName;
+}
+
+/**
+ * Map medians object keys from model feature names to engine feature names.
+ *
+ * Note: Multiple model feature names may map to the same engine feature name
+ * (e.g., threshold-suffixed features like `first_up_hit_minute_8bps` map to
+ * `first_up_hit_minute`). When this occurs, the last value wins and a warning
+ * is logged. This is expected behavior when loading per-asset imputations.
+ */
+function mapMedianKeys(medians: Record<string, number>): Record<string, number> {
+  const mapped: Record<string, number> = {};
+  for (const [key, value] of Object.entries(medians)) {
+    const mappedKey = mapFeatureName(key);
+    if (mappedKey in mapped) {
+      console.warn(
+        `[model-loader] Median key collision: "${key}" maps to "${mappedKey}" which already exists (previous value: ${mapped[mappedKey]}, new value: ${value})`
+      );
+    }
+    mapped[mappedKey] = value;
+  }
+  return mapped;
+}
+
+/**
  * Create a Crypto15LRModel from a symbol entry and optional medians
  */
 function createModel(
@@ -165,13 +233,17 @@ function createModel(
   version: string,
   medians: Record<string, number> = {}
 ): Crypto15LRModel {
+  // Map feature column names from model format to engine format
+  const mappedFeatureColumns = symbolEntry.feature_columns.map(mapFeatureName);
+  const mappedMedians = mapMedianKeys(medians);
+
   const config: ModelConfig = {
     version,
     asset: extractAsset(symbolEntry.symbol),
-    featureColumns: [...symbolEntry.feature_columns],
+    featureColumns: mappedFeatureColumns,
     coefficients: [...symbolEntry.coefficients],
     intercept: symbolEntry.intercept,
-    featureMedians: medians,
+    featureMedians: mappedMedians,
   };
   return new Crypto15LRModel(config);
 }
