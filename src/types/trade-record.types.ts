@@ -460,9 +460,23 @@ export interface ModelVsMarketStats {
  *
  * Part of #38
  */
+/**
+ * Options for paginated queries
+ */
+export interface PaginationOptions {
+  /** Maximum number of records to return */
+  limit?: number;
+  /** Number of records to skip */
+  offset?: number;
+}
+
 export interface IEvaluationAnalytics {
-  /** Get evaluations within a date range */
-  getEvaluationsByDateRange(start: Date, end: Date): Promise<EvaluationRecord[]>;
+  /** Get evaluations within a date range (with optional pagination) */
+  getEvaluationsByDateRange(
+    start: Date,
+    end: Date,
+    options?: PaginationOptions
+  ): Promise<EvaluationRecord[]>;
 
   /** Get probability distribution histogram */
   getProbabilityDistribution(

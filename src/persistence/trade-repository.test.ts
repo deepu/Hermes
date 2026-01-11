@@ -21,6 +21,19 @@ import { createTestTrade, createTestOutcome, createTestFeatures, createTestEvalu
 const TEST_DB_PATH = './test-data/test-trades.db';
 
 // ============================================================================
+// Test Constants
+// ============================================================================
+
+/** One minute in milliseconds */
+const ONE_MINUTE_MS = 60_000;
+
+/** Two minutes in milliseconds */
+const TWO_MINUTES_MS = 120_000;
+
+/** Base timestamp for analytics tests (2024-01-15 12:00:00 UTC) */
+const TEST_BASE_TIMESTAMP = new Date('2024-01-15T12:00:00Z').getTime();
+
+// ============================================================================
 // Test Setup Helpers (extracted to reduce duplication)
 // ============================================================================
 
@@ -934,29 +947,26 @@ describe('TradeRepository', () => {
 
   describe('getEvaluationsByDateRange', () => {
     it('should return evaluations within the date range', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       // Create evaluations at different times
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime + 60000 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime + 120000 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP + ONE_MINUTE_MS }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP + TWO_MINUTES_MS }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 90000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 90000);
 
       const results = await repository.getEvaluationsByDateRange(start, end);
 
       expect(results).toHaveLength(2);
-      expect(results[0].timestamp).toBe(baseTime);
-      expect(results[1].timestamp).toBe(baseTime + 60000);
+      expect(results[0].timestamp).toBe(TEST_BASE_TIMESTAMP);
+      expect(results[1].timestamp).toBe(TEST_BASE_TIMESTAMP + ONE_MINUTE_MS);
     });
 
     it('should return empty array when no evaluations in range', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP }));
 
-      const start = new Date(baseTime + 100000);
-      const end = new Date(baseTime + 200000);
+      const start = new Date(TEST_BASE_TIMESTAMP + 100000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 200000);
 
       const results = await repository.getEvaluationsByDateRange(start, end);
 
@@ -964,37 +974,62 @@ describe('TradeRepository', () => {
     });
 
     it('should order results by timestamp ascending', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       // Insert in reverse order
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime + 120000 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime + 60000 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP + TWO_MINUTES_MS }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP + ONE_MINUTE_MS }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 200000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 200000);
 
       const results = await repository.getEvaluationsByDateRange(start, end);
 
       expect(results).toHaveLength(3);
-      expect(results[0].timestamp).toBe(baseTime);
-      expect(results[1].timestamp).toBe(baseTime + 60000);
-      expect(results[2].timestamp).toBe(baseTime + 120000);
+      expect(results[0].timestamp).toBe(TEST_BASE_TIMESTAMP);
+      expect(results[1].timestamp).toBe(TEST_BASE_TIMESTAMP + ONE_MINUTE_MS);
+      expect(results[2].timestamp).toBe(TEST_BASE_TIMESTAMP + TWO_MINUTES_MS);
+    });
+
+    it('should support pagination with limit and offset', async () => {
+      // Create 5 evaluations
+      for (let i = 0; i < 5; i++) {
+        await repository.recordEvaluation(createTestEvaluation({
+          timestamp: TEST_BASE_TIMESTAMP + i * ONE_MINUTE_MS,
+        }));
+      }
+
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 10 * ONE_MINUTE_MS);
+
+      // Get first 2
+      const page1 = await repository.getEvaluationsByDateRange(start, end, { limit: 2 });
+      expect(page1).toHaveLength(2);
+      expect(page1[0].timestamp).toBe(TEST_BASE_TIMESTAMP);
+      expect(page1[1].timestamp).toBe(TEST_BASE_TIMESTAMP + ONE_MINUTE_MS);
+
+      // Get next 2
+      const page2 = await repository.getEvaluationsByDateRange(start, end, { limit: 2, offset: 2 });
+      expect(page2).toHaveLength(2);
+      expect(page2[0].timestamp).toBe(TEST_BASE_TIMESTAMP + 2 * ONE_MINUTE_MS);
+      expect(page2[1].timestamp).toBe(TEST_BASE_TIMESTAMP + 3 * ONE_MINUTE_MS);
+
+      // Get last 1
+      const page3 = await repository.getEvaluationsByDateRange(start, end, { limit: 2, offset: 4 });
+      expect(page3).toHaveLength(1);
+      expect(page3[0].timestamp).toBe(TEST_BASE_TIMESTAMP + 4 * ONE_MINUTE_MS);
     });
   });
 
   describe('getProbabilityDistribution', () => {
     it('should bucket probabilities correctly with default bucket size', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       // Create evaluations with different probabilities
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.52, marketPriceYes: 0.50 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.53, marketPriceYes: 0.52 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.61, marketPriceYes: 0.60 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.72, marketPriceYes: 0.70 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, modelProbability: 0.52, marketPriceYes: 0.50 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, modelProbability: 0.53, marketPriceYes: 0.52 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, modelProbability: 0.61, marketPriceYes: 0.60 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, modelProbability: 0.72, marketPriceYes: 0.70 }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       const results = await repository.getProbabilityDistribution(start, end);
 
@@ -1009,14 +1044,12 @@ describe('TradeRepository', () => {
     });
 
     it('should work with custom bucket sizes', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, modelProbability: 0.52 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, modelProbability: 0.58 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, modelProbability: 0.72 }));
 
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.52 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.58 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.72 }));
-
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       const results = await repository.getProbabilityDistribution(start, end, 0.10);
 
@@ -1038,8 +1071,8 @@ describe('TradeRepository', () => {
     });
 
     it('should return empty array when no evaluations in range', async () => {
-      const start = new Date('2024-01-15T12:00:00Z');
-      const end = new Date('2024-01-15T13:00:00Z');
+      const start = new Date(TEST_BASE_TIMESTAMP);
+      const end = new Date(TEST_BASE_TIMESTAMP + 60 * ONE_MINUTE_MS);
 
       const results = await repository.getProbabilityDistribution(start, end);
 
@@ -1049,19 +1082,17 @@ describe('TradeRepository', () => {
 
   describe('getDecisionBreakdown', () => {
     it('should count decisions by symbol', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       // BTC: 2 SKIP, 1 YES, 1 NO
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'BTC' as CryptoAsset, decision: 'SKIP', modelProbability: 0.50 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'BTC' as CryptoAsset, decision: 'SKIP', modelProbability: 0.52 }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'BTC' as CryptoAsset, decision: 'YES' }));
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'BTC' as CryptoAsset, decision: 'NO' }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, symbol: 'BTC' as CryptoAsset, decision: 'SKIP', modelProbability: 0.50 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, symbol: 'BTC' as CryptoAsset, decision: 'SKIP', modelProbability: 0.52 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, symbol: 'BTC' as CryptoAsset, decision: 'YES' }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, symbol: 'BTC' as CryptoAsset, decision: 'NO' }));
 
       // ETH: 1 YES
-      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'ETH' as CryptoAsset, decision: 'YES' }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: TEST_BASE_TIMESTAMP, symbol: 'ETH' as CryptoAsset, decision: 'YES' }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       const results = await repository.getDecisionBreakdown(start, end);
 
@@ -1082,8 +1113,8 @@ describe('TradeRepository', () => {
     });
 
     it('should return empty array when no evaluations in range', async () => {
-      const start = new Date('2024-01-15T12:00:00Z');
-      const end = new Date('2024-01-15T13:00:00Z');
+      const start = new Date(TEST_BASE_TIMESTAMP);
+      const end = new Date(TEST_BASE_TIMESTAMP + 60 * ONE_MINUTE_MS);
 
       const results = await repository.getDecisionBreakdown(start, end);
 
@@ -1093,11 +1124,9 @@ describe('TradeRepository', () => {
 
   describe('simulateThreshold', () => {
     it('should identify new opportunities with lower thresholds', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       // Original threshold was 0.70, this was a SKIP at 0.68
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         modelProbability: 0.68,
         decision: 'SKIP',
         reason: 'Below threshold',
@@ -1105,13 +1134,13 @@ describe('TradeRepository', () => {
 
       // This actually traded at 0.75
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         modelProbability: 0.75,
         decision: 'YES',
       }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       // Simulate with lower YES threshold of 0.65
       const result = await repository.simulateThreshold(start, end, 0.65, 0.65);
@@ -1124,17 +1153,15 @@ describe('TradeRepository', () => {
     });
 
     it('should identify lost trades with stricter thresholds', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       // Traded at 0.72
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         modelProbability: 0.72,
         decision: 'YES',
       }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       // Simulate with stricter threshold of 0.75
       const result = await repository.simulateThreshold(start, end, 0.75, 0.75);
@@ -1147,17 +1174,15 @@ describe('TradeRepository', () => {
     });
 
     it('should handle NO trades based on low probability', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       // Low probability = NO trade
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         modelProbability: 0.28,
         decision: 'NO',
       }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       // noThreshold = 0.70 means we trade NO when prob <= 0.30
       const result = await repository.simulateThreshold(start, end, 0.70, 0.70);
@@ -1179,36 +1204,34 @@ describe('TradeRepository', () => {
 
   describe('getModelVsMarket', () => {
     it('should calculate correlation between model and market', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       // Create evaluations with positively correlated model and market prices
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         symbol: 'BTC' as CryptoAsset,
         modelProbability: 0.50,
         marketPriceYes: 0.48,
       }));
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         symbol: 'BTC' as CryptoAsset,
         modelProbability: 0.60,
         marketPriceYes: 0.58,
       }));
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         symbol: 'BTC' as CryptoAsset,
         modelProbability: 0.70,
         marketPriceYes: 0.68,
       }));
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         symbol: 'BTC' as CryptoAsset,
         modelProbability: 0.80,
         marketPriceYes: 0.78,
       }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       const results = await repository.getModelVsMarket(start, end);
 
@@ -1222,29 +1245,27 @@ describe('TradeRepository', () => {
     });
 
     it('should handle multiple symbols', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         symbol: 'BTC' as CryptoAsset,
         modelProbability: 0.60,
         marketPriceYes: 0.55,
       }));
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         symbol: 'BTC' as CryptoAsset,
         modelProbability: 0.70,
         marketPriceYes: 0.65,
       }));
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         symbol: 'ETH' as CryptoAsset,
         modelProbability: 0.55,
         marketPriceYes: 0.50,
       }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       const results = await repository.getModelVsMarket(start, end);
 
@@ -1261,17 +1282,15 @@ describe('TradeRepository', () => {
     });
 
     it('should return 0 correlation with single data point', async () => {
-      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
-
       await repository.recordEvaluation(createTestEvaluation({
-        timestamp: baseTime,
+        timestamp: TEST_BASE_TIMESTAMP,
         symbol: 'BTC' as CryptoAsset,
         modelProbability: 0.60,
         marketPriceYes: 0.55,
       }));
 
-      const start = new Date(baseTime - 1000);
-      const end = new Date(baseTime + 1000);
+      const start = new Date(TEST_BASE_TIMESTAMP - 1000);
+      const end = new Date(TEST_BASE_TIMESTAMP + 1000);
 
       const results = await repository.getModelVsMarket(start, end);
 
@@ -1280,8 +1299,8 @@ describe('TradeRepository', () => {
     });
 
     it('should return empty array when no evaluations in range', async () => {
-      const start = new Date('2024-01-15T12:00:00Z');
-      const end = new Date('2024-01-15T13:00:00Z');
+      const start = new Date(TEST_BASE_TIMESTAMP);
+      const end = new Date(TEST_BASE_TIMESTAMP + 60 * ONE_MINUTE_MS);
 
       const results = await repository.getModelVsMarket(start, end);
 
