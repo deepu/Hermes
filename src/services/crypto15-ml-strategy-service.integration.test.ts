@@ -42,6 +42,8 @@ import type { ITradeRepository } from '../types/trade-record.types.js';
 const WINDOW_MS = 15 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
 const ASYNC_SETTLE_MS = 100;
+// Additional settle time for setImmediate callbacks in evaluation tests
+const EVALUATION_SETTLE_MS = 100;
 
 // Use a fixed timestamp for reproducible tests (2024-01-01 00:00:00 UTC)
 const MOCK_TIME = 1704067200000;
@@ -50,6 +52,14 @@ const TEST_END_TIME = TEST_WINDOW_START + WINDOW_MS;
 
 // Test price constant
 const TEST_BTC_PRICE = 98500;
+
+// Default persistence config for tests that need evaluation logging
+const DEFAULT_PERSISTENCE_CONFIG = {
+  enabled: true,
+  dbPath: './test-data/trades.db',
+  syncMode: 'async' as const,
+  vacuumIntervalHours: 24,
+};
 
 // ============================================================================
 // Mock Helpers
@@ -265,6 +275,9 @@ type MockTradeRepository = ITradeRepository & {
   updateOutcome: ReturnType<typeof vi.fn>;
   recordMinutePrice: ReturnType<typeof vi.fn>;
   recordMinutePrices: ReturnType<typeof vi.fn>;
+  recordEvaluation: ReturnType<typeof vi.fn>;
+  recordEvaluations: ReturnType<typeof vi.fn>;
+  getEvaluationById: ReturnType<typeof vi.fn>;
 };
 
 /**
@@ -282,6 +295,10 @@ function createMockTradeRepository(): MockTradeRepository {
     updateOutcome: vi.fn().mockResolvedValue(undefined),
     recordMinutePrice: vi.fn().mockResolvedValue(undefined),
     recordMinutePrices: vi.fn().mockResolvedValue(undefined),
+    // Evaluation operations
+    recordEvaluation: vi.fn().mockResolvedValue(1),
+    recordEvaluations: vi.fn().mockResolvedValue([1]),
+    getEvaluationById: vi.fn().mockResolvedValue(null),
     // Read operations (not used in current tests, but required by interface)
     getTradeByConditionId: vi.fn().mockResolvedValue(null),
     getPendingTrades: vi.fn().mockResolvedValue([]),
@@ -289,7 +306,10 @@ function createMockTradeRepository(): MockTradeRepository {
     // Analysis queries
     getTradesByDateRange: vi.fn().mockResolvedValue([]),
     getTradesBySymbol: vi.fn().mockResolvedValue([]),
+    getSymbolStats: vi.fn().mockResolvedValue({ symbol: 'BTC', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
+    getAllSymbolStats: vi.fn().mockResolvedValue([]),
     getPerformanceByRegime: vi.fn().mockResolvedValue({ regime: 'mid', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
+    getAllRegimeStats: vi.fn().mockResolvedValue([]),
     getCalibrationData: vi.fn().mockResolvedValue([]),
     // Maintenance
     vacuum: vi.fn().mockResolvedValue(undefined),
@@ -2128,6 +2148,249 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       // Service should not crash
       expect(service.isRunning()).toBe(true);
+    });
+  });
+
+  // ============================================================================
+  // Evaluation Logging Tests (#37)
+  // ============================================================================
+
+  describe('Evaluation Logging', () => {
+    // Model intercept values: sigmoid(x) determines probability
+    // sigmoid(3.0) ≈ 0.95 -> triggers YES signal
+    // sigmoid(-3.0) ≈ 0.05 -> triggers NO signal
+    // sigmoid(0.0) = 0.50 -> SKIP (uncertain range)
+    const MODEL_INTERCEPT_YES = 3.0;
+    const MODEL_INTERCEPT_NO = -3.0;
+    const MODEL_INTERCEPT_SKIP = 0.0;
+
+    /**
+     * Helper to set up evaluation test with common configuration
+     */
+    async function setupEvaluationTest(opts: {
+      conditionId: string;
+      modelIntercept: number;
+      prices?: { yes: number; no: number };
+      configOverrides?: Partial<Crypto15MLConfig>;
+      mockRepo?: MockTradeRepository;
+    }): Promise<{ mockRepo: MockTradeRepository; slug: string }> {
+      const mockRepo = opts.mockRepo ?? createMockTradeRepository();
+      testModelIntercept = opts.modelIntercept;
+
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const prices = opts.prices ?? { yes: 0.50, no: 0.50 };
+      const market = createTestMarket(opts.conditionId, slug, TEST_END_TIME, prices);
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: DEFAULT_PERSISTENCE_CONFIG,
+        ...opts.configOverrides,
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      return { mockRepo, slug };
+    }
+
+    /**
+     * Helper to trigger evaluation and wait for async settle
+     */
+    async function triggerEvaluationAndSettle(timestamp: number = TEST_WINDOW_START, price: number = TEST_BTC_PRICE): Promise<void> {
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price, timestamp });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(EVALUATION_SETTLE_MS);
+    }
+
+    it('should record YES evaluation when probability >= yesThreshold', async () => {
+      const { mockRepo, slug } = await setupEvaluationTest({
+        conditionId: 'cond-eval-yes',
+        modelIntercept: MODEL_INTERCEPT_YES,
+      });
+
+      await triggerEvaluationAndSettle();
+
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-eval-yes',
+          slug,
+          symbol: 'BTC',
+          stateMinute: 0,
+          decision: 'YES',
+          reason: expect.stringContaining('>= YES threshold'),
+          marketPriceYes: 0.50,
+          marketPriceNo: 0.50,
+        })
+      );
+    });
+
+    it('should record NO evaluation when probability <= noThreshold', async () => {
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-no',
+        modelIntercept: MODEL_INTERCEPT_NO,
+      });
+
+      await triggerEvaluationAndSettle();
+
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-eval-no',
+          decision: 'NO',
+          reason: expect.stringContaining('<= NO threshold'),
+        })
+      );
+    });
+
+    it('should record SKIP evaluation when probability in uncertain range', async () => {
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-skip',
+        modelIntercept: MODEL_INTERCEPT_SKIP,
+      });
+
+      await triggerEvaluationAndSettle();
+
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-eval-skip',
+          decision: 'SKIP',
+          reason: expect.stringContaining('in uncertain range'),
+        })
+      );
+    });
+
+    it('should record SKIP evaluation when entry price cap rejects signal', async () => {
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-cap',
+        modelIntercept: MODEL_INTERCEPT_YES,
+        prices: { yes: 0.80, no: 0.20 },
+        configOverrides: { entryPriceCap: 0.70 },
+      });
+
+      await triggerEvaluationAndSettle();
+
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-eval-cap',
+          decision: 'SKIP',
+          reason: expect.stringMatching(/entry price.*> cap/),
+        })
+      );
+    });
+
+    it('should include all required fields in evaluation record', async () => {
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-fields',
+        modelIntercept: MODEL_INTERCEPT_YES,
+        prices: { yes: 0.55, no: 0.45 },
+      });
+
+      await triggerEvaluationAndSettle();
+
+      const evalRecord = mockRepo.recordEvaluation.mock.calls[0][0];
+      expect(evalRecord).toMatchObject({
+        conditionId: expect.any(String),
+        slug: expect.any(String),
+        symbol: expect.any(String),
+        timestamp: expect.any(Number),
+        stateMinute: expect.any(Number),
+        modelProbability: expect.any(Number),
+        linearCombination: expect.any(Number),
+        imputedCount: expect.any(Number),
+        marketPriceYes: expect.any(Number),
+        marketPriceNo: expect.any(Number),
+        decision: expect.any(String),
+        reason: expect.any(String),
+        featuresJson: expect.any(String),
+      });
+
+      // Verify featuresJson is valid JSON
+      expect(() => JSON.parse(evalRecord.featuresJson)).not.toThrow();
+    });
+
+    it('should not record evaluation when repository is not configured', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-norepo', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig(); // No persistence config
+
+      // Create service without repository
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config
+        // No mockRepo passed
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      await triggerEvaluationAndSettle();
+
+      // Should not crash and signal should still be generated
+      expect(service.isRunning()).toBe(true);
+    });
+
+    it('should handle evaluation persistence errors gracefully', async () => {
+      const mockRepo = createMockTradeRepository();
+      mockRepo.recordEvaluation.mockRejectedValue(new Error('Database error'));
+
+      await setupEvaluationTest({
+        conditionId: 'cond-eval-error',
+        modelIntercept: MODEL_INTERCEPT_YES,
+        mockRepo,
+      });
+
+      await triggerEvaluationAndSettle();
+
+      // Service should not crash
+      expect(service.isRunning()).toBe(true);
+    });
+
+    it('should record evaluation for each state minute', async () => {
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-multi',
+        modelIntercept: MODEL_INTERCEPT_SKIP, // Use SKIP to allow multiple evaluations
+        configOverrides: { stateMinutes: [0, 1, 2] },
+      });
+
+      // Feed prices at minute 0, 1, 2 (state minutes)
+      const baseTime = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 100000, timestamp: baseTime });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 100100, timestamp: baseTime + 60_000 });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 100200, timestamp: baseTime + 120_000 });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(EVALUATION_SETTLE_MS);
+
+      // Should have 3 evaluations (one for each state minute)
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(3);
+
+      // Verify state minutes
+      const calls = mockRepo.recordEvaluation.mock.calls;
+      expect(calls[0][0].stateMinute).toBe(0);
+      expect(calls[1][0].stateMinute).toBe(1);
+      expect(calls[2][0].stateMinute).toBe(2);
     });
   });
 

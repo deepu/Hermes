@@ -55,6 +55,7 @@ export const LogEvents = {
   REPOSITORY_INITIALIZED: 'repository_initialized',
   TRADE_PERSISTED: 'trade_persisted',
   OUTCOME_PERSISTED: 'outcome_persisted',
+  EVALUATION_RECORDED: 'evaluation_recorded',
   PERSISTENCE_ERROR: 'persistence_error',
 
   // General
@@ -143,6 +144,10 @@ export interface LogContext {
   minuteOffset?: number;
   /** Number of minute prices recorded/persisted */
   minutePriceCount?: number;
+  /** Evaluation decision (SKIP, YES, NO) */
+  decision?: 'SKIP' | 'YES' | 'NO';
+  /** Database evaluation ID */
+  evalId?: number;
 }
 
 /**
