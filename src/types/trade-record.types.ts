@@ -319,6 +319,57 @@ export interface ITradeAnalytics {
 export interface ITradeRepository extends ITradeRepositoryCore, ITradeAnalytics {}
 
 // ============================================================================
+// Evaluation Record Types
+// ============================================================================
+
+/** Valid evaluation decisions for runtime validation */
+export const VALID_EVALUATION_DECISIONS = ['SKIP', 'YES', 'NO'] as const;
+
+/**
+ * Evaluation decision type
+ */
+export type EvaluationDecision = (typeof VALID_EVALUATION_DECISIONS)[number];
+
+/**
+ * Evaluation record capturing every model evaluation (48/hour).
+ * Records both trade actions and skipped opportunities for analysis.
+ *
+ * Part of #36
+ */
+export interface EvaluationRecord {
+  /** Database ID (auto-assigned on insert) */
+  id?: number;
+  /** Polymarket condition ID */
+  conditionId: string;
+  /** Market slug */
+  slug: string;
+  /** Crypto asset: BTC, ETH, SOL, XRP */
+  symbol: CryptoAsset;
+  /** Unix ms when evaluation occurred */
+  timestamp: number;
+  /** Minute within window (0-14) */
+  stateMinute: number;
+  /** Model probability prediction (0-1) */
+  modelProbability: number;
+  /** Z-score before sigmoid (linear combination) */
+  linearCombination: number;
+  /** Number of features that were imputed */
+  imputedCount: number;
+  /** YES side market price at evaluation */
+  marketPriceYes: number;
+  /** NO side market price at evaluation */
+  marketPriceNo: number;
+  /** Decision: SKIP, YES, or NO */
+  decision: EvaluationDecision;
+  /** Human-readable reason for the decision */
+  reason: string;
+  /** Full feature vector as JSON string */
+  featuresJson: string;
+  /** Record creation timestamp */
+  createdAt?: number;
+}
+
+// ============================================================================
 // Configuration Types
 // ============================================================================
 

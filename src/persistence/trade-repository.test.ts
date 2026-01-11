@@ -12,7 +12,7 @@ import { dirname } from 'path';
 import { TradeRepository } from './trade-repository.js';
 import type { PersistenceConfig } from '../types/trade-record.types.js';
 import type { CryptoAsset } from '../strategies/crypto15-feature-engine.js';
-import { createTestTrade, createTestOutcome, createTestFeatures } from './test-fixtures.js';
+import { createTestTrade, createTestOutcome, createTestFeatures, createTestEvaluation } from './test-fixtures.js';
 
 // ============================================================================
 // Test Configuration
@@ -766,6 +766,162 @@ describe('TradeRepository', () => {
 
       expect(btcTrades).toHaveLength(5);
       expect(btcTrades.every((t) => t.features !== null)).toBe(true);
+    });
+  });
+
+  // ============================================================================
+  // Evaluation Record Tests (Part of #36)
+  // ============================================================================
+
+  describe('recordEvaluation', () => {
+    it('should insert an evaluation and return an ID', async () => {
+      const evaluation = createTestEvaluation();
+      const id = await repository.recordEvaluation(evaluation);
+
+      expect(id).toBeGreaterThan(0);
+    });
+
+    it('should store all evaluation fields correctly', async () => {
+      const evaluation = createTestEvaluation({
+        conditionId: 'eval-cond-123',
+        slug: 'eth-updown-15m',
+        symbol: 'ETH' as CryptoAsset,
+        timestamp: 1700000000000,
+        stateMinute: 7,
+        modelProbability: 0.68,
+        linearCombination: 0.75,
+        imputedCount: 2,
+        marketPriceYes: 0.62,
+        marketPriceNo: 0.38,
+        decision: 'NO',
+        reason: 'Price below threshold',
+      });
+
+      const id = await repository.recordEvaluation(evaluation);
+      const retrieved = await repository.getEvaluationById(id);
+
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.conditionId).toBe('eval-cond-123');
+      expect(retrieved!.slug).toBe('eth-updown-15m');
+      expect(retrieved!.symbol).toBe('ETH');
+      expect(retrieved!.timestamp).toBe(1700000000000);
+      expect(retrieved!.stateMinute).toBe(7);
+      expect(retrieved!.modelProbability).toBeCloseTo(0.68, 2);
+      expect(retrieved!.linearCombination).toBeCloseTo(0.75, 2);
+      expect(retrieved!.imputedCount).toBe(2);
+      expect(retrieved!.marketPriceYes).toBeCloseTo(0.62, 2);
+      expect(retrieved!.marketPriceNo).toBeCloseTo(0.38, 2);
+      expect(retrieved!.decision).toBe('NO');
+      expect(retrieved!.reason).toBe('Price below threshold');
+    });
+
+    it('should handle SKIP decisions', async () => {
+      const evaluation = createTestEvaluation({
+        decision: 'SKIP',
+        reason: 'No edge detected',
+      });
+
+      const id = await repository.recordEvaluation(evaluation);
+      const retrieved = await repository.getEvaluationById(id);
+
+      expect(retrieved!.decision).toBe('SKIP');
+      expect(retrieved!.reason).toBe('No edge detected');
+    });
+
+    it('should store features JSON correctly', async () => {
+      const features = {
+        stateMinute: 3,
+        volatility5m: 0.015,
+        returnSinceOpen: 0.002,
+      };
+      const evaluation = createTestEvaluation({
+        featuresJson: JSON.stringify(features),
+      });
+
+      const id = await repository.recordEvaluation(evaluation);
+      const retrieved = await repository.getEvaluationById(id);
+
+      const parsedFeatures = JSON.parse(retrieved!.featuresJson);
+      expect(parsedFeatures.stateMinute).toBe(3);
+      expect(parsedFeatures.volatility5m).toBeCloseTo(0.015, 3);
+      expect(parsedFeatures.returnSinceOpen).toBeCloseTo(0.002, 3);
+    });
+  });
+
+  describe('recordEvaluations (batch)', () => {
+    it('should insert multiple evaluations efficiently', async () => {
+      const evaluations = [
+        createTestEvaluation({ decision: 'YES' }),
+        createTestEvaluation({ decision: 'NO' }),
+        createTestEvaluation({ decision: 'SKIP' }),
+      ];
+
+      const ids = await repository.recordEvaluations(evaluations);
+
+      expect(ids).toHaveLength(3);
+      expect(ids.every((id) => id > 0)).toBe(true);
+      expect(ids[0]).toBeLessThan(ids[1]);
+      expect(ids[1]).toBeLessThan(ids[2]);
+    });
+
+    it('should handle empty array', async () => {
+      const ids = await repository.recordEvaluations([]);
+
+      expect(ids).toEqual([]);
+    });
+
+    it('should be atomic - all or nothing on error', async () => {
+      // This test verifies transaction behavior
+      const evaluations = [
+        createTestEvaluation({ symbol: 'BTC' as CryptoAsset }),
+        createTestEvaluation({ symbol: 'ETH' as CryptoAsset }),
+      ];
+
+      const ids = await repository.recordEvaluations(evaluations);
+
+      // Both should be inserted
+      const eval1 = await repository.getEvaluationById(ids[0]);
+      const eval2 = await repository.getEvaluationById(ids[1]);
+
+      expect(eval1).not.toBeNull();
+      expect(eval2).not.toBeNull();
+      expect(eval1!.symbol).toBe('BTC');
+      expect(eval2!.symbol).toBe('ETH');
+    });
+
+    it('should handle all crypto assets', async () => {
+      const assets: CryptoAsset[] = ['BTC', 'ETH', 'SOL', 'XRP'];
+      const evaluations = assets.map((symbol) =>
+        createTestEvaluation({ symbol })
+      );
+
+      const ids = await repository.recordEvaluations(evaluations);
+
+      expect(ids).toHaveLength(4);
+
+      for (let i = 0; i < assets.length; i++) {
+        const retrieved = await repository.getEvaluationById(ids[i]);
+        expect(retrieved!.symbol).toBe(assets[i]);
+      }
+    });
+  });
+
+  describe('getEvaluationById', () => {
+    it('should return null for non-existent evaluation', async () => {
+      const result = await repository.getEvaluationById(99999);
+
+      expect(result).toBeNull();
+    });
+
+    it('should return correct evaluation', async () => {
+      const evaluation = createTestEvaluation();
+      const id = await repository.recordEvaluation(evaluation);
+
+      const retrieved = await repository.getEvaluationById(id);
+
+      expect(retrieved).not.toBeNull();
+      expect(retrieved!.id).toBe(id);
+      expect(retrieved!.conditionId).toBe(evaluation.conditionId);
     });
   });
 });

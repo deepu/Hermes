@@ -4,10 +4,10 @@
  * Provides reusable factory functions for creating test data.
  * Used by both unit tests and integration tests.
  *
- * Part of #29
+ * Part of #29, #36
  */
 
-import type { TradeRecord, TradeOutcome } from '../types/trade-record.types.js';
+import type { TradeRecord, TradeOutcome, EvaluationRecord } from '../types/trade-record.types.js';
 import type { FeatureVector, CryptoAsset } from '../strategies/crypto15-feature-engine.js';
 
 /**
@@ -74,6 +74,30 @@ export function createTestOutcome(overrides: Partial<TradeOutcome> = {}): TradeO
     windowClosePrice: 50100,
     maxFavorableExcursion: 0.003,
     maxAdverseExcursion: -0.001,
+    ...overrides,
+  };
+}
+
+/**
+ * Create a test EvaluationRecord with sensible defaults.
+ * Part of #36
+ */
+export function createTestEvaluation(overrides: Partial<EvaluationRecord> = {}): EvaluationRecord {
+  const features = createTestFeatures();
+  return {
+    conditionId: `test-cond-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`,
+    slug: 'btc-updown-15m-test',
+    symbol: 'BTC' as CryptoAsset,
+    timestamp: Date.now(),
+    stateMinute: 5,
+    modelProbability: 0.72,
+    linearCombination: 0.94,
+    imputedCount: 0,
+    marketPriceYes: 0.55,
+    marketPriceNo: 0.45,
+    decision: 'YES',
+    reason: 'Edge exceeds threshold',
+    featuresJson: JSON.stringify(features),
     ...overrides,
   };
 }
