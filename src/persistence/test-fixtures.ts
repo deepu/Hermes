@@ -18,6 +18,7 @@ export function createTestFeatures(overrides: Partial<FeatureVector> = {}): Feat
     stateMinute: 5,
     minutesRemaining: 10,
     hourOfDay: 14,
+    minuteOfHour: 35,
     dayOfWeek: 3,
     returnSinceOpen: 0.0005,
     maxRunUp: 0.0008,

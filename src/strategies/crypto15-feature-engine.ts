@@ -49,6 +49,8 @@ export interface FeatureVector {
   minutesRemaining: number;
   /** Hour of day (0-23, UTC) */
   hourOfDay: number;
+  /** Minute within the hour (0-59, UTC) */
+  minuteOfHour: number;
   /** Day of week (0=Sunday, 6=Saturday) */
   dayOfWeek: number;
 
@@ -254,6 +256,7 @@ export class Crypto15FeatureEngine {
       state_minute: features.stateMinute,
       minutes_remaining: features.minutesRemaining,
       hour_of_day: features.hourOfDay,
+      minute_of_hour: features.minuteOfHour,
       day_of_week: features.dayOfWeek,
       return_since_open: features.returnSinceOpen,
       max_run_up: features.maxRunUp,
@@ -372,6 +375,7 @@ export class Crypto15FeatureEngine {
   ): FeatureVector {
     // Extract UTC time components directly from timestamp (avoid Date allocation)
     const hourOfDay = Math.floor((timestamp % DAY_MS) / HOUR_MS);
+    const minuteOfHour = Math.floor((timestamp % HOUR_MS) / MINUTE_MS);
     const dayOfWeek = (Math.floor(timestamp / DAY_MS) + EPOCH_DAY_OF_WEEK) % 7;
 
     // Calculate lagged returns
@@ -392,6 +396,7 @@ export class Crypto15FeatureEngine {
       stateMinute: windowIndex,
       minutesRemaining: WINDOW_MINUTES - windowIndex,
       hourOfDay,
+      minuteOfHour,
       dayOfWeek,
 
       // Return features

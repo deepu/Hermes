@@ -1454,10 +1454,19 @@ export class TradeRepository implements ITradeRepository {
    * Convert a feature row to FeatureVector
    */
   private featureRowToVector(row: FeatureRow, symbol: CryptoAsset, timestamp: number): FeatureVector {
+    // Compute minuteOfHour from timestamp if available, otherwise use default
+    // Note: minute_of_hour not stored in DB - derive from timestamp or use mid-hour default
+    const MINUTE_MS = 60 * 1000;
+    const HOUR_MS = 60 * MINUTE_MS;
+    const minuteOfHour = timestamp > 0
+      ? Math.floor((timestamp % HOUR_MS) / MINUTE_MS)
+      : 30; // Default to mid-hour for legacy data
+
     return {
       stateMinute: row.state_minute,
       minutesRemaining: row.minutes_remaining,
       hourOfDay: row.hour_of_day,
+      minuteOfHour,
       dayOfWeek: row.day_of_week,
       returnSinceOpen: row.return_since_open ?? NaN,
       maxRunUp: row.max_run_up ?? NaN,
