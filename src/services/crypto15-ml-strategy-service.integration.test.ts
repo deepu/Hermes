@@ -265,6 +265,9 @@ type MockTradeRepository = ITradeRepository & {
   updateOutcome: ReturnType<typeof vi.fn>;
   recordMinutePrice: ReturnType<typeof vi.fn>;
   recordMinutePrices: ReturnType<typeof vi.fn>;
+  recordEvaluation: ReturnType<typeof vi.fn>;
+  recordEvaluations: ReturnType<typeof vi.fn>;
+  getEvaluationById: ReturnType<typeof vi.fn>;
 };
 
 /**
@@ -282,6 +285,10 @@ function createMockTradeRepository(): MockTradeRepository {
     updateOutcome: vi.fn().mockResolvedValue(undefined),
     recordMinutePrice: vi.fn().mockResolvedValue(undefined),
     recordMinutePrices: vi.fn().mockResolvedValue(undefined),
+    // Evaluation operations
+    recordEvaluation: vi.fn().mockResolvedValue(1),
+    recordEvaluations: vi.fn().mockResolvedValue([1]),
+    getEvaluationById: vi.fn().mockResolvedValue(null),
     // Read operations (not used in current tests, but required by interface)
     getTradeByConditionId: vi.fn().mockResolvedValue(null),
     getPendingTrades: vi.fn().mockResolvedValue([]),
@@ -289,7 +296,10 @@ function createMockTradeRepository(): MockTradeRepository {
     // Analysis queries
     getTradesByDateRange: vi.fn().mockResolvedValue([]),
     getTradesBySymbol: vi.fn().mockResolvedValue([]),
+    getSymbolStats: vi.fn().mockResolvedValue({ symbol: 'BTC', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
+    getAllSymbolStats: vi.fn().mockResolvedValue([]),
     getPerformanceByRegime: vi.fn().mockResolvedValue({ regime: 'mid', totalTrades: 0, wins: 0, winRate: 0, avgPnl: 0, totalPnl: 0 }),
+    getAllRegimeStats: vi.fn().mockResolvedValue([]),
     getCalibrationData: vi.fn().mockResolvedValue([]),
     // Maintenance
     vacuum: vi.fn().mockResolvedValue(undefined),
@@ -2128,6 +2138,409 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       // Service should not crash
       expect(service.isRunning()).toBe(true);
+    });
+  });
+
+  // ============================================================================
+  // Evaluation Logging Tests (#37)
+  // ============================================================================
+
+  describe('Evaluation Logging', () => {
+    const MODEL_INTERCEPT_YES = 3.0;   // High probability -> YES signal
+    const MODEL_INTERCEPT_NO = -3.0;   // Low probability -> NO signal
+    const MODEL_INTERCEPT_SKIP = 0.0;  // Mid probability -> SKIP (uncertain range)
+
+    it('should record YES evaluation when probability >= yesThreshold', async () => {
+      const mockRepo = createMockTradeRepository();
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-yes', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      // Trigger evaluation at minute 0
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Evaluation should have been recorded
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-eval-yes',
+          slug,
+          symbol: 'BTC',
+          stateMinute: 0,
+          decision: 'YES',
+          reason: expect.stringContaining('>= YES threshold'),
+          marketPriceYes: 0.50,
+          marketPriceNo: 0.50,
+        })
+      );
+    });
+
+    it('should record NO evaluation when probability <= noThreshold', async () => {
+      const mockRepo = createMockTradeRepository();
+      testModelIntercept = MODEL_INTERCEPT_NO;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-no', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      // Trigger evaluation at minute 0
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Evaluation should have been recorded as NO
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-eval-no',
+          decision: 'NO',
+          reason: expect.stringContaining('<= NO threshold'),
+        })
+      );
+    });
+
+    it('should record SKIP evaluation when probability in uncertain range', async () => {
+      const mockRepo = createMockTradeRepository();
+      testModelIntercept = MODEL_INTERCEPT_SKIP;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-skip', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      // Trigger evaluation at minute 0
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Evaluation should have been recorded as SKIP
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-eval-skip',
+          decision: 'SKIP',
+          reason: expect.stringContaining('in uncertain range'),
+        })
+      );
+    });
+
+    it('should record SKIP evaluation when entry price cap rejects signal', async () => {
+      const mockRepo = createMockTradeRepository();
+      testModelIntercept = MODEL_INTERCEPT_YES; // Would be YES, but price is too high
+
+      // Setup market with high price (above entry cap)
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-cap', slug, TEST_END_TIME, { yes: 0.80, no: 0.20 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        entryPriceCap: 0.70,
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      // Trigger evaluation at minute 0
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Evaluation should record SKIP with reason mentioning entry price cap
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
+        expect.objectContaining({
+          conditionId: 'cond-eval-cap',
+          decision: 'SKIP',
+          reason: expect.stringMatching(/entry price.*> cap/),
+        })
+      );
+    });
+
+    it('should include all required fields in evaluation record', async () => {
+      const mockRepo = createMockTradeRepository();
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-fields', slug, TEST_END_TIME, { yes: 0.55, no: 0.45 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      // Trigger evaluation at minute 0
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Verify all required fields are present
+      const evalRecord = mockRepo.recordEvaluation.mock.calls[0][0];
+      expect(evalRecord).toMatchObject({
+        conditionId: expect.any(String),
+        slug: expect.any(String),
+        symbol: expect.any(String),
+        timestamp: expect.any(Number),
+        stateMinute: expect.any(Number),
+        modelProbability: expect.any(Number),
+        linearCombination: expect.any(Number),
+        imputedCount: expect.any(Number),
+        marketPriceYes: expect.any(Number),
+        marketPriceNo: expect.any(Number),
+        decision: expect.any(String),
+        reason: expect.any(String),
+        featuresJson: expect.any(String),
+      });
+
+      // Verify featuresJson is valid JSON
+      expect(() => JSON.parse(evalRecord.featuresJson)).not.toThrow();
+    });
+
+    it('should not record evaluation when repository is not configured', async () => {
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-norepo', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig(); // No persistence config
+
+      // Create service without repository
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config
+        // No mockRepo passed
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      // Trigger evaluation
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Should not crash and signal should still be generated
+      expect(service.isRunning()).toBe(true);
+    });
+
+    it('should handle evaluation persistence errors gracefully', async () => {
+      const mockRepo = createMockTradeRepository();
+      mockRepo.recordEvaluation.mockRejectedValue(new Error('Database error'));
+      testModelIntercept = MODEL_INTERCEPT_YES;
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-error', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      // Trigger evaluation
+      const timestamp = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+
+      // Allow async operations to settle
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Service should not crash
+      expect(service.isRunning()).toBe(true);
+    });
+
+    it('should record evaluation for each state minute', async () => {
+      const mockRepo = createMockTradeRepository();
+      testModelIntercept = MODEL_INTERCEPT_SKIP; // Use SKIP to allow multiple evaluations (no trade to block)
+
+      // Setup market
+      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
+      const slug = `btc-updown-15m-${windowStartSec}`;
+      const market = createTestMarket('cond-eval-multi', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      mockMarketService.mockGetMarket.mockResolvedValue(market);
+
+      const config = createTestConfig({
+        stateMinutes: [0, 1, 2],
+        persistence: {
+          enabled: true,
+          dbPath: './test-data/trades.db',
+          syncMode: 'async',
+          vacuumIntervalHours: 24,
+        },
+      });
+
+      service = new Crypto15MLStrategyService(
+        mockMarketService,
+        mockTradingService,
+        mockRealtimeService,
+        config,
+        mockRepo
+      );
+
+      await service.start();
+      await (service as any).scanUpcomingMarkets();
+
+      // Feed prices at minute 0, 1, 2 (state minutes)
+      const baseTime = TEST_WINDOW_START;
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 100000, timestamp: baseTime });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 100100, timestamp: baseTime + 60_000 });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 100200, timestamp: baseTime + 120_000 });
+      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
+      await vi.advanceTimersByTimeAsync(100);
+
+      // Should have 3 evaluations (one for each state minute)
+      expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(3);
+
+      // Verify state minutes
+      const calls = mockRepo.recordEvaluation.mock.calls;
+      expect(calls[0][0].stateMinute).toBe(0);
+      expect(calls[1][0].stateMinute).toBe(1);
+      expect(calls[2][0].stateMinute).toBe(2);
     });
   });
 

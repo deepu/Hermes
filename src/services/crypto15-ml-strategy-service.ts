@@ -41,7 +41,7 @@ import type { TradingService, OrderResult } from './trading-service.js';
 import type { RealtimeServiceV2, CryptoPrice, Subscription } from './realtime-service-v2.js';
 import type { GammaMarket } from '../clients/gamma-api.js';
 import type { UnifiedMarket } from '../core/types.js';
-import type { ITradeRepository, TradeRecord, TradeOutcome, PersistenceConfig, MinutePrice } from '../types/trade-record.types.js';
+import type { ITradeRepository, TradeRecord, TradeOutcome, PersistenceConfig, MinutePrice, EvaluationRecord, EvaluationDecision } from '../types/trade-record.types.js';
 
 // ============================================================================
 // Types
@@ -1144,6 +1144,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * 2. Model confidence meets threshold (>= 0.70 for YES, <= 0.30 for NO)
    * 3. Entry price is acceptable (<= 0.70)
    * 4. Haven't already traded this market
+   *
+   * Records evaluation for all decision paths (SKIP, YES, NO) to enable
+   * post-hoc analysis of skipped opportunities.
    */
   private evaluateSignal(tracker: MarketTracker, features: FeatureVector): void {
     // Skip if already traded
@@ -1167,33 +1170,51 @@ export class Crypto15MLStrategyService extends EventEmitter {
     const prediction = model.predict(featureMap);
 
     // Determine signal direction and check thresholds
+    let decision: EvaluationDecision = 'SKIP';
+    let reason = '';
     let side: 'YES' | 'NO' | null = null;
     let entryPrice = 0;
 
     if (prediction.probability >= this.config.yesThreshold) {
       side = 'YES';
+      decision = 'YES';
       entryPrice = tracker.prices.yes;
+      reason = `prob ${prediction.probability.toFixed(3)} >= YES threshold ${this.config.yesThreshold}`;
     } else if (prediction.probability <= this.config.noThreshold) {
       side = 'NO';
+      decision = 'NO';
       entryPrice = tracker.prices.no;
+      reason = `prob ${prediction.probability.toFixed(3)} <= NO threshold ${this.config.noThreshold}`;
+    } else {
+      // Probability in uncertain range - SKIP
+      decision = 'SKIP';
+      reason = `prob ${prediction.probability.toFixed(3)} in uncertain range [${this.config.noThreshold}, ${this.config.yesThreshold}]`;
     }
 
-    if (!side) {
-      // No signal - probability in uncertain range
-      return;
-    }
+    // Check entry price cap before finalizing decision
+    if (side && entryPrice > this.config.entryPriceCap) {
+      // Downgrade to SKIP due to entry price cap - capture original side for logging
+      const originalSide = side;
+      reason = `${decision} signal rejected: entry price ${entryPrice.toFixed(3)} > cap ${this.config.entryPriceCap}`;
+      decision = 'SKIP';
+      side = null;
 
-    // Check entry price cap
-    if (entryPrice > this.config.entryPriceCap) {
       this.logger.warn(LogEvents.SIGNAL_REJECTED, {
         marketId: tracker.conditionId,
         slug: tracker.slug,
         symbol: tracker.symbol,
-        side,
+        side: originalSide,
         entryPrice,
         confidence: prediction.probability,
-        message: `Entry price ${entryPrice.toFixed(3)} exceeds cap ${this.config.entryPriceCap}`,
+        message: reason,
       });
+    }
+
+    // Record evaluation for all decision paths (SKIP, YES, NO)
+    this.recordEvaluation(tracker, prediction, features, decision, reason);
+
+    if (!side) {
+      // No signal - either probability in uncertain range or entry price cap rejected
       return;
     }
 
@@ -1235,6 +1256,70 @@ export class Crypto15MLStrategyService extends EventEmitter {
 
     // Execute the signal (fire-and-forget with error handling)
     this.executeSignal(tracker, signal).catch(e => this.handleError(e));
+  }
+
+  /**
+   * Record a market evaluation to the database
+   *
+   * Captures every model evaluation at stateMinutes 0, 1, 2 for all symbols.
+   * Records SKIP, YES, and NO decisions with reasoning for post-hoc analysis.
+   * Uses async write to ensure zero latency impact on signal evaluation.
+   */
+  private recordEvaluation(
+    tracker: MarketTracker,
+    prediction: { probability: number; linearCombination: number; imputedCount: number },
+    features: FeatureVector,
+    decision: EvaluationDecision,
+    reason: string
+  ): void {
+    const repo = this.tradeRepository;
+    if (!repo) {
+      return; // Persistence not enabled
+    }
+
+    const evaluation: EvaluationRecord = {
+      conditionId: tracker.conditionId,
+      slug: tracker.slug,
+      symbol: tracker.asset,
+      timestamp: Date.now(),
+      stateMinute: features.stateMinute,
+      modelProbability: prediction.probability,
+      linearCombination: prediction.linearCombination,
+      imputedCount: prediction.imputedCount,
+      marketPriceYes: tracker.prices.yes,
+      marketPriceNo: tracker.prices.no,
+      decision,
+      reason,
+      featuresJson: JSON.stringify(Crypto15FeatureEngine.toFeatureMap(features)),
+    };
+
+    // Use setImmediate to avoid blocking the trading hot path
+    // Use promise chaining instead of async wrapper to avoid unhandled rejections
+    setImmediate(() => {
+      repo.recordEvaluation(evaluation)
+        .then(evalId => {
+          if (this.logger.isEnabled()) {
+            this.logger.info(LogEvents.EVALUATION_RECORDED, {
+              marketId: tracker.conditionId,
+              slug: tracker.slug,
+              stateMinute: features.stateMinute,
+              decision,
+              evalId,
+              message: `Evaluation recorded: ${decision}`,
+            });
+          }
+        })
+        .catch(error => {
+          // Log error but don't crash - evaluation persistence is non-critical
+          this.logger.error(LogEvents.PERSISTENCE_ERROR, {
+            marketId: tracker.conditionId,
+            slug: tracker.slug,
+            stateMinute: features.stateMinute,
+            error: error instanceof Error ? error.message : String(error),
+            message: 'Failed to persist evaluation',
+          });
+        });
+    });
   }
 
   /**
