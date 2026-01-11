@@ -26,12 +26,15 @@ import type {
   PersistenceConfig,
   TradeSide,
   TradeOutcomeDirection,
+  EvaluationRecord,
+  EvaluationDecision,
 } from '../types/trade-record.types.js';
 import {
   VALID_CRYPTO_ASSETS,
   VALID_TRADE_SIDES,
   VALID_VOLATILITY_REGIMES,
   VALID_TRADE_OUTCOMES,
+  VALID_EVALUATION_DECISIONS,
 } from '../types/trade-record.types.js';
 import type { CryptoAsset, FeatureVector } from '../strategies/crypto15-feature-engine.js';
 
@@ -95,6 +98,7 @@ const cryptoAssetAsserter = createAsserter<CryptoAsset>('CryptoAsset', VALID_CRY
 const tradeSideAsserter = createAsserter<TradeSide>('TradeSide', VALID_TRADE_SIDES);
 const volatilityRegimeAsserter = createAsserter<VolatilityRegime>('VolatilityRegime', VALID_VOLATILITY_REGIMES);
 const tradeOutcomeAsserter = createAsserter<TradeOutcomeDirection>('TradeOutcome', VALID_TRADE_OUTCOMES);
+const evaluationDecisionAsserter = createAsserter<EvaluationDecision>('EvaluationDecision', VALID_EVALUATION_DECISIONS);
 
 // Convenience aliases for existing usage patterns
 const assertCryptoAsset = cryptoAssetAsserter.assert;
@@ -102,6 +106,7 @@ const assertTradeSide = tradeSideAsserter.assert;
 const assertVolatilityRegime = volatilityRegimeAsserter.assertNullable;
 const assertVolatilityRegimeRequired = volatilityRegimeAsserter.assert;
 const assertTradeOutcome = tradeOutcomeAsserter.assertNullable;
+const assertEvaluationDecision = evaluationDecisionAsserter.assert;
 
 /**
  * Convert boolean to SQLite integer
@@ -126,6 +131,7 @@ export class TradeRepository implements ITradeRepository {
     insertFeatures?: Statement;
     updateOutcome?: Statement;
     insertPrice?: Statement;
+    insertEvaluation?: Statement;
     selectByConditionId?: Statement;
     selectById?: Statement;
     selectPending?: Statement;
@@ -139,6 +145,7 @@ export class TradeRepository implements ITradeRepository {
     selectAllSymbolStats?: Statement;
     selectAllRegimeStats?: Statement;
     selectCalibration?: Statement;
+    selectEvaluationById?: Statement;
   } = {};
 
   constructor(config: Partial<PersistenceConfig> = {}) {
@@ -292,6 +299,22 @@ export class TradeRepository implements ITradeRepository {
     this.statements.insertPrice = db.prepare(`
       INSERT OR REPLACE INTO trade_prices (trade_id, minute_offset, timestamp, price)
       VALUES (@tradeId, @minuteOffset, @timestamp, @price)
+    `);
+
+    this.statements.insertEvaluation = db.prepare(`
+      INSERT INTO evaluations (
+        condition_id, slug, symbol, timestamp, state_minute,
+        model_probability, linear_combination, imputed_count,
+        market_price_yes, market_price_no, decision, reason, features_json
+      ) VALUES (
+        @conditionId, @slug, @symbol, @timestamp, @stateMinute,
+        @modelProbability, @linearCombination, @imputedCount,
+        @marketPriceYes, @marketPriceNo, @decision, @reason, @featuresJson
+      )
+    `);
+
+    this.statements.selectEvaluationById = db.prepare(`
+      SELECT * FROM evaluations WHERE id = ?
     `);
 
     this.statements.selectByConditionId = db.prepare(`
@@ -529,11 +552,7 @@ export class TradeRepository implements ITradeRepository {
           entryAskPrice: this.nullifyNaN(trade.entryAskPrice),
         });
 
-        // Safely convert bigint to number
-        const tradeId = Number(result.lastInsertRowid);
-        if (!Number.isSafeInteger(tradeId)) {
-          throw new Error(`Trade ID ${result.lastInsertRowid} exceeds safe integer range`);
-        }
+        const tradeId = this.toSafeId(result.lastInsertRowid, 'Trade');
 
         // Insert features (within same transaction)
         this.insertFeatures(tradeId, trade.features);
@@ -623,6 +642,69 @@ export class TradeRepository implements ITradeRepository {
         });
       }
     });
+  }
+
+  // ============================================================================
+  // Evaluation Write Operations
+  // ============================================================================
+
+  /**
+   * Record a single market evaluation.
+   * Uses async write mode by default for zero latency impact.
+   * @returns The database ID of the inserted evaluation
+   */
+  async recordEvaluation(evaluation: EvaluationRecord): Promise<number> {
+    this.ensureInitialized();
+
+    return this.executeWrite(() => {
+      const stmt = this.getStatement('insertEvaluation');
+      const params = this.evaluationToParams(evaluation);
+      const result = stmt.run(params);
+      return this.toSafeId(result.lastInsertRowid, 'Evaluation');
+    });
+  }
+
+  /**
+   * Record multiple evaluations in a single batch operation.
+   * More efficient than multiple individual recordEvaluation calls.
+   * Uses a single transaction for all inserts.
+   * @returns Array of database IDs for the inserted evaluations
+   */
+  async recordEvaluations(evaluations: ReadonlyArray<EvaluationRecord>): Promise<number[]> {
+    this.ensureInitialized();
+
+    if (evaluations.length === 0) {
+      return [];
+    }
+
+    return this.executeWrite(() => {
+      const stmt = this.getStatement('insertEvaluation');
+
+      // Transaction returns IDs directly for cleaner functional style
+      const batchInsert = this.database.transaction((evals: ReadonlyArray<EvaluationRecord>) => {
+        const insertedIds: number[] = [];
+        for (const evaluation of evals) {
+          const params = this.evaluationToParams(evaluation);
+          const result = stmt.run(params);
+          insertedIds.push(this.toSafeId(result.lastInsertRowid, 'Evaluation'));
+        }
+        return insertedIds;
+      });
+
+      return batchInsert(evaluations);
+    });
+  }
+
+  /**
+   * Get evaluation by database ID.
+   */
+  async getEvaluationById(id: number): Promise<EvaluationRecord | null> {
+    this.ensureInitialized();
+
+    const row = this.getStatement('selectEvaluationById').get(id) as EvaluationRow | undefined;
+    if (!row) return null;
+
+    return this.rowToEvaluationRecord(row);
   }
 
   // ============================================================================
@@ -915,6 +997,53 @@ export class TradeRepository implements ITradeRepository {
   }
 
   /**
+   * Safely convert bigint lastInsertRowid to number, throwing if out of safe range.
+   */
+  private toSafeId(rowid: number | bigint, entityName: string): number {
+    const id = Number(rowid);
+    if (!Number.isSafeInteger(id)) {
+      throw new Error(`${entityName} ID ${rowid} exceeds safe integer range`);
+    }
+    return id;
+  }
+
+  /**
+   * Validate and convert an EvaluationRecord to prepared statement parameters.
+   * Performs input validation for JSON and decision field.
+   */
+  private evaluationToParams(evaluation: EvaluationRecord): Record<string, unknown> {
+    // Validate JSON is parseable
+    try {
+      JSON.parse(evaluation.featuresJson);
+    } catch {
+      throw new Error('Invalid JSON in featuresJson field');
+    }
+
+    // Validate decision against allowed values
+    if (!VALID_EVALUATION_DECISIONS.includes(evaluation.decision)) {
+      throw new Error(
+        `Invalid decision: ${evaluation.decision}. Expected one of: ${VALID_EVALUATION_DECISIONS.join(', ')}`
+      );
+    }
+
+    return {
+      conditionId: evaluation.conditionId,
+      slug: evaluation.slug,
+      symbol: evaluation.symbol,
+      timestamp: evaluation.timestamp,
+      stateMinute: evaluation.stateMinute,
+      modelProbability: evaluation.modelProbability,
+      linearCombination: evaluation.linearCombination,
+      imputedCount: evaluation.imputedCount,
+      marketPriceYes: evaluation.marketPriceYes,
+      marketPriceNo: evaluation.marketPriceNo,
+      decision: evaluation.decision,
+      reason: evaluation.reason,
+      featuresJson: evaluation.featuresJson,
+    };
+  }
+
+  /**
    * Insert feature vector for a trade
    */
   private insertFeatures(tradeId: number, features: FeatureVector): void {
@@ -1129,6 +1258,29 @@ export class TradeRepository implements ITradeRepository {
   }
 
   /**
+   * Convert an evaluation row to EvaluationRecord
+   */
+  private rowToEvaluationRecord(row: EvaluationRow): EvaluationRecord {
+    return {
+      id: row.id,
+      conditionId: row.condition_id,
+      slug: row.slug,
+      symbol: assertCryptoAsset(row.symbol),
+      timestamp: row.timestamp,
+      stateMinute: row.state_minute,
+      modelProbability: row.model_probability,
+      linearCombination: row.linear_combination,
+      imputedCount: row.imputed_count,
+      marketPriceYes: row.market_price_yes,
+      marketPriceNo: row.market_price_no,
+      decision: assertEvaluationDecision(row.decision),
+      reason: row.reason,
+      featuresJson: row.features_json,
+      createdAt: row.created_at ?? undefined,
+    };
+  }
+
+  /**
    * Parse bucket bounds from bucket label
    */
   private parseBucketBounds(bucket: string): { lower: number; upper: number } {
@@ -1261,6 +1413,27 @@ interface PriceRow {
   minute_offset: number;
   timestamp: number;
   price: number;
+}
+
+/**
+ * Evaluation row from database query
+ */
+interface EvaluationRow {
+  id: number;
+  condition_id: string;
+  slug: string;
+  symbol: string;
+  timestamp: number;
+  state_minute: number;
+  model_probability: number;
+  linear_combination: number;
+  imputed_count: number;
+  market_price_yes: number;
+  market_price_no: number;
+  decision: string;
+  reason: string;
+  features_json: string;
+  created_at: number | null;
 }
 
 /**
