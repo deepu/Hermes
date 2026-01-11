@@ -28,6 +28,10 @@ import type {
   TradeOutcomeDirection,
   EvaluationRecord,
   EvaluationDecision,
+  ProbabilityBucket,
+  DecisionBreakdown,
+  ThresholdSimulationResult,
+  ModelVsMarketStats,
 } from '../types/trade-record.types.js';
 import {
   VALID_CRYPTO_ASSETS,
@@ -910,6 +914,308 @@ export class TradeRepository implements ITradeRepository {
 
     const txn = this.database.transaction(fn);
     return txn();
+  }
+
+  // ============================================================================
+  // Evaluation Analytics (Part of #38)
+  // ============================================================================
+
+  /**
+   * Get evaluations within a date range.
+   * @param start Start date (inclusive)
+   * @param end End date (inclusive)
+   * @returns Array of evaluation records
+   */
+  async getEvaluationsByDateRange(start: Date, end: Date): Promise<EvaluationRecord[]> {
+    this.ensureInitialized();
+
+    const stmt = this.database.prepare(`
+      SELECT * FROM evaluations
+      WHERE timestamp >= ? AND timestamp <= ?
+      ORDER BY timestamp ASC
+    `);
+
+    const rows = stmt.all(start.getTime(), end.getTime()) as EvaluationRow[];
+    return rows.map((row) => this.rowToEvaluationRecord(row));
+  }
+
+  /**
+   * Get probability distribution histogram for model probabilities.
+   * Shows how model predictions are distributed across probability ranges.
+   *
+   * @param start Start date (inclusive)
+   * @param end End date (inclusive)
+   * @param bucketSize Size of each bucket (default: 0.05)
+   * @returns Array of probability buckets with counts and avg market prices
+   */
+  async getProbabilityDistribution(
+    start: Date,
+    end: Date,
+    bucketSize: number = 0.05
+  ): Promise<ProbabilityBucket[]> {
+    this.ensureInitialized();
+
+    // Validate bucket size
+    if (bucketSize <= 0 || bucketSize > 1) {
+      throw new Error('Bucket size must be between 0 (exclusive) and 1 (inclusive)');
+    }
+
+    // Use SQL to bucket the probabilities
+    // FLOOR(probability / bucketSize) * bucketSize gives us the bucket start
+    const stmt = this.database.prepare(`
+      SELECT
+        CAST(FLOOR(model_probability / ?) * ? AS REAL) as bucket_start,
+        COUNT(*) as count,
+        AVG(market_price_yes) as avg_market_price
+      FROM evaluations
+      WHERE timestamp >= ? AND timestamp <= ?
+      GROUP BY FLOOR(model_probability / ?)
+      ORDER BY bucket_start ASC
+    `);
+
+    const rows = stmt.all(
+      bucketSize,
+      bucketSize,
+      start.getTime(),
+      end.getTime(),
+      bucketSize
+    ) as Array<{
+      bucket_start: number;
+      count: number;
+      avg_market_price: number;
+    }>;
+
+    return rows.map((row) => {
+      const bucketStart = row.bucket_start;
+      const bucketEnd = Math.min(bucketStart + bucketSize, 1);
+      return {
+        bucket: `${bucketStart.toFixed(2)}-${bucketEnd.toFixed(2)}`,
+        count: row.count,
+        avgMarketPrice: row.avg_market_price,
+      };
+    });
+  }
+
+  /**
+   * Get decision breakdown by symbol showing how often each decision occurs.
+   *
+   * @param start Start date (inclusive)
+   * @param end End date (inclusive)
+   * @returns Array of decision breakdowns per symbol
+   */
+  async getDecisionBreakdown(start: Date, end: Date): Promise<DecisionBreakdown[]> {
+    this.ensureInitialized();
+
+    const stmt = this.database.prepare(`
+      SELECT
+        symbol,
+        SUM(CASE WHEN decision = 'SKIP' THEN 1 ELSE 0 END) as skip_count,
+        SUM(CASE WHEN decision = 'YES' THEN 1 ELSE 0 END) as yes_count,
+        SUM(CASE WHEN decision = 'NO' THEN 1 ELSE 0 END) as no_count,
+        AVG(CASE WHEN decision = 'SKIP' THEN model_probability ELSE NULL END) as avg_skip_prob
+      FROM evaluations
+      WHERE timestamp >= ? AND timestamp <= ?
+      GROUP BY symbol
+      ORDER BY symbol ASC
+    `);
+
+    const rows = stmt.all(start.getTime(), end.getTime()) as Array<{
+      symbol: string;
+      skip_count: number;
+      yes_count: number;
+      no_count: number;
+      avg_skip_prob: number | null;
+    }>;
+
+    return rows.map((row) => ({
+      symbol: assertCryptoAsset(row.symbol),
+      skipCount: row.skip_count,
+      yesCount: row.yes_count,
+      noCount: row.no_count,
+      avgSkipProb: row.avg_skip_prob ?? 0,
+    }));
+  }
+
+  /**
+   * Simulate different thresholds for what-if analysis.
+   * Shows what trades would have been made with different YES/NO thresholds.
+   *
+   * This assumes the current strategy logic:
+   * - YES trade if model_probability >= yesThreshold
+   * - NO trade if (1 - model_probability) >= noThreshold (i.e., model_probability <= 1 - noThreshold)
+   *
+   * @param start Start date (inclusive)
+   * @param end End date (inclusive)
+   * @param yesThreshold Probability threshold for YES trades (e.g., 0.65)
+   * @param noThreshold Probability threshold for NO trades (e.g., 0.65)
+   * @returns Simulation result with trade counts and opportunity lists
+   */
+  async simulateThreshold(
+    start: Date,
+    end: Date,
+    yesThreshold: number,
+    noThreshold: number
+  ): Promise<ThresholdSimulationResult> {
+    this.ensureInitialized();
+
+    // Validate thresholds
+    if (yesThreshold < 0 || yesThreshold > 1) {
+      throw new Error('yesThreshold must be between 0 and 1');
+    }
+    if (noThreshold < 0 || noThreshold > 1) {
+      throw new Error('noThreshold must be between 0 and 1');
+    }
+
+    // Get all evaluations in the range
+    const evaluations = await this.getEvaluationsByDateRange(start, end);
+
+    let wouldTrade = 0;
+    let actuallyTraded = 0;
+    const newOpportunities: EvaluationRecord[] = [];
+    const lostTrades: EvaluationRecord[] = [];
+
+    for (const evaluation of evaluations) {
+      const actuallyTradedThis = evaluation.decision !== 'SKIP';
+
+      // Would this trade under new thresholds?
+      // YES if probability >= yesThreshold
+      // NO if probability <= (1 - noThreshold)
+      const wouldTradeYes = evaluation.modelProbability >= yesThreshold;
+      const wouldTradeNo = evaluation.modelProbability <= 1 - noThreshold;
+      const wouldTradeThis = wouldTradeYes || wouldTradeNo;
+
+      if (wouldTradeThis) {
+        wouldTrade++;
+      }
+
+      if (actuallyTradedThis) {
+        actuallyTraded++;
+
+        if (!wouldTradeThis) {
+          // Would lose this trade under new thresholds
+          lostTrades.push(evaluation);
+        }
+      } else {
+        // Was a SKIP
+        if (wouldTradeThis) {
+          // New opportunity under new thresholds
+          newOpportunities.push(evaluation);
+        }
+      }
+    }
+
+    return {
+      wouldTrade,
+      actuallyTraded,
+      newOpportunities,
+      lostTrades,
+    };
+  }
+
+  /**
+   * Compare model predictions against market prices.
+   * Calculates correlation between model probability and market YES price.
+   *
+   * @param start Start date (inclusive)
+   * @param end End date (inclusive)
+   * @returns Array of model vs market stats per symbol
+   */
+  async getModelVsMarket(start: Date, end: Date): Promise<ModelVsMarketStats[]> {
+    this.ensureInitialized();
+
+    // First, get aggregate stats per symbol
+    const aggStmt = this.database.prepare(`
+      SELECT
+        symbol,
+        AVG(model_probability) as avg_model_prob,
+        AVG(market_price_yes) as avg_market_price_yes,
+        COUNT(*) as evaluation_count
+      FROM evaluations
+      WHERE timestamp >= ? AND timestamp <= ?
+      GROUP BY symbol
+      ORDER BY symbol ASC
+    `);
+
+    const aggRows = aggStmt.all(start.getTime(), end.getTime()) as Array<{
+      symbol: string;
+      avg_model_prob: number;
+      avg_market_price_yes: number;
+      evaluation_count: number;
+    }>;
+
+    // For correlation, we need raw values per symbol
+    const correlationStmt = this.database.prepare(`
+      SELECT symbol, model_probability, market_price_yes
+      FROM evaluations
+      WHERE timestamp >= ? AND timestamp <= ?
+      ORDER BY symbol ASC
+    `);
+
+    const allRows = correlationStmt.all(start.getTime(), end.getTime()) as Array<{
+      symbol: string;
+      model_probability: number;
+      market_price_yes: number;
+    }>;
+
+    // Group by symbol for correlation calculation
+    const bySymbol = new Map<string, Array<{ model: number; market: number }>>();
+    for (const row of allRows) {
+      const arr = bySymbol.get(row.symbol) || [];
+      arr.push({ model: row.model_probability, market: row.market_price_yes });
+      bySymbol.set(row.symbol, arr);
+    }
+
+    return aggRows.map((row) => {
+      const dataPoints = bySymbol.get(row.symbol) || [];
+      const correlation = this.calculatePearsonCorrelation(dataPoints);
+
+      return {
+        symbol: assertCryptoAsset(row.symbol),
+        avgModelProb: row.avg_model_prob,
+        avgMarketPriceYes: row.avg_market_price_yes,
+        correlation,
+        evaluationCount: row.evaluation_count,
+      };
+    });
+  }
+
+  /**
+   * Calculate Pearson correlation coefficient between model and market values.
+   * @param data Array of {model, market} pairs
+   * @returns Correlation coefficient (-1 to 1), or 0 if insufficient data
+   */
+  private calculatePearsonCorrelation(
+    data: Array<{ model: number; market: number }>
+  ): number {
+    if (data.length < 2) {
+      return 0;
+    }
+
+    const n = data.length;
+    let sumModel = 0;
+    let sumMarket = 0;
+    let sumModelSq = 0;
+    let sumMarketSq = 0;
+    let sumProduct = 0;
+
+    for (const { model, market } of data) {
+      sumModel += model;
+      sumMarket += market;
+      sumModelSq += model * model;
+      sumMarketSq += market * market;
+      sumProduct += model * market;
+    }
+
+    const numerator = n * sumProduct - sumModel * sumMarket;
+    const denominator = Math.sqrt(
+      (n * sumModelSq - sumModel * sumModel) * (n * sumMarketSq - sumMarket * sumMarket)
+    );
+
+    if (denominator === 0) {
+      return 0;
+    }
+
+    return numerator / denominator;
   }
 
   // ============================================================================

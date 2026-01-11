@@ -927,6 +927,367 @@ describe('TradeRepository', () => {
       expect(retrieved!.conditionId).toBe(evaluation.conditionId);
     });
   });
+
+  // ============================================================================
+  // Evaluation Analytics Tests (Part of #38)
+  // ============================================================================
+
+  describe('getEvaluationsByDateRange', () => {
+    it('should return evaluations within the date range', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      // Create evaluations at different times
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime + 60000 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime + 120000 }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 90000);
+
+      const results = await repository.getEvaluationsByDateRange(start, end);
+
+      expect(results).toHaveLength(2);
+      expect(results[0].timestamp).toBe(baseTime);
+      expect(results[1].timestamp).toBe(baseTime + 60000);
+    });
+
+    it('should return empty array when no evaluations in range', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime }));
+
+      const start = new Date(baseTime + 100000);
+      const end = new Date(baseTime + 200000);
+
+      const results = await repository.getEvaluationsByDateRange(start, end);
+
+      expect(results).toHaveLength(0);
+    });
+
+    it('should order results by timestamp ascending', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      // Insert in reverse order
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime + 120000 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime + 60000 }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 200000);
+
+      const results = await repository.getEvaluationsByDateRange(start, end);
+
+      expect(results).toHaveLength(3);
+      expect(results[0].timestamp).toBe(baseTime);
+      expect(results[1].timestamp).toBe(baseTime + 60000);
+      expect(results[2].timestamp).toBe(baseTime + 120000);
+    });
+  });
+
+  describe('getProbabilityDistribution', () => {
+    it('should bucket probabilities correctly with default bucket size', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      // Create evaluations with different probabilities
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.52, marketPriceYes: 0.50 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.53, marketPriceYes: 0.52 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.61, marketPriceYes: 0.60 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.72, marketPriceYes: 0.70 }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      const results = await repository.getProbabilityDistribution(start, end);
+
+      // Should have 3 buckets: 0.50-0.55, 0.60-0.65, 0.70-0.75
+      expect(results.length).toBeGreaterThanOrEqual(3);
+
+      // Check the 0.50-0.55 bucket
+      const bucket50 = results.find(r => r.bucket === '0.50-0.55');
+      expect(bucket50).toBeDefined();
+      expect(bucket50!.count).toBe(2);
+      expect(bucket50!.avgMarketPrice).toBeCloseTo(0.51, 2);
+    });
+
+    it('should work with custom bucket sizes', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.52 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.58 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, modelProbability: 0.72 }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      const results = await repository.getProbabilityDistribution(start, end, 0.10);
+
+      // With 0.10 bucket size: 0.50-0.60 (2), 0.70-0.80 (1)
+      expect(results).toHaveLength(2);
+
+      const bucket50 = results.find(r => r.bucket === '0.50-0.60');
+      expect(bucket50).toBeDefined();
+      expect(bucket50!.count).toBe(2);
+    });
+
+    it('should throw error for invalid bucket size', async () => {
+      const start = new Date();
+      const end = new Date();
+
+      await expect(repository.getProbabilityDistribution(start, end, 0)).rejects.toThrow();
+      await expect(repository.getProbabilityDistribution(start, end, -0.1)).rejects.toThrow();
+      await expect(repository.getProbabilityDistribution(start, end, 1.5)).rejects.toThrow();
+    });
+
+    it('should return empty array when no evaluations in range', async () => {
+      const start = new Date('2024-01-15T12:00:00Z');
+      const end = new Date('2024-01-15T13:00:00Z');
+
+      const results = await repository.getProbabilityDistribution(start, end);
+
+      expect(results).toHaveLength(0);
+    });
+  });
+
+  describe('getDecisionBreakdown', () => {
+    it('should count decisions by symbol', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      // BTC: 2 SKIP, 1 YES, 1 NO
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'BTC' as CryptoAsset, decision: 'SKIP', modelProbability: 0.50 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'BTC' as CryptoAsset, decision: 'SKIP', modelProbability: 0.52 }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'BTC' as CryptoAsset, decision: 'YES' }));
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'BTC' as CryptoAsset, decision: 'NO' }));
+
+      // ETH: 1 YES
+      await repository.recordEvaluation(createTestEvaluation({ timestamp: baseTime, symbol: 'ETH' as CryptoAsset, decision: 'YES' }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      const results = await repository.getDecisionBreakdown(start, end);
+
+      expect(results).toHaveLength(2);
+
+      const btcStats = results.find(r => r.symbol === 'BTC');
+      expect(btcStats).toBeDefined();
+      expect(btcStats!.skipCount).toBe(2);
+      expect(btcStats!.yesCount).toBe(1);
+      expect(btcStats!.noCount).toBe(1);
+      expect(btcStats!.avgSkipProb).toBeCloseTo(0.51, 2);
+
+      const ethStats = results.find(r => r.symbol === 'ETH');
+      expect(ethStats).toBeDefined();
+      expect(ethStats!.skipCount).toBe(0);
+      expect(ethStats!.yesCount).toBe(1);
+      expect(ethStats!.noCount).toBe(0);
+    });
+
+    it('should return empty array when no evaluations in range', async () => {
+      const start = new Date('2024-01-15T12:00:00Z');
+      const end = new Date('2024-01-15T13:00:00Z');
+
+      const results = await repository.getDecisionBreakdown(start, end);
+
+      expect(results).toHaveLength(0);
+    });
+  });
+
+  describe('simulateThreshold', () => {
+    it('should identify new opportunities with lower thresholds', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      // Original threshold was 0.70, this was a SKIP at 0.68
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        modelProbability: 0.68,
+        decision: 'SKIP',
+        reason: 'Below threshold',
+      }));
+
+      // This actually traded at 0.75
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        modelProbability: 0.75,
+        decision: 'YES',
+      }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      // Simulate with lower YES threshold of 0.65
+      const result = await repository.simulateThreshold(start, end, 0.65, 0.65);
+
+      expect(result.actuallyTraded).toBe(1);
+      expect(result.wouldTrade).toBe(2);
+      expect(result.newOpportunities).toHaveLength(1);
+      expect(result.newOpportunities[0].modelProbability).toBeCloseTo(0.68, 2);
+      expect(result.lostTrades).toHaveLength(0);
+    });
+
+    it('should identify lost trades with stricter thresholds', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      // Traded at 0.72
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        modelProbability: 0.72,
+        decision: 'YES',
+      }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      // Simulate with stricter threshold of 0.75
+      const result = await repository.simulateThreshold(start, end, 0.75, 0.75);
+
+      expect(result.actuallyTraded).toBe(1);
+      expect(result.wouldTrade).toBe(0);
+      expect(result.newOpportunities).toHaveLength(0);
+      expect(result.lostTrades).toHaveLength(1);
+      expect(result.lostTrades[0].modelProbability).toBeCloseTo(0.72, 2);
+    });
+
+    it('should handle NO trades based on low probability', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      // Low probability = NO trade
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        modelProbability: 0.28,
+        decision: 'NO',
+      }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      // noThreshold = 0.70 means we trade NO when prob <= 0.30
+      const result = await repository.simulateThreshold(start, end, 0.70, 0.70);
+
+      expect(result.wouldTrade).toBe(1);
+      expect(result.actuallyTraded).toBe(1);
+    });
+
+    it('should throw error for invalid thresholds', async () => {
+      const start = new Date();
+      const end = new Date();
+
+      await expect(repository.simulateThreshold(start, end, -0.1, 0.70)).rejects.toThrow();
+      await expect(repository.simulateThreshold(start, end, 1.5, 0.70)).rejects.toThrow();
+      await expect(repository.simulateThreshold(start, end, 0.70, -0.1)).rejects.toThrow();
+      await expect(repository.simulateThreshold(start, end, 0.70, 1.5)).rejects.toThrow();
+    });
+  });
+
+  describe('getModelVsMarket', () => {
+    it('should calculate correlation between model and market', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      // Create evaluations with positively correlated model and market prices
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        symbol: 'BTC' as CryptoAsset,
+        modelProbability: 0.50,
+        marketPriceYes: 0.48,
+      }));
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        symbol: 'BTC' as CryptoAsset,
+        modelProbability: 0.60,
+        marketPriceYes: 0.58,
+      }));
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        symbol: 'BTC' as CryptoAsset,
+        modelProbability: 0.70,
+        marketPriceYes: 0.68,
+      }));
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        symbol: 'BTC' as CryptoAsset,
+        modelProbability: 0.80,
+        marketPriceYes: 0.78,
+      }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      const results = await repository.getModelVsMarket(start, end);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].symbol).toBe('BTC');
+      expect(results[0].avgModelProb).toBeCloseTo(0.65, 2);
+      expect(results[0].avgMarketPriceYes).toBeCloseTo(0.63, 2);
+      expect(results[0].evaluationCount).toBe(4);
+      // Should have high positive correlation
+      expect(results[0].correlation).toBeGreaterThan(0.99);
+    });
+
+    it('should handle multiple symbols', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        symbol: 'BTC' as CryptoAsset,
+        modelProbability: 0.60,
+        marketPriceYes: 0.55,
+      }));
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        symbol: 'BTC' as CryptoAsset,
+        modelProbability: 0.70,
+        marketPriceYes: 0.65,
+      }));
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        symbol: 'ETH' as CryptoAsset,
+        modelProbability: 0.55,
+        marketPriceYes: 0.50,
+      }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      const results = await repository.getModelVsMarket(start, end);
+
+      expect(results).toHaveLength(2);
+
+      const btcStats = results.find(r => r.symbol === 'BTC');
+      expect(btcStats).toBeDefined();
+      expect(btcStats!.evaluationCount).toBe(2);
+      expect(btcStats!.avgModelProb).toBeCloseTo(0.65, 2);
+
+      const ethStats = results.find(r => r.symbol === 'ETH');
+      expect(ethStats).toBeDefined();
+      expect(ethStats!.evaluationCount).toBe(1);
+    });
+
+    it('should return 0 correlation with single data point', async () => {
+      const baseTime = new Date('2024-01-15T12:00:00Z').getTime();
+
+      await repository.recordEvaluation(createTestEvaluation({
+        timestamp: baseTime,
+        symbol: 'BTC' as CryptoAsset,
+        modelProbability: 0.60,
+        marketPriceYes: 0.55,
+      }));
+
+      const start = new Date(baseTime - 1000);
+      const end = new Date(baseTime + 1000);
+
+      const results = await repository.getModelVsMarket(start, end);
+
+      expect(results).toHaveLength(1);
+      expect(results[0].correlation).toBe(0);
+    });
+
+    it('should return empty array when no evaluations in range', async () => {
+      const start = new Date('2024-01-15T12:00:00Z');
+      const end = new Date('2024-01-15T13:00:00Z');
+
+      const results = await repository.getModelVsMarket(start, end);
+
+      expect(results).toHaveLength(0);
+    });
+  });
 });
 
 // ============================================================================

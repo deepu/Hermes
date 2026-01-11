@@ -319,12 +319,13 @@ export interface ITradeAnalytics {
 }
 
 /**
- * Full trade repository interface combining CRUD and analytics
+ * Full trade repository interface combining CRUD, trade analytics, and evaluation analytics.
  *
  * Use ITradeRepositoryCore for clients that only need basic persistence.
- * Use ITradeAnalytics for clients that only need analysis queries.
+ * Use ITradeAnalytics for clients that only need trade analysis queries.
+ * Use IEvaluationAnalytics for clients that only need evaluation analysis queries.
  */
-export interface ITradeRepository extends ITradeRepositoryCore, ITradeAnalytics {}
+export interface ITradeRepository extends ITradeRepositoryCore, ITradeAnalytics, IEvaluationAnalytics {}
 
 // ============================================================================
 // Evaluation Record Types
@@ -375,6 +376,114 @@ export interface EvaluationRecord {
   featuresJson: string;
   /** Record creation timestamp */
   createdAt?: number;
+}
+
+// ============================================================================
+// Evaluation Analysis Types
+// ============================================================================
+
+/**
+ * Probability distribution bucket for histogram analysis.
+ * Shows how model probabilities are distributed across ranges.
+ *
+ * Part of #38
+ */
+export interface ProbabilityBucket {
+  /** Bucket label (e.g., "0.50-0.55") */
+  bucket: string;
+  /** Number of evaluations in this bucket */
+  count: number;
+  /** Average market YES price for evaluations in this bucket */
+  avgMarketPrice: number;
+}
+
+/**
+ * Decision breakdown by symbol showing how often each decision occurs.
+ *
+ * Part of #38
+ */
+export interface DecisionBreakdown {
+  /** Crypto asset symbol */
+  symbol: CryptoAsset;
+  /** Number of SKIP decisions */
+  skipCount: number;
+  /** Number of YES decisions */
+  yesCount: number;
+  /** Number of NO decisions */
+  noCount: number;
+  /** Average model probability for SKIP decisions */
+  avgSkipProb: number;
+}
+
+/**
+ * Result from threshold simulation showing what-if analysis.
+ *
+ * Part of #38
+ */
+export interface ThresholdSimulationResult {
+  /** Count of evaluations that would trade under new thresholds */
+  wouldTrade: number;
+  /** Count of evaluations that actually traded */
+  actuallyTraded: number;
+  /** Evaluations that would be newly captured (opportunities) */
+  newOpportunities: EvaluationRecord[];
+  /** Evaluations that would be lost (would skip under new thresholds) */
+  lostTrades: EvaluationRecord[];
+}
+
+/**
+ * Model vs market comparison per symbol.
+ * Compares model predictions against market prices.
+ *
+ * Part of #38
+ */
+export interface ModelVsMarketStats {
+  /** Crypto asset symbol */
+  symbol: CryptoAsset;
+  /** Average model probability across all evaluations */
+  avgModelProb: number;
+  /** Average market YES price across all evaluations */
+  avgMarketPriceYes: number;
+  /** Pearson correlation between model prob and market price */
+  correlation: number;
+  /** Number of evaluations used in calculation */
+  evaluationCount: number;
+}
+
+// ============================================================================
+// Evaluation Analytics Interface
+// ============================================================================
+
+/**
+ * Analysis queries for evaluation data.
+ * Enables threshold tuning, model diagnostics, and performance analysis.
+ *
+ * Part of #38
+ */
+export interface IEvaluationAnalytics {
+  /** Get evaluations within a date range */
+  getEvaluationsByDateRange(start: Date, end: Date): Promise<EvaluationRecord[]>;
+
+  /** Get probability distribution histogram */
+  getProbabilityDistribution(
+    start: Date,
+    end: Date,
+    bucketSize?: number
+  ): Promise<ProbabilityBucket[]>;
+
+  /** Get decision breakdown by symbol */
+  getDecisionBreakdown(start: Date, end: Date): Promise<DecisionBreakdown[]>;
+
+  /** Simulate different thresholds for what-if analysis */
+  simulateThreshold(
+    start: Date,
+    end: Date,
+    yesThreshold: number,
+    noThreshold: number
+  ): Promise<ThresholdSimulationResult>;
+
+  /** Compare model predictions against market prices */
+  getModelVsMarket(start: Date, end: Date): Promise<ModelVsMarketStats[]>;
 }
 
 // ============================================================================
