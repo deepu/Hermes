@@ -134,13 +134,16 @@ const WINDOW_MS = WINDOW_MINUTES * 60 * 1000;
 const BUFFER_SIZE = 32;
 
 /** Milliseconds per minute */
-const MINUTE_MS = 60 * 1000;
+export const MINUTE_MS = 60 * 1000;
 
 /** Milliseconds per hour */
-const HOUR_MS = 60 * MINUTE_MS;
+export const HOUR_MS = 60 * MINUTE_MS;
 
 /** Milliseconds per day */
-const DAY_MS = 24 * HOUR_MS;
+export const DAY_MS = 24 * HOUR_MS;
+
+/** Default minute of hour for legacy data without timestamp (mid-hour) */
+export const DEFAULT_MINUTE_OF_HOUR = 30;
 
 /**
  * Unix epoch day-of-week offset.

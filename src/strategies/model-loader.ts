@@ -205,11 +205,22 @@ function mapFeatureName(modelFeatureName: string): string {
 
 /**
  * Map medians object keys from model feature names to engine feature names.
+ *
+ * Note: Multiple model feature names may map to the same engine feature name
+ * (e.g., threshold-suffixed features like `first_up_hit_minute_8bps` map to
+ * `first_up_hit_minute`). When this occurs, the last value wins and a warning
+ * is logged. This is expected behavior when loading per-asset imputations.
  */
 function mapMedianKeys(medians: Record<string, number>): Record<string, number> {
   const mapped: Record<string, number> = {};
   for (const [key, value] of Object.entries(medians)) {
-    mapped[mapFeatureName(key)] = value;
+    const mappedKey = mapFeatureName(key);
+    if (mappedKey in mapped) {
+      console.warn(
+        `[model-loader] Median key collision: "${key}" maps to "${mappedKey}" which already exists (previous value: ${mapped[mappedKey]}, new value: ${value})`
+      );
+    }
+    mapped[mappedKey] = value;
   }
   return mapped;
 }
