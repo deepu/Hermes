@@ -42,6 +42,8 @@ import type { ITradeRepository } from '../types/trade-record.types.js';
 const WINDOW_MS = 15 * 60 * 1000;
 const MINUTE_MS = 60 * 1000;
 const ASYNC_SETTLE_MS = 100;
+// Additional settle time for setImmediate callbacks in evaluation tests
+const EVALUATION_SETTLE_MS = 100;
 
 // Use a fixed timestamp for reproducible tests (2024-01-01 00:00:00 UTC)
 const MOCK_TIME = 1704067200000;
@@ -50,6 +52,14 @@ const TEST_END_TIME = TEST_WINDOW_START + WINDOW_MS;
 
 // Test price constant
 const TEST_BTC_PRICE = 98500;
+
+// Default persistence config for tests that need evaluation logging
+const DEFAULT_PERSISTENCE_CONFIG = {
+  enabled: true,
+  dbPath: './test-data/trades.db',
+  syncMode: 'async' as const,
+  vacuumIntervalHours: 24,
+};
 
 // ============================================================================
 // Mock Helpers
@@ -2146,27 +2156,36 @@ describe('Crypto15MLStrategyService Integration', () => {
   // ============================================================================
 
   describe('Evaluation Logging', () => {
-    const MODEL_INTERCEPT_YES = 3.0;   // High probability -> YES signal
-    const MODEL_INTERCEPT_NO = -3.0;   // Low probability -> NO signal
-    const MODEL_INTERCEPT_SKIP = 0.0;  // Mid probability -> SKIP (uncertain range)
+    // Model intercept values: sigmoid(x) determines probability
+    // sigmoid(3.0) ≈ 0.95 -> triggers YES signal
+    // sigmoid(-3.0) ≈ 0.05 -> triggers NO signal
+    // sigmoid(0.0) = 0.50 -> SKIP (uncertain range)
+    const MODEL_INTERCEPT_YES = 3.0;
+    const MODEL_INTERCEPT_NO = -3.0;
+    const MODEL_INTERCEPT_SKIP = 0.0;
 
-    it('should record YES evaluation when probability >= yesThreshold', async () => {
-      const mockRepo = createMockTradeRepository();
-      testModelIntercept = MODEL_INTERCEPT_YES;
+    /**
+     * Helper to set up evaluation test with common configuration
+     */
+    async function setupEvaluationTest(opts: {
+      conditionId: string;
+      modelIntercept: number;
+      prices?: { yes: number; no: number };
+      configOverrides?: Partial<Crypto15MLConfig>;
+      mockRepo?: MockTradeRepository;
+    }): Promise<{ mockRepo: MockTradeRepository; slug: string }> {
+      const mockRepo = opts.mockRepo ?? createMockTradeRepository();
+      testModelIntercept = opts.modelIntercept;
 
-      // Setup market
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const slug = `btc-updown-15m-${windowStartSec}`;
-      const market = createTestMarket('cond-eval-yes', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
+      const prices = opts.prices ?? { yes: 0.50, no: 0.50 };
+      const market = createTestMarket(opts.conditionId, slug, TEST_END_TIME, prices);
       mockMarketService.mockGetMarket.mockResolvedValue(market);
 
       const config = createTestConfig({
-        persistence: {
-          enabled: true,
-          dbPath: './test-data/trades.db',
-          syncMode: 'async',
-          vacuumIntervalHours: 24,
-        },
+        persistence: DEFAULT_PERSISTENCE_CONFIG,
+        ...opts.configOverrides,
       });
 
       service = new Crypto15MLStrategyService(
@@ -2180,15 +2199,26 @@ describe('Crypto15MLStrategyService Integration', () => {
       await service.start();
       await (service as any).scanUpcomingMarkets();
 
-      // Trigger evaluation at minute 0
-      const timestamp = TEST_WINDOW_START;
-      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
+      return { mockRepo, slug };
+    }
 
-      // Allow async operations to settle
+    /**
+     * Helper to trigger evaluation and wait for async settle
+     */
+    async function triggerEvaluationAndSettle(timestamp: number = TEST_WINDOW_START, price: number = TEST_BTC_PRICE): Promise<void> {
+      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price, timestamp });
       await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(EVALUATION_SETTLE_MS);
+    }
 
-      // Evaluation should have been recorded
+    it('should record YES evaluation when probability >= yesThreshold', async () => {
+      const { mockRepo, slug } = await setupEvaluationTest({
+        conditionId: 'cond-eval-yes',
+        modelIntercept: MODEL_INTERCEPT_YES,
+      });
+
+      await triggerEvaluationAndSettle();
+
       expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
       expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2205,44 +2235,13 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should record NO evaluation when probability <= noThreshold', async () => {
-      const mockRepo = createMockTradeRepository();
-      testModelIntercept = MODEL_INTERCEPT_NO;
-
-      // Setup market
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const slug = `btc-updown-15m-${windowStartSec}`;
-      const market = createTestMarket('cond-eval-no', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
-      mockMarketService.mockGetMarket.mockResolvedValue(market);
-
-      const config = createTestConfig({
-        persistence: {
-          enabled: true,
-          dbPath: './test-data/trades.db',
-          syncMode: 'async',
-          vacuumIntervalHours: 24,
-        },
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-no',
+        modelIntercept: MODEL_INTERCEPT_NO,
       });
 
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config,
-        mockRepo
-      );
+      await triggerEvaluationAndSettle();
 
-      await service.start();
-      await (service as any).scanUpcomingMarkets();
-
-      // Trigger evaluation at minute 0
-      const timestamp = TEST_WINDOW_START;
-      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
-
-      // Allow async operations to settle
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
-      await vi.advanceTimersByTimeAsync(100);
-
-      // Evaluation should have been recorded as NO
       expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
       expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2254,44 +2253,13 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should record SKIP evaluation when probability in uncertain range', async () => {
-      const mockRepo = createMockTradeRepository();
-      testModelIntercept = MODEL_INTERCEPT_SKIP;
-
-      // Setup market
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const slug = `btc-updown-15m-${windowStartSec}`;
-      const market = createTestMarket('cond-eval-skip', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
-      mockMarketService.mockGetMarket.mockResolvedValue(market);
-
-      const config = createTestConfig({
-        persistence: {
-          enabled: true,
-          dbPath: './test-data/trades.db',
-          syncMode: 'async',
-          vacuumIntervalHours: 24,
-        },
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-skip',
+        modelIntercept: MODEL_INTERCEPT_SKIP,
       });
 
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config,
-        mockRepo
-      );
+      await triggerEvaluationAndSettle();
 
-      await service.start();
-      await (service as any).scanUpcomingMarkets();
-
-      // Trigger evaluation at minute 0
-      const timestamp = TEST_WINDOW_START;
-      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
-
-      // Allow async operations to settle
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
-      await vi.advanceTimersByTimeAsync(100);
-
-      // Evaluation should have been recorded as SKIP
       expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
       expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2303,45 +2271,15 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should record SKIP evaluation when entry price cap rejects signal', async () => {
-      const mockRepo = createMockTradeRepository();
-      testModelIntercept = MODEL_INTERCEPT_YES; // Would be YES, but price is too high
-
-      // Setup market with high price (above entry cap)
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const slug = `btc-updown-15m-${windowStartSec}`;
-      const market = createTestMarket('cond-eval-cap', slug, TEST_END_TIME, { yes: 0.80, no: 0.20 });
-      mockMarketService.mockGetMarket.mockResolvedValue(market);
-
-      const config = createTestConfig({
-        entryPriceCap: 0.70,
-        persistence: {
-          enabled: true,
-          dbPath: './test-data/trades.db',
-          syncMode: 'async',
-          vacuumIntervalHours: 24,
-        },
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-cap',
+        modelIntercept: MODEL_INTERCEPT_YES,
+        prices: { yes: 0.80, no: 0.20 },
+        configOverrides: { entryPriceCap: 0.70 },
       });
 
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config,
-        mockRepo
-      );
+      await triggerEvaluationAndSettle();
 
-      await service.start();
-      await (service as any).scanUpcomingMarkets();
-
-      // Trigger evaluation at minute 0
-      const timestamp = TEST_WINDOW_START;
-      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
-
-      // Allow async operations to settle
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
-      await vi.advanceTimersByTimeAsync(100);
-
-      // Evaluation should record SKIP with reason mentioning entry price cap
       expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(1);
       expect(mockRepo.recordEvaluation).toHaveBeenCalledWith(
         expect.objectContaining({
@@ -2353,44 +2291,14 @@ describe('Crypto15MLStrategyService Integration', () => {
     });
 
     it('should include all required fields in evaluation record', async () => {
-      const mockRepo = createMockTradeRepository();
-      testModelIntercept = MODEL_INTERCEPT_YES;
-
-      // Setup market
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const slug = `btc-updown-15m-${windowStartSec}`;
-      const market = createTestMarket('cond-eval-fields', slug, TEST_END_TIME, { yes: 0.55, no: 0.45 });
-      mockMarketService.mockGetMarket.mockResolvedValue(market);
-
-      const config = createTestConfig({
-        persistence: {
-          enabled: true,
-          dbPath: './test-data/trades.db',
-          syncMode: 'async',
-          vacuumIntervalHours: 24,
-        },
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-fields',
+        modelIntercept: MODEL_INTERCEPT_YES,
+        prices: { yes: 0.55, no: 0.45 },
       });
 
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config,
-        mockRepo
-      );
+      await triggerEvaluationAndSettle();
 
-      await service.start();
-      await (service as any).scanUpcomingMarkets();
-
-      // Trigger evaluation at minute 0
-      const timestamp = TEST_WINDOW_START;
-      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
-
-      // Allow async operations to settle
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
-      await vi.advanceTimersByTimeAsync(100);
-
-      // Verify all required fields are present
       const evalRecord = mockRepo.recordEvaluation.mock.calls[0][0];
       expect(evalRecord).toMatchObject({
         conditionId: expect.any(String),
@@ -2415,7 +2323,6 @@ describe('Crypto15MLStrategyService Integration', () => {
     it('should not record evaluation when repository is not configured', async () => {
       testModelIntercept = MODEL_INTERCEPT_YES;
 
-      // Setup market
       const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
       const slug = `btc-updown-15m-${windowStartSec}`;
       const market = createTestMarket('cond-eval-norepo', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
@@ -2435,13 +2342,7 @@ describe('Crypto15MLStrategyService Integration', () => {
       await service.start();
       await (service as any).scanUpcomingMarkets();
 
-      // Trigger evaluation
-      const timestamp = TEST_WINDOW_START;
-      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
-
-      // Allow async operations to settle
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
-      await vi.advanceTimersByTimeAsync(100);
+      await triggerEvaluationAndSettle();
 
       // Should not crash and signal should still be generated
       expect(service.isRunning()).toBe(true);
@@ -2450,76 +2351,25 @@ describe('Crypto15MLStrategyService Integration', () => {
     it('should handle evaluation persistence errors gracefully', async () => {
       const mockRepo = createMockTradeRepository();
       mockRepo.recordEvaluation.mockRejectedValue(new Error('Database error'));
-      testModelIntercept = MODEL_INTERCEPT_YES;
 
-      // Setup market
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const slug = `btc-updown-15m-${windowStartSec}`;
-      const market = createTestMarket('cond-eval-error', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
-      mockMarketService.mockGetMarket.mockResolvedValue(market);
-
-      const config = createTestConfig({
-        persistence: {
-          enabled: true,
-          dbPath: './test-data/trades.db',
-          syncMode: 'async',
-          vacuumIntervalHours: 24,
-        },
+      await setupEvaluationTest({
+        conditionId: 'cond-eval-error',
+        modelIntercept: MODEL_INTERCEPT_YES,
+        mockRepo,
       });
 
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config,
-        mockRepo
-      );
-
-      await service.start();
-      await (service as any).scanUpcomingMarkets();
-
-      // Trigger evaluation
-      const timestamp = TEST_WINDOW_START;
-      mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: TEST_BTC_PRICE, timestamp });
-
-      // Allow async operations to settle
-      await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
-      await vi.advanceTimersByTimeAsync(100);
+      await triggerEvaluationAndSettle();
 
       // Service should not crash
       expect(service.isRunning()).toBe(true);
     });
 
     it('should record evaluation for each state minute', async () => {
-      const mockRepo = createMockTradeRepository();
-      testModelIntercept = MODEL_INTERCEPT_SKIP; // Use SKIP to allow multiple evaluations (no trade to block)
-
-      // Setup market
-      const windowStartSec = Math.floor(TEST_WINDOW_START / 1000);
-      const slug = `btc-updown-15m-${windowStartSec}`;
-      const market = createTestMarket('cond-eval-multi', slug, TEST_END_TIME, { yes: 0.50, no: 0.50 });
-      mockMarketService.mockGetMarket.mockResolvedValue(market);
-
-      const config = createTestConfig({
-        stateMinutes: [0, 1, 2],
-        persistence: {
-          enabled: true,
-          dbPath: './test-data/trades.db',
-          syncMode: 'async',
-          vacuumIntervalHours: 24,
-        },
+      const { mockRepo } = await setupEvaluationTest({
+        conditionId: 'cond-eval-multi',
+        modelIntercept: MODEL_INTERCEPT_SKIP, // Use SKIP to allow multiple evaluations
+        configOverrides: { stateMinutes: [0, 1, 2] },
       });
-
-      service = new Crypto15MLStrategyService(
-        mockMarketService,
-        mockTradingService,
-        mockRealtimeService,
-        config,
-        mockRepo
-      );
-
-      await service.start();
-      await (service as any).scanUpcomingMarkets();
 
       // Feed prices at minute 0, 1, 2 (state minutes)
       const baseTime = TEST_WINDOW_START;
@@ -2531,7 +2381,7 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       mockRealtimeService.emitPrice({ symbol: 'BTC/USD', price: 100200, timestamp: baseTime + 120_000 });
       await vi.advanceTimersByTimeAsync(ASYNC_SETTLE_MS);
-      await vi.advanceTimersByTimeAsync(100);
+      await vi.advanceTimersByTimeAsync(EVALUATION_SETTLE_MS);
 
       // Should have 3 evaluations (one for each state minute)
       expect(mockRepo.recordEvaluation).toHaveBeenCalledTimes(3);
