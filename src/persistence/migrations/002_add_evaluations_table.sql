@@ -15,23 +15,23 @@ CREATE TABLE IF NOT EXISTS evaluations (
     -- === Identity ===
     condition_id TEXT NOT NULL,           -- Polymarket condition ID
     slug TEXT NOT NULL,                   -- Market slug
-    symbol TEXT NOT NULL,                 -- BTC, ETH, SOL, XRP
+    symbol TEXT NOT NULL CHECK (symbol IN ('BTC', 'ETH', 'SOL', 'XRP')),
 
     -- === Timing ===
     timestamp INTEGER NOT NULL,           -- Unix ms when evaluation occurred
-    state_minute INTEGER NOT NULL,        -- 0-14, minute within window
+    state_minute INTEGER NOT NULL CHECK (state_minute >= 0 AND state_minute <= 14),
 
     -- === Model Output ===
-    model_probability REAL NOT NULL,      -- Model probability (0-1)
+    model_probability REAL NOT NULL CHECK (model_probability >= 0 AND model_probability <= 1),
     linear_combination REAL NOT NULL,     -- Z-score before sigmoid
-    imputed_count INTEGER NOT NULL,       -- Number of imputed features
+    imputed_count INTEGER NOT NULL CHECK (imputed_count >= 0),
 
     -- === Market Context ===
-    market_price_yes REAL NOT NULL,       -- YES side price at evaluation
-    market_price_no REAL NOT NULL,        -- NO side price at evaluation
+    market_price_yes REAL NOT NULL CHECK (market_price_yes >= 0 AND market_price_yes <= 1),
+    market_price_no REAL NOT NULL CHECK (market_price_no >= 0 AND market_price_no <= 1),
 
     -- === Decision ===
-    decision TEXT NOT NULL,               -- 'SKIP', 'YES', 'NO'
+    decision TEXT NOT NULL CHECK (decision IN ('SKIP', 'YES', 'NO')),
     reason TEXT NOT NULL,                 -- Human-readable reason for decision
 
     -- === Features ===
@@ -60,6 +60,9 @@ CREATE INDEX IF NOT EXISTS idx_evaluations_symbol_timestamp ON evaluations(symbo
 
 -- Composite index for decision + timestamp (find all trades in range)
 CREATE INDEX IF NOT EXISTS idx_evaluations_decision_timestamp ON evaluations(decision, timestamp);
+
+-- Query evaluations by condition ID (market-specific analysis)
+CREATE INDEX IF NOT EXISTS idx_evaluations_condition_id ON evaluations(condition_id);
 
 -- ============================================================================
 -- Record Migration

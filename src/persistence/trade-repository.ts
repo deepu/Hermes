@@ -552,11 +552,7 @@ export class TradeRepository implements ITradeRepository {
           entryAskPrice: this.nullifyNaN(trade.entryAskPrice),
         });
 
-        // Safely convert bigint to number
-        const tradeId = Number(result.lastInsertRowid);
-        if (!Number.isSafeInteger(tradeId)) {
-          throw new Error(`Trade ID ${result.lastInsertRowid} exceeds safe integer range`);
-        }
+        const tradeId = this.toSafeId(result.lastInsertRowid, 'Trade');
 
         // Insert features (within same transaction)
         this.insertFeatures(tradeId, trade.features);
@@ -662,30 +658,9 @@ export class TradeRepository implements ITradeRepository {
 
     return this.executeWrite(() => {
       const stmt = this.getStatement('insertEvaluation');
-
-      const result = stmt.run({
-        conditionId: evaluation.conditionId,
-        slug: evaluation.slug,
-        symbol: evaluation.symbol,
-        timestamp: evaluation.timestamp,
-        stateMinute: evaluation.stateMinute,
-        modelProbability: evaluation.modelProbability,
-        linearCombination: evaluation.linearCombination,
-        imputedCount: evaluation.imputedCount,
-        marketPriceYes: evaluation.marketPriceYes,
-        marketPriceNo: evaluation.marketPriceNo,
-        decision: evaluation.decision,
-        reason: evaluation.reason,
-        featuresJson: evaluation.featuresJson,
-      });
-
-      // Safely convert bigint to number
-      const evaluationId = Number(result.lastInsertRowid);
-      if (!Number.isSafeInteger(evaluationId)) {
-        throw new Error(`Evaluation ID ${result.lastInsertRowid} exceeds safe integer range`);
-      }
-
-      return evaluationId;
+      const params = this.evaluationToParams(evaluation);
+      const result = stmt.run(params);
+      return this.toSafeId(result.lastInsertRowid, 'Evaluation');
     });
   }
 
@@ -704,37 +679,19 @@ export class TradeRepository implements ITradeRepository {
 
     return this.executeWrite(() => {
       const stmt = this.getStatement('insertEvaluation');
-      const ids: number[] = [];
 
-      // Run all inserts in a single transaction
-      const batchInsert = this.database.transaction(() => {
-        for (const evaluation of evaluations) {
-          const result = stmt.run({
-            conditionId: evaluation.conditionId,
-            slug: evaluation.slug,
-            symbol: evaluation.symbol,
-            timestamp: evaluation.timestamp,
-            stateMinute: evaluation.stateMinute,
-            modelProbability: evaluation.modelProbability,
-            linearCombination: evaluation.linearCombination,
-            imputedCount: evaluation.imputedCount,
-            marketPriceYes: evaluation.marketPriceYes,
-            marketPriceNo: evaluation.marketPriceNo,
-            decision: evaluation.decision,
-            reason: evaluation.reason,
-            featuresJson: evaluation.featuresJson,
-          });
-
-          const evaluationId = Number(result.lastInsertRowid);
-          if (!Number.isSafeInteger(evaluationId)) {
-            throw new Error(`Evaluation ID ${result.lastInsertRowid} exceeds safe integer range`);
-          }
-          ids.push(evaluationId);
+      // Transaction returns IDs directly for cleaner functional style
+      const batchInsert = this.database.transaction((evals: ReadonlyArray<EvaluationRecord>) => {
+        const insertedIds: number[] = [];
+        for (const evaluation of evals) {
+          const params = this.evaluationToParams(evaluation);
+          const result = stmt.run(params);
+          insertedIds.push(this.toSafeId(result.lastInsertRowid, 'Evaluation'));
         }
+        return insertedIds;
       });
 
-      batchInsert();
-      return ids;
+      return batchInsert(evaluations);
     });
   }
 
@@ -1037,6 +994,53 @@ export class TradeRepository implements ITradeRepository {
       return null;
     }
     return value;
+  }
+
+  /**
+   * Safely convert bigint lastInsertRowid to number, throwing if out of safe range.
+   */
+  private toSafeId(rowid: number | bigint, entityName: string): number {
+    const id = Number(rowid);
+    if (!Number.isSafeInteger(id)) {
+      throw new Error(`${entityName} ID ${rowid} exceeds safe integer range`);
+    }
+    return id;
+  }
+
+  /**
+   * Validate and convert an EvaluationRecord to prepared statement parameters.
+   * Performs input validation for JSON and decision field.
+   */
+  private evaluationToParams(evaluation: EvaluationRecord): Record<string, unknown> {
+    // Validate JSON is parseable
+    try {
+      JSON.parse(evaluation.featuresJson);
+    } catch {
+      throw new Error('Invalid JSON in featuresJson field');
+    }
+
+    // Validate decision against allowed values
+    if (!VALID_EVALUATION_DECISIONS.includes(evaluation.decision)) {
+      throw new Error(
+        `Invalid decision: ${evaluation.decision}. Expected one of: ${VALID_EVALUATION_DECISIONS.join(', ')}`
+      );
+    }
+
+    return {
+      conditionId: evaluation.conditionId,
+      slug: evaluation.slug,
+      symbol: evaluation.symbol,
+      timestamp: evaluation.timestamp,
+      stateMinute: evaluation.stateMinute,
+      modelProbability: evaluation.modelProbability,
+      linearCombination: evaluation.linearCombination,
+      imputedCount: evaluation.imputedCount,
+      marketPriceYes: evaluation.marketPriceYes,
+      marketPriceNo: evaluation.marketPriceNo,
+      decision: evaluation.decision,
+      reason: evaluation.reason,
+      featuresJson: evaluation.featuresJson,
+    };
   }
 
   /**

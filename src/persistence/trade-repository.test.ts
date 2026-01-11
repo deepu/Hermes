@@ -10,7 +10,7 @@ import { describe, it, expect, beforeEach, afterEach } from 'vitest';
 import { existsSync, unlinkSync, mkdirSync } from 'fs';
 import { dirname } from 'path';
 import { TradeRepository } from './trade-repository.js';
-import type { PersistenceConfig } from '../types/trade-record.types.js';
+import type { PersistenceConfig, EvaluationRecord } from '../types/trade-record.types.js';
 import type { CryptoAsset } from '../strategies/crypto15-feature-engine.js';
 import { createTestTrade, createTestOutcome, createTestFeatures, createTestEvaluation } from './test-fixtures.js';
 
@@ -871,22 +871,25 @@ describe('TradeRepository', () => {
     });
 
     it('should be atomic - all or nothing on error', async () => {
-      // This test verifies transaction behavior
-      const evaluations = [
-        createTestEvaluation({ symbol: 'BTC' as CryptoAsset }),
-        createTestEvaluation({ symbol: 'ETH' as CryptoAsset }),
+      // This test verifies transaction rollback on failure
+      const initialEvalId = await repository.recordEvaluation(createTestEvaluation());
+      expect(initialEvalId).toBeGreaterThan(0);
+
+      const evaluationsWithFailure = [
+        createTestEvaluation({ conditionId: 'atomic-test-1' }),
+        // This record is invalid because `slug` is NOT NULL in the database schema.
+        { ...createTestEvaluation({ conditionId: 'atomic-test-2' }), slug: null } as unknown as EvaluationRecord,
       ];
 
-      const ids = await repository.recordEvaluations(evaluations);
+      // This batch insert should fail and roll back the transaction.
+      await expect(repository.recordEvaluations(evaluationsWithFailure)).rejects.toThrow();
 
-      // Both should be inserted
-      const eval1 = await repository.getEvaluationById(ids[0]);
-      const eval2 = await repository.getEvaluationById(ids[1]);
+      // Insert another valid evaluation to check the auto-incrementing ID.
+      const finalEvalId = await repository.recordEvaluation(createTestEvaluation());
 
-      expect(eval1).not.toBeNull();
-      expect(eval2).not.toBeNull();
-      expect(eval1!.symbol).toBe('BTC');
-      expect(eval2!.symbol).toBe('ETH');
+      // If the transaction was atomic, the failed batch should not have consumed an ID.
+      // The new ID should be the next sequential one after the initial insert.
+      expect(finalEvalId).toBe(initialEvalId + 1);
     });
 
     it('should handle all crypto assets', async () => {

@@ -288,6 +288,14 @@ export interface ITradeRepositoryCore {
   // === Transaction Support ===
   /** Execute multiple operations within a single transaction */
   transaction<T>(fn: () => T): Promise<T>;
+
+  // === Evaluation Operations ===
+  /** Record a single market evaluation, returns the database ID */
+  recordEvaluation(evaluation: EvaluationRecord): Promise<number>;
+  /** Record multiple evaluations in a batch, returns array of database IDs */
+  recordEvaluations(evaluations: ReadonlyArray<EvaluationRecord>): Promise<number[]>;
+  /** Get evaluation by database ID */
+  getEvaluationById(id: number): Promise<EvaluationRecord | null>;
 }
 
 /**
