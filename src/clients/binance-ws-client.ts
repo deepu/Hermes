@@ -20,7 +20,7 @@
 
 import { EventEmitter } from 'events';
 import WebSocket from 'isomorphic-ws';
-import { CryptoPrice } from '../types/price.types.js';
+import type { CryptoPrice } from '../types/price.types.js';
 
 // ============================================================================
 // Types
@@ -40,8 +40,15 @@ export interface BinanceWsConfig {
   pingInterval?: number;
   /** Enable debug logging (default: false) */
   debug?: boolean;
-  /** Maximum reconnection attempts (default: Infinity) */
+  /**
+   * Maximum reconnection attempts (default: 100)
+   * Set to Infinity for unlimited reconnection attempts (use with caution)
+   */
   maxReconnectAttempts?: number;
+  /** Maximum messages per second before dropping (default: 500, 0 = unlimited) */
+  maxMessagesPerSecond?: number;
+  /** Maximum burst messages (default: 1000) */
+  maxBurstMessages?: number;
 }
 
 /**
@@ -61,7 +68,7 @@ interface BinanceAggTrade {
 /**
  * Connection states
  */
-enum ConnectionState {
+export enum ConnectionState {
   DISCONNECTED = 'DISCONNECTED',
   CONNECTING = 'CONNECTING',
   CONNECTED = 'CONNECTED',
@@ -80,6 +87,7 @@ enum ConnectionState {
  * - 'connected': Emitted when connection is established
  * - 'disconnected': Emitted when connection is lost
  * - 'error': Emitted on errors
+ * - 'rateLimitExceeded': Emitted when message rate limit is exceeded
  */
 export class BinanceWsClient extends EventEmitter {
   private ws: WebSocket | null = null;
@@ -89,6 +97,12 @@ export class BinanceWsClient extends EventEmitter {
   private pingTimer: NodeJS.Timeout | null = null;
   private lastPongTime: number = 0;
   private reconnectAttempts: number = 0;
+
+  // Rate limiting state (token bucket algorithm)
+  private rateLimit = {
+    tokens: 0,
+    lastRefill: 0,
+  };
 
   // Pre-computed values for performance
   private readonly wsUrl: string;
@@ -109,8 +123,14 @@ export class BinanceWsClient extends EventEmitter {
       reconnectDelay: config.reconnectDelay ?? 5000,
       pingInterval: config.pingInterval ?? 30000,
       debug: config.debug ?? false,
-      maxReconnectAttempts: config.maxReconnectAttempts ?? Infinity,
+      maxReconnectAttempts: config.maxReconnectAttempts ?? 100,
+      maxMessagesPerSecond: config.maxMessagesPerSecond ?? 500,
+      maxBurstMessages: config.maxBurstMessages ?? 1000,
     };
+
+    // Initialize rate limit tokens
+    this.rateLimit.tokens = this.config.maxBurstMessages;
+    this.rateLimit.lastRefill = Date.now();
 
     // Pre-compute WebSocket URL with validation
     this.wsUrl = this.buildWebSocketUrl();
@@ -164,7 +184,8 @@ export class BinanceWsClient extends EventEmitter {
       this.ws.on('pong', this.boundHandlePong);
     } catch (error) {
       this.log(`Connection error: ${error}`);
-      this.handleConnectionError(error as Error);
+      const errorObj = error instanceof Error ? error : new Error(String(error));
+      this.handleConnectionError(errorObj);
     }
 
     return this;
@@ -250,6 +271,27 @@ export class BinanceWsClient extends EventEmitter {
   }
 
   private handleMessage(data: WebSocket.Data): void {
+    // Rate limiting check (skip if disabled via maxMessagesPerSecond = 0)
+    if (this.config.maxMessagesPerSecond > 0) {
+      const now = Date.now();
+      const elapsed = (now - this.rateLimit.lastRefill) / 1000;
+
+      // Refill tokens based on elapsed time
+      this.rateLimit.tokens = Math.min(
+        this.config.maxBurstMessages,
+        this.rateLimit.tokens + elapsed * this.config.maxMessagesPerSecond
+      );
+      this.rateLimit.lastRefill = now;
+
+      // Check if we have tokens available
+      if (this.rateLimit.tokens < 1) {
+        this.log('Rate limit exceeded, dropping message');
+        this.emit('rateLimitExceeded');
+        return;
+      }
+      this.rateLimit.tokens -= 1;
+    }
+
     // Cache toString() to prevent multiple calls in hot path
     const messageStr = data.toString();
 
@@ -289,10 +331,13 @@ export class BinanceWsClient extends EventEmitter {
       }
 
       // Validate timestamp is reasonable (within 1 minute of current time)
+      // Reject messages with suspicious timestamps to prevent replay attacks
       const now = Date.now();
-      if (Math.abs(trade.T - now) > 60000) {
-        this.log(`Suspicious timestamp: ${trade.T} (current: ${now})`);
-        // Don't return - just log warning, as clock drift can happen
+      const timeDiff = Math.abs(trade.T - now);
+      if (timeDiff > 60000) {
+        this.log(`Rejecting message with suspicious timestamp: ${trade.T} (diff: ${timeDiff}ms)`);
+        this.emit('error', new Error('Timestamp validation failed - possible replay attack'));
+        return;
       }
 
       // Use pre-computed symbol map for O(1) lookup instead of toLowerCase()

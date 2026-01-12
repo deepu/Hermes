@@ -21,8 +21,8 @@ import {
   ConnectionStatus,
 } from '@polymarket/real-time-data-client';
 import type { PriceUpdate, BookUpdate, Orderbook, OrderbookLevel } from '../core/types.js';
+import type { CryptoPrice } from '../types/price.types.js';
 import { BinanceWsClient } from '../clients/binance-ws-client.js';
-import { CryptoPrice } from '../types/price.types.js';
 
 // ============================================================================
 // Types

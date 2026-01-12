@@ -954,13 +954,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       const binanceSymbols = this.config.symbols.map(s => s.toLowerCase());
 
       // Pre-populate symbol-to-asset cache for O(1) hot path lookup
-      this.symbolToAssetCache.clear();
-      for (const symbol of binanceSymbols) {
-        const asset = this.parseAssetFromPriceSymbol(symbol);
-        if (asset) {
-          this.symbolToAssetCache.set(symbol, asset);
-        }
-      }
+      this.populateSymbolCache(binanceSymbols);
 
       this.priceSubscription = this.realtimeService.subscribeBinancePrices(
         binanceSymbols,
@@ -982,13 +976,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       });
 
       // Pre-populate symbol-to-asset cache for O(1) hot path lookup
-      this.symbolToAssetCache.clear();
-      for (const symbol of chainlinkSymbols) {
-        const asset = this.parseAssetFromPriceSymbol(symbol);
-        if (asset) {
-          this.symbolToAssetCache.set(symbol, asset);
-        }
-      }
+      this.populateSymbolCache(chainlinkSymbols);
 
       this.priceSubscription = this.realtimeService.subscribeCryptoChainlinkPrices(
         chainlinkSymbols,
@@ -1013,16 +1001,16 @@ export class Crypto15MLStrategyService extends EventEmitter {
    */
   private onPriceUpdate(priceUpdate: CryptoPrice): void {
     // Use cached symbol-to-asset mapping for O(1) lookup (hot path optimization)
-    const asset = this.symbolToAssetCache.get(priceUpdate.symbol);
+    let asset = this.symbolToAssetCache.get(priceUpdate.symbol);
     if (!asset) {
       // Fallback to parsing if not in cache (should be rare)
-      const parsedAsset = this.parseAssetFromPriceSymbol(priceUpdate.symbol);
-      if (!parsedAsset) {
+      asset = this.parseAssetFromPriceSymbol(priceUpdate.symbol);
+      if (!asset) {
         return; // Unknown or invalid asset
       }
       // Cache for future lookups
-      this.symbolToAssetCache.set(priceUpdate.symbol, parsedAsset);
-      return this.onPriceUpdate({ ...priceUpdate, symbol: priceUpdate.symbol });
+      this.symbolToAssetCache.set(priceUpdate.symbol, asset);
+      // Continue with the parsed asset instead of recursing
     }
 
     const symbol = ASSET_TO_SYMBOL[asset];
@@ -1165,6 +1153,20 @@ export class Crypto15MLStrategyService extends EventEmitter {
     } catch {
       // Non-critical failure - use cached prices
       return null;
+    }
+  }
+
+  /**
+   * Populate symbol-to-asset cache for O(1) lookup in hot path
+   * @param symbols - Array of price symbols in any supported format
+   */
+  private populateSymbolCache(symbols: string[]): void {
+    this.symbolToAssetCache.clear();
+    for (const symbol of symbols) {
+      const asset = this.parseAssetFromPriceSymbol(symbol);
+      if (asset) {
+        this.symbolToAssetCache.set(symbol, asset);
+      }
     }
   }
 
