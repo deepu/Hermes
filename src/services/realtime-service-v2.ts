@@ -698,6 +698,60 @@ export class RealtimeServiceV2 extends EventEmitter {
     return subscription;
   }
 
+  /**
+   * Subscribe to Binance crypto prices via direct WebSocket connection
+   * @param symbols - Array of symbols in lowercase (e.g., ['btcusdt', 'ethusdt'])
+   * @param handlers - Event handlers
+   */
+  subscribeBinancePrices(symbols: string[], handlers: CryptoPriceHandlers = {}): Subscription {
+    const subId = `binance_${++this.subscriptionIdCounter}`;
+
+    // Import BinanceWsClient dynamically to avoid circular dependencies
+    const BinanceWsClientModule = require('../clients/binance-ws-client.js');
+    const { BinanceWsClient } = BinanceWsClientModule;
+
+    // Create Binance WebSocket client
+    const binanceClient = new BinanceWsClient({
+      symbols,
+      autoReconnect: this.config.autoReconnect ?? true,
+      debug: this.config.debug ?? false,
+    });
+
+    // Set up event handlers
+    binanceClient.on('price', (price: CryptoPrice) => {
+      handlers.onPrice?.(price);
+    });
+
+    binanceClient.on('error', (error: Error) => {
+      handlers.onError?.(error);
+      this.log(`Binance WebSocket error: ${error.message}`);
+    });
+
+    binanceClient.on('connected', () => {
+      this.log('Binance WebSocket connected');
+    });
+
+    binanceClient.on('disconnected', () => {
+      this.log('Binance WebSocket disconnected');
+    });
+
+    // Connect to Binance
+    binanceClient.connect();
+
+    const subscription: Subscription = {
+      id: subId,
+      topic: 'binance_prices',
+      type: 'aggTrade',
+      unsubscribe: () => {
+        binanceClient.disconnect();
+        this.subscriptions.delete(subId);
+      },
+    };
+
+    this.subscriptions.set(subId, subscription);
+    return subscription;
+  }
+
   // ============================================================================
   // Equity Price Subscriptions
   // ============================================================================

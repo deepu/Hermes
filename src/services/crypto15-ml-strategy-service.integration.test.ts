@@ -198,6 +198,7 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
   mockIsConnected: Mock;
   mockConnect: Mock;
   mockSubscribeCryptoChainlinkPrices: Mock;
+  mockSubscribeBinancePrices: Mock;
   mockSubscribeMarketEvents: Mock;
   emitPrice: (price: CryptoPrice) => void;
   emitMarketEvent: (event: MarketEvent) => void;
@@ -219,6 +220,16 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
       unsubscribe: vi.fn(),
     };
   });
+  const mockSubscribeBinancePrices = vi.fn((symbols: string[], handlers: CryptoPriceHandlers): Subscription => {
+    priceHandler = handlers;
+    subscriptionCounter++;
+    return {
+      id: `binance_${subscriptionCounter}`,
+      topic: 'binance_prices',
+      type: 'aggTrade',
+      unsubscribe: vi.fn(),
+    };
+  });
   const mockSubscribeMarketEvents = vi.fn((handlers: { onMarketEvent?: (event: MarketEvent) => void }): Subscription => {
     marketEventHandler = handlers.onMarketEvent || null;
     subscriptionCounter++;
@@ -234,10 +245,12 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
     isConnected: mockIsConnected,
     connect: mockConnect,
     subscribeCryptoChainlinkPrices: mockSubscribeCryptoChainlinkPrices,
+    subscribeBinancePrices: mockSubscribeBinancePrices,
     subscribeMarketEvents: mockSubscribeMarketEvents,
     mockIsConnected,
     mockConnect,
     mockSubscribeCryptoChainlinkPrices,
+    mockSubscribeBinancePrices,
     mockSubscribeMarketEvents,
     get priceHandler() {
       return priceHandler;
@@ -258,6 +271,7 @@ function createMockRealtimeService(): RealtimeServiceV2 & {
     mockIsConnected: Mock;
     mockConnect: Mock;
     mockSubscribeCryptoChainlinkPrices: Mock;
+    mockSubscribeBinancePrices: Mock;
     mockSubscribeMarketEvents: Mock;
     emitPrice: (price: CryptoPrice) => void;
     emitMarketEvent: (event: MarketEvent) => void;
@@ -467,7 +481,8 @@ describe('Crypto15MLStrategyService Integration', () => {
       await service.start();
 
       expect(service.isRunning()).toBe(true);
-      expect(mockRealtimeService.mockSubscribeCryptoChainlinkPrices).toHaveBeenCalled();
+      // Default price source is Binance
+      expect(mockRealtimeService.mockSubscribeBinancePrices).toHaveBeenCalled();
     });
 
     it('should not start when disabled', async () => {
@@ -535,8 +550,8 @@ describe('Crypto15MLStrategyService Integration', () => {
       await service.start(); // Second call should be no-op
 
       expect(service.isRunning()).toBe(true);
-      // Should only subscribe once
-      expect(mockRealtimeService.mockSubscribeCryptoChainlinkPrices).toHaveBeenCalledTimes(1);
+      // Should only subscribe once (default price source is Binance)
+      expect(mockRealtimeService.mockSubscribeBinancePrices).toHaveBeenCalledTimes(1);
     });
 
     it('should be idempotent for stop calls when not running', () => {
@@ -697,8 +712,9 @@ describe('Crypto15MLStrategyService Integration', () => {
 
       await service.start();
 
-      expect(mockRealtimeService.mockSubscribeCryptoChainlinkPrices).toHaveBeenCalledWith(
-        expect.arrayContaining(['BTC/USD', 'ETH/USD', 'SOL/USD', 'XRP/USD']),
+      // Default price source is Binance, uses lowercase symbols
+      expect(mockRealtimeService.mockSubscribeBinancePrices).toHaveBeenCalledWith(
+        expect.arrayContaining(['btcusdt', 'ethusdt', 'solusdt', 'xrpusdt']),
         expect.any(Object)
       );
     });

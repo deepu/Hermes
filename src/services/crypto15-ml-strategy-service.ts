@@ -78,6 +78,8 @@ export interface Crypto15MLConfig {
   symbols: string[];
   /** Threshold in basis points per symbol for up/down detection */
   thresholdBps: Record<string, number>;
+  /** Price data source: 'binance' | 'polymarket-chainlink' (default: 'binance') */
+  priceSource?: 'binance' | 'polymarket-chainlink';
   /** Enable debug logging */
   debug?: boolean;
   /** Dry run mode - generate signals but don't execute trades */
@@ -941,24 +943,44 @@ export class Crypto15MLStrategyService extends EventEmitter {
       this.realtimeService.connect();
     }
 
-    // Subscribe to Chainlink prices (used by Polymarket for crypto markets)
-    // The symbols use format like "BTC/USD", "ETH/USD"
-    const chainlinkSymbols = this.config.symbols.map(s => {
-      const asset = SYMBOL_TO_ASSET[s];
-      return `${asset}/USD`;
-    });
+    const priceSource = this.config.priceSource ?? 'binance';
 
-    this.priceSubscription = this.realtimeService.subscribeCryptoChainlinkPrices(
-      chainlinkSymbols,
-      {
-        onPrice: (price: CryptoPrice) => this.onPriceUpdate(price),
-        onError: (error: Error) => this.handleError(error),
-      }
-    );
+    if (priceSource === 'binance') {
+      // Subscribe to Binance prices (direct WebSocket, high frequency)
+      // The symbols use format like "btcusdt", "ethusdt"
+      const binanceSymbols = this.config.symbols.map(s => s.toLowerCase());
 
-    this.logger.info(LogEvents.PRICE_SUBSCRIPTION_ACTIVE, {
-      message: `Subscribed to crypto prices: ${chainlinkSymbols.join(', ')}`,
-    });
+      this.priceSubscription = this.realtimeService.subscribeBinancePrices(
+        binanceSymbols,
+        {
+          onPrice: (price: CryptoPrice) => this.onPriceUpdate(price),
+          onError: (error: Error) => this.handleError(error),
+        }
+      );
+
+      this.logger.info(LogEvents.PRICE_SUBSCRIPTION_ACTIVE, {
+        message: `Subscribed to Binance crypto prices: ${binanceSymbols.join(', ')}`,
+      });
+    } else {
+      // Subscribe to Chainlink prices (used by Polymarket for crypto markets)
+      // The symbols use format like "BTC/USD", "ETH/USD"
+      const chainlinkSymbols = this.config.symbols.map(s => {
+        const asset = SYMBOL_TO_ASSET[s];
+        return `${asset}/USD`;
+      });
+
+      this.priceSubscription = this.realtimeService.subscribeCryptoChainlinkPrices(
+        chainlinkSymbols,
+        {
+          onPrice: (price: CryptoPrice) => this.onPriceUpdate(price),
+          onError: (error: Error) => this.handleError(error),
+        }
+      );
+
+      this.logger.info(LogEvents.PRICE_SUBSCRIPTION_ACTIVE, {
+        message: `Subscribed to Polymarket Chainlink crypto prices: ${chainlinkSymbols.join(', ')}`,
+      });
+    }
   }
 
   /**
@@ -1119,16 +1141,42 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
-   * Parse and validate CryptoAsset from price symbol (e.g., "BTC/USD" -> "BTC")
+   * Parse and validate CryptoAsset from price symbol
+   *
+   * Supports multiple formats:
+   * - Chainlink: "BTC/USD" -> "BTC"
+   * - Binance: "btcusdt" -> "BTC"
    */
   private parseAssetFromPriceSymbol(symbol: string): CryptoAsset | null {
+    // Handle Chainlink format: "BTC/USD"
     const slashIndex = symbol.indexOf('/');
-    const prefix = slashIndex > 0 ? symbol.substring(0, slashIndex) : symbol;
-
-    // Use type guard for validation
-    if (isCryptoAsset(prefix)) {
-      return prefix;
+    if (slashIndex > 0) {
+      const prefix = symbol.substring(0, slashIndex);
+      if (isCryptoAsset(prefix)) {
+        return prefix;
+      }
+      return null;
     }
+
+    // Handle Binance format: "btcusdt", "ethusdt", etc.
+    const symbolUpper = symbol.toUpperCase();
+
+    // Try to extract asset by removing common quote currencies
+    const quoteCurrencies = ['USDT', 'USDC', 'USD', 'BUSD'];
+    for (const quote of quoteCurrencies) {
+      if (symbolUpper.endsWith(quote)) {
+        const asset = symbolUpper.substring(0, symbolUpper.length - quote.length);
+        if (isCryptoAsset(asset)) {
+          return asset;
+        }
+      }
+    }
+
+    // Try direct match (already uppercase)
+    if (isCryptoAsset(symbolUpper)) {
+      return symbolUpper;
+    }
+
     return null;
   }
 
