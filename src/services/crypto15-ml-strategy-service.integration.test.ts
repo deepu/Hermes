@@ -29,7 +29,8 @@ import {
 } from './crypto15-ml-strategy-service.js';
 import type { MarketService } from './market-service.js';
 import type { TradingService, OrderResult } from './trading-service.js';
-import type { RealtimeServiceV2, CryptoPrice, Subscription, CryptoPriceHandlers, MarketEvent } from './realtime-service-v2.js';
+import type { RealtimeServiceV2, Subscription, CryptoPriceHandlers, MarketEvent } from './realtime-service-v2.js';
+import type { CryptoPrice } from '../types/price.types.js';
 import type { UnifiedMarket, MarketToken } from '../core/types.js';
 import type { GammaMarket } from '../clients/gamma-api.js';
 import { Crypto15LRModel, type ModelConfig } from '../strategies/crypto15-lr-model.js';

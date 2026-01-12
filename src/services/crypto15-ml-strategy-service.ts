@@ -385,6 +385,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
   /** Secondary index: symbol -> Set<conditionId> for O(1) price routing */
   private trackersBySymbol: Map<string, Set<string>> = new Map();
 
+  /** Performance cache: price symbol -> CryptoAsset for O(1) hot path lookup */
+  private symbolToAssetCache: Map<string, CryptoAsset> = new Map();
+
   private priceSubscription: Subscription | null = null;
   private marketEventSubscription: Subscription | null = null;
   private predictiveScanInterval: ReturnType<typeof setInterval> | null = null;
@@ -950,6 +953,15 @@ export class Crypto15MLStrategyService extends EventEmitter {
       // The symbols use format like "btcusdt", "ethusdt"
       const binanceSymbols = this.config.symbols.map(s => s.toLowerCase());
 
+      // Pre-populate symbol-to-asset cache for O(1) hot path lookup
+      this.symbolToAssetCache.clear();
+      for (const symbol of binanceSymbols) {
+        const asset = this.parseAssetFromPriceSymbol(symbol);
+        if (asset) {
+          this.symbolToAssetCache.set(symbol, asset);
+        }
+      }
+
       this.priceSubscription = this.realtimeService.subscribeBinancePrices(
         binanceSymbols,
         {
@@ -968,6 +980,15 @@ export class Crypto15MLStrategyService extends EventEmitter {
         const asset = SYMBOL_TO_ASSET[s];
         return `${asset}/USD`;
       });
+
+      // Pre-populate symbol-to-asset cache for O(1) hot path lookup
+      this.symbolToAssetCache.clear();
+      for (const symbol of chainlinkSymbols) {
+        const asset = this.parseAssetFromPriceSymbol(symbol);
+        if (asset) {
+          this.symbolToAssetCache.set(symbol, asset);
+        }
+      }
 
       this.priceSubscription = this.realtimeService.subscribeCryptoChainlinkPrices(
         chainlinkSymbols,
@@ -991,10 +1012,17 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Validates price data to prevent manipulation attacks.
    */
   private onPriceUpdate(priceUpdate: CryptoPrice): void {
-    // Convert symbol format (e.g., "BTC/USD" -> "BTC") with validation
-    const asset = this.parseAssetFromPriceSymbol(priceUpdate.symbol);
+    // Use cached symbol-to-asset mapping for O(1) lookup (hot path optimization)
+    const asset = this.symbolToAssetCache.get(priceUpdate.symbol);
     if (!asset) {
-      return; // Unknown or invalid asset
+      // Fallback to parsing if not in cache (should be rare)
+      const parsedAsset = this.parseAssetFromPriceSymbol(priceUpdate.symbol);
+      if (!parsedAsset) {
+        return; // Unknown or invalid asset
+      }
+      // Cache for future lookups
+      this.symbolToAssetCache.set(priceUpdate.symbol, parsedAsset);
+      return this.onPriceUpdate({ ...priceUpdate, symbol: priceUpdate.symbol });
     }
 
     const symbol = ASSET_TO_SYMBOL[asset];
@@ -1146,12 +1174,15 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Supports multiple formats:
    * - Chainlink: "BTC/USD" -> "BTC"
    * - Binance: "btcusdt" -> "BTC"
+   *
+   * Note: This method is called during initialization to populate the cache.
+   * During runtime, onPriceUpdate() uses the cached mapping for O(1) lookup.
    */
   private parseAssetFromPriceSymbol(symbol: string): CryptoAsset | null {
-    // Handle Chainlink format: "BTC/USD"
+    // Handle Chainlink format: "BTC/USD" or "btc/usd"
     const slashIndex = symbol.indexOf('/');
     if (slashIndex > 0) {
-      const prefix = symbol.substring(0, slashIndex);
+      const prefix = symbol.substring(0, slashIndex).toUpperCase();
       if (isCryptoAsset(prefix)) {
         return prefix;
       }
@@ -1161,14 +1192,11 @@ export class Crypto15MLStrategyService extends EventEmitter {
     // Handle Binance format: "btcusdt", "ethusdt", etc.
     const symbolUpper = symbol.toUpperCase();
 
-    // Try to extract asset by removing common quote currencies
-    const quoteCurrencies = ['USDT', 'USDC', 'USD', 'BUSD'];
-    for (const quote of quoteCurrencies) {
-      if (symbolUpper.endsWith(quote)) {
-        const asset = symbolUpper.substring(0, symbolUpper.length - quote.length);
-        if (isCryptoAsset(asset)) {
-          return asset;
-        }
+    // Try to extract asset by removing USDT (most common)
+    if (symbolUpper.endsWith('USDT')) {
+      const asset = symbolUpper.substring(0, symbolUpper.length - 4);
+      if (isCryptoAsset(asset)) {
+        return asset;
       }
     }
 

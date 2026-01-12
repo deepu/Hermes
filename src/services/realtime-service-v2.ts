@@ -21,6 +21,8 @@ import {
   ConnectionStatus,
 } from '@polymarket/real-time-data-client';
 import type { PriceUpdate, BookUpdate, Orderbook, OrderbookLevel } from '../core/types.js';
+import { BinanceWsClient } from '../clients/binance-ws-client.js';
+import { CryptoPrice } from '../types/price.types.js';
 
 // ============================================================================
 // Types
@@ -156,11 +158,8 @@ export interface ActivityTrade {
 }
 
 // External price types
-export interface CryptoPrice {
-  symbol: string;
-  price: number;
-  timestamp: number;
-}
+// Re-export CryptoPrice from shared types for backward compatibility
+export type { CryptoPrice };
 
 export interface EquityPrice {
   symbol: string;
@@ -706,10 +705,6 @@ export class RealtimeServiceV2 extends EventEmitter {
   subscribeBinancePrices(symbols: string[], handlers: CryptoPriceHandlers = {}): Subscription {
     const subId = `binance_${++this.subscriptionIdCounter}`;
 
-    // Import BinanceWsClient dynamically to avoid circular dependencies
-    const BinanceWsClientModule = require('../clients/binance-ws-client.js');
-    const { BinanceWsClient } = BinanceWsClientModule;
-
     // Create Binance WebSocket client
     const binanceClient = new BinanceWsClient({
       symbols,
@@ -743,6 +738,8 @@ export class RealtimeServiceV2 extends EventEmitter {
       topic: 'binance_prices',
       type: 'aggTrade',
       unsubscribe: () => {
+        // Remove all event listeners to prevent memory leaks
+        binanceClient.removeAllListeners();
         binanceClient.disconnect();
         this.subscriptions.delete(subId);
       },

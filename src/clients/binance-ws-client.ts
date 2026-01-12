@@ -20,6 +20,7 @@
 
 import { EventEmitter } from 'events';
 import WebSocket from 'isomorphic-ws';
+import { CryptoPrice } from '../types/price.types.js';
 
 // ============================================================================
 // Types
@@ -39,18 +40,8 @@ export interface BinanceWsConfig {
   pingInterval?: number;
   /** Enable debug logging (default: false) */
   debug?: boolean;
-}
-
-/**
- * Price update from Binance
- */
-export interface BinancePrice {
-  /** Symbol in lowercase (e.g., 'btcusdt') */
-  symbol: string;
-  /** Current price */
-  price: number;
-  /** Timestamp in milliseconds */
-  timestamp: number;
+  /** Maximum reconnection attempts (default: Infinity) */
+  maxReconnectAttempts?: number;
 }
 
 /**
@@ -62,14 +53,8 @@ interface BinanceAggTrade {
     e: string;      // Event type: "aggTrade"
     E: number;      // Event time (ms)
     s: string;      // Symbol (BTCUSDT)
-    a: number;      // Aggregate trade ID
     p: string;      // Price (string)
-    q: string;      // Quantity
-    f: number;      // First trade ID
-    l: number;      // Last trade ID
     T: number;      // Trade time (ms)
-    m: boolean;     // Is buyer market maker
-    M: boolean;     // Ignore
   };
 }
 
@@ -91,7 +76,7 @@ enum ConnectionState {
  * Binance WebSocket client for real-time price data
  *
  * Events:
- * - 'price': Emitted for each price update (BinancePrice)
+ * - 'price': Emitted for each price update (CryptoPrice)
  * - 'connected': Emitted when connection is established
  * - 'disconnected': Emitted when connection is lost
  * - 'error': Emitted on errors
@@ -103,6 +88,18 @@ export class BinanceWsClient extends EventEmitter {
   private reconnectTimer: NodeJS.Timeout | null = null;
   private pingTimer: NodeJS.Timeout | null = null;
   private lastPongTime: number = 0;
+  private reconnectAttempts: number = 0;
+
+  // Pre-computed values for performance
+  private readonly wsUrl: string;
+  private readonly symbolMap: Map<string, string>; // BTCUSDT -> btcusdt
+
+  // Bound event handlers (reused to prevent memory leaks)
+  private readonly boundHandleOpen: () => void;
+  private readonly boundHandleMessage: (data: WebSocket.Data) => void;
+  private readonly boundHandleError: (error: Error) => void;
+  private readonly boundHandleClose: (code: number, reason: string) => void;
+  private readonly boundHandlePong: () => void;
 
   constructor(config: BinanceWsConfig) {
     super();
@@ -112,7 +109,26 @@ export class BinanceWsClient extends EventEmitter {
       reconnectDelay: config.reconnectDelay ?? 5000,
       pingInterval: config.pingInterval ?? 30000,
       debug: config.debug ?? false,
+      maxReconnectAttempts: config.maxReconnectAttempts ?? Infinity,
     };
+
+    // Pre-compute WebSocket URL with validation
+    this.wsUrl = this.buildWebSocketUrl();
+
+    // Pre-compute symbol mappings for O(1) lookup in hot path
+    this.symbolMap = new Map();
+    for (const symbol of this.config.symbols) {
+      const upper = symbol.toUpperCase();
+      const lower = symbol.toLowerCase();
+      this.symbolMap.set(upper, lower);
+    }
+
+    // Bind event handlers once to prevent memory leaks during reconnection
+    this.boundHandleOpen = this.handleOpen.bind(this);
+    this.boundHandleMessage = this.handleMessage.bind(this);
+    this.boundHandleError = this.handleError.bind(this);
+    this.boundHandleClose = this.handleClose.bind(this);
+    this.boundHandlePong = this.handlePong.bind(this);
   }
 
   // ============================================================================
@@ -123,6 +139,12 @@ export class BinanceWsClient extends EventEmitter {
    * Connect to Binance WebSocket
    */
   connect(): this {
+    // Guard against empty symbol array
+    if (this.config.symbols.length === 0) {
+      this.log('No symbols to subscribe to. Skipping connection.');
+      return this;
+    }
+
     if (this.state !== ConnectionState.DISCONNECTED) {
       this.log('Already connected or connecting');
       return this;
@@ -132,14 +154,14 @@ export class BinanceWsClient extends EventEmitter {
     this.log('Connecting to Binance WebSocket...');
 
     try {
-      const url = this.buildWebSocketUrl();
-      this.ws = new WebSocket(url);
+      this.ws = new WebSocket(this.wsUrl);
 
-      this.ws.on('open', this.handleOpen.bind(this));
-      this.ws.on('message', this.handleMessage.bind(this));
-      this.ws.on('error', this.handleError.bind(this));
-      this.ws.on('close', this.handleClose.bind(this));
-      this.ws.on('pong', this.handlePong.bind(this));
+      // Use pre-bound handlers to prevent memory leaks
+      this.ws.on('open', this.boundHandleOpen);
+      this.ws.on('message', this.boundHandleMessage);
+      this.ws.on('error', this.boundHandleError);
+      this.ws.on('close', this.boundHandleClose);
+      this.ws.on('pong', this.boundHandlePong);
     } catch (error) {
       this.log(`Connection error: ${error}`);
       this.handleConnectionError(error as Error);
@@ -153,7 +175,9 @@ export class BinanceWsClient extends EventEmitter {
    */
   disconnect(): void {
     this.log('Disconnecting...');
+    const wasConnected = this.state !== ConnectionState.DISCONNECTED;
     this.state = ConnectionState.DISCONNECTED;
+    this.reconnectAttempts = 0;
     this.clearTimers();
 
     if (this.ws) {
@@ -162,7 +186,10 @@ export class BinanceWsClient extends EventEmitter {
       this.ws = null;
     }
 
-    this.emit('disconnected');
+    // Only emit disconnected event if we were actually connected
+    if (wasConnected) {
+      this.emit('disconnected');
+    }
   }
 
   /**
@@ -179,20 +206,41 @@ export class BinanceWsClient extends EventEmitter {
     return this.state;
   }
 
+  /**
+   * Get number of reconnection attempts
+   */
+  getReconnectAttempts(): number {
+    return this.reconnectAttempts;
+  }
+
   // ============================================================================
   // Private Methods - Connection Management
   // ============================================================================
 
   private buildWebSocketUrl(): string {
-    // Build combined stream URL
-    // Format: wss://stream.binance.com:9443/stream?streams=btcusdt@aggTrade/ethusdt@aggTrade/...
-    const streams = this.config.symbols.map(symbol => `${symbol.toLowerCase()}@aggTrade`).join('/');
-    return `wss://stream.binance.com:9443/stream?streams=${streams}`;
+    // Validate and sanitize symbols to prevent URL injection
+    const streams = this.config.symbols.map(symbol => {
+      const sanitized = symbol.toLowerCase().replace(/[^a-z0-9]/g, '');
+      if (sanitized !== symbol.toLowerCase()) {
+        throw new Error(`Invalid symbol format: ${symbol}. Only alphanumeric characters allowed.`);
+      }
+      return `${sanitized}@aggTrade`;
+    }).join('/');
+
+    const url = `wss://stream.binance.com:9443/stream?streams=${streams}`;
+
+    // Validate URL length
+    if (url.length > 2048) {
+      throw new Error('Too many symbols: URL length exceeds 2048 characters');
+    }
+
+    return url;
   }
 
   private handleOpen(): void {
     this.state = ConnectionState.CONNECTED;
     this.lastPongTime = Date.now();
+    this.reconnectAttempts = 0;
     this.log('Connected to Binance WebSocket');
 
     // Start heartbeat monitoring
@@ -202,33 +250,65 @@ export class BinanceWsClient extends EventEmitter {
   }
 
   private handleMessage(data: WebSocket.Data): void {
-    try {
-      const message = JSON.parse(data.toString()) as BinanceAggTrade;
+    // Cache toString() to prevent multiple calls in hot path
+    const messageStr = data.toString();
 
-      // Validate message structure
-      if (!message.stream || !message.data) {
-        this.log(`Invalid message structure: ${data.toString()}`);
+    try {
+      const message = JSON.parse(messageStr) as BinanceAggTrade;
+
+      // Strict validation of message structure
+      if (!message.stream || typeof message.stream !== 'string') {
+        this.log(`Invalid message: missing or invalid stream field`);
         return;
       }
 
-      // Parse aggregate trade data
+      if (!message.data || typeof message.data !== 'object') {
+        this.log(`Invalid message: missing or invalid data field`);
+        return;
+      }
+
       const { data: trade } = message;
+
+      // Validate event type
       if (trade.e !== 'aggTrade') {
         this.log(`Unknown event type: ${trade.e}`);
         return;
       }
 
-      // Convert to BinancePrice and emit
-      const price: BinancePrice = {
-        symbol: trade.s.toLowerCase(),
-        price: parseFloat(trade.p),
+      // Validate required fields
+      if (typeof trade.s !== 'string' || typeof trade.p !== 'string' || typeof trade.T !== 'number') {
+        this.log(`Invalid trade data: missing or invalid required fields`);
+        return;
+      }
+
+      // Parse and validate price
+      const price = parseFloat(trade.p);
+      if (!Number.isFinite(price) || price <= 0) {
+        this.log(`Invalid price value: ${trade.p}`);
+        return;
+      }
+
+      // Validate timestamp is reasonable (within 1 minute of current time)
+      const now = Date.now();
+      if (Math.abs(trade.T - now) > 60000) {
+        this.log(`Suspicious timestamp: ${trade.T} (current: ${now})`);
+        // Don't return - just log warning, as clock drift can happen
+      }
+
+      // Use pre-computed symbol map for O(1) lookup instead of toLowerCase()
+      const symbol = this.symbolMap.get(trade.s) || trade.s.toLowerCase();
+
+      const priceUpdate: CryptoPrice = {
+        symbol,
+        price,
         timestamp: trade.T,
       };
 
-      this.emit('price', price);
+      this.emit('price', priceUpdate);
     } catch (error) {
       this.log(`Failed to parse message: ${error}`);
-      this.emit('error', error);
+      // Don't emit raw error to prevent information leakage
+      this.emit('error', new Error('Message parsing error'));
     }
   }
 
@@ -248,9 +328,14 @@ export class BinanceWsClient extends EventEmitter {
       this.emit('disconnected');
     }
 
-    // Auto-reconnect if enabled
-    if (this.config.autoReconnect && this.state === ConnectionState.DISCONNECTED) {
+    // Auto-reconnect if enabled and under max attempts
+    if (this.config.autoReconnect &&
+        this.state === ConnectionState.DISCONNECTED &&
+        this.reconnectAttempts < this.config.maxReconnectAttempts) {
       this.scheduleReconnect();
+    } else if (this.reconnectAttempts >= this.config.maxReconnectAttempts) {
+      this.log(`Max reconnection attempts (${this.config.maxReconnectAttempts}) reached`);
+      this.emit('error', new Error('Max reconnection attempts reached'));
     }
   }
 
@@ -259,7 +344,7 @@ export class BinanceWsClient extends EventEmitter {
     this.state = ConnectionState.DISCONNECTED;
     this.emit('error', error);
 
-    if (this.config.autoReconnect) {
+    if (this.config.autoReconnect && this.reconnectAttempts < this.config.maxReconnectAttempts) {
       this.scheduleReconnect();
     }
   }
@@ -296,8 +381,9 @@ export class BinanceWsClient extends EventEmitter {
       return; // Already scheduled
     }
 
+    this.reconnectAttempts++;
     this.state = ConnectionState.RECONNECTING;
-    this.log(`Reconnecting in ${this.config.reconnectDelay}ms...`);
+    this.log(`Reconnecting in ${this.config.reconnectDelay}ms... (attempt ${this.reconnectAttempts}/${this.config.maxReconnectAttempts})`);
 
     this.reconnectTimer = setTimeout(() => {
       this.reconnectTimer = null;
@@ -307,7 +393,16 @@ export class BinanceWsClient extends EventEmitter {
 
   private reconnect(): void {
     this.log('Attempting to reconnect...');
-    this.disconnect();
+    this.clearTimers();
+
+    // Close existing connection without emitting disconnected event
+    if (this.ws) {
+      this.ws.removeAllListeners();
+      this.ws.close();
+      this.ws = null;
+    }
+
+    this.state = ConnectionState.DISCONNECTED;
     this.connect();
   }
 
