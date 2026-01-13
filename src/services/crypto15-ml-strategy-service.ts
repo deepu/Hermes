@@ -807,6 +807,9 @@ export class Crypto15MLStrategyService extends EventEmitter {
    */
   async scanActiveMarkets(): Promise<void> {
     try {
+      if (this.config.debug) {
+        console.log('[DEBUG] scanActiveMarkets: Starting scan...');
+      }
       const markets = await this.marketService.scanCryptoShortTermMarkets({
         minMinutesUntilEnd: 1,
         maxMinutesUntilEnd: 15,
@@ -815,15 +818,35 @@ export class Crypto15MLStrategyService extends EventEmitter {
         limit: 50,
       });
 
+      if (this.config.debug) {
+        console.log(`[DEBUG] scanActiveMarkets: Found ${markets.length} markets`);
+      }
+
       for (const market of markets) {
+        if (this.config.debug) {
+          console.log(`[DEBUG] scanActiveMarkets: Processing ${market.slug}, conditionId=${market.conditionId}`);
+        }
+
         // Skip if we already have this tracker
         if (this.trackers.has(market.conditionId)) {
+          if (this.config.debug) {
+            console.log(`[DEBUG] scanActiveMarkets: Already tracking ${market.slug}`);
+          }
           continue;
         }
 
         // Verify it's a 15m market by checking slug pattern
         if (this.is15mMarket(market.slug)) {
-          await this.addMarketTracker(market);
+          if (this.config.debug) {
+            console.log(`[DEBUG] scanActiveMarkets: Adding tracker for ${market.slug}`);
+          }
+          // WORKAROUND: Use slug-based lookup instead of conditionId due to Gamma API bug
+          // The API returns incorrect data when querying by condition_id parameter
+          await this.addMarketTrackerBySlug(market.slug);
+        } else {
+          if (this.config.debug) {
+            console.log(`[DEBUG] scanActiveMarkets: Skipping ${market.slug} (not a 15m market)`);
+          }
         }
       }
     } catch (error) {
@@ -832,20 +855,64 @@ export class Crypto15MLStrategyService extends EventEmitter {
   }
 
   /**
+   * Add a market tracker using slug-based lookup (WORKAROUND for Gamma API bug)
+   *
+   * Fetches complete market data via slug to avoid Gamma API condition_id bug.
+   * The Gamma API returns incorrect markets when querying by condition_id.
+   */
+  private async addMarketTrackerBySlug(slug: string): Promise<void> {
+    let unifiedMarket: UnifiedMarket;
+    try {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerBySlug: Fetching market data for ${slug}`);
+      }
+      // Use slug-based lookup which works correctly
+      unifiedMarket = await this.marketService.getMarket(slug);
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerBySlug: Successfully fetched market data for ${slug}`);
+      }
+    } catch (error) {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerBySlug: Failed to fetch market data for ${slug}:`, error);
+      }
+      return; // Could not fetch full market data - skip this market
+    }
+
+    if (this.config.debug) {
+      console.log(`[DEBUG] addMarketTrackerBySlug: Calling addMarketTrackerFromUnified for ${slug}`);
+    }
+    await this.addMarketTrackerFromUnified(unifiedMarket);
+  }
+
+  /**
    * Add a market tracker for a discovered market (from GammaMarket)
    *
    * Fetches complete market data via MarketService and delegates to addMarketTrackerFromUnified.
-   * Used by scanActiveMarkets which receives GammaMarket from the API.
+   * Used by scanUpcomingMarkets which generates slugs predictively.
+   *
+   * @deprecated Use addMarketTrackerBySlug instead to avoid Gamma API condition_id bug
    */
   private async addMarketTracker(market: GammaMarket): Promise<void> {
     // Fetch full market data with token IDs
     let unifiedMarket: UnifiedMarket;
     try {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTracker: Fetching market data for ${market.slug}`);
+      }
       unifiedMarket = await this.marketService.getMarket(market.conditionId);
-    } catch {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTracker: Successfully fetched market data for ${market.slug}`);
+      }
+    } catch (error) {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTracker: Failed to fetch market data for ${market.slug}:`, error);
+      }
       return; // Could not fetch full market data - skip this market
     }
 
+    if (this.config.debug) {
+      console.log(`[DEBUG] addMarketTracker: Calling addMarketTrackerFromUnified for ${market.slug}`);
+    }
     await this.addMarketTrackerFromUnified(unifiedMarket);
   }
 
@@ -857,34 +924,74 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Thread-safe: checks for duplicates before adding to prevent race conditions.
    */
   private async addMarketTrackerFromUnified(unifiedMarket: UnifiedMarket): Promise<void> {
+    if (this.config.debug) {
+      console.log(`[DEBUG] addMarketTrackerFromUnified: Processing ${unifiedMarket.slug}`);
+    }
+
     // Check for duplicate tracker (race condition prevention for parallel discovery)
     if (this.trackers.has(unifiedMarket.conditionId)) {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerFromUnified: Already tracking ${unifiedMarket.slug}`);
+      }
       return; // Already tracking this market
     }
 
     const asset = this.inferAssetFromSlug(unifiedMarket.slug);
     if (!asset) {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerFromUnified: Could not infer asset from slug ${unifiedMarket.slug}`);
+      }
       return; // Could not infer asset from slug
     }
 
     const symbol = ASSET_TO_SYMBOL[asset];
     if (!this.config.symbols.includes(symbol)) {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerFromUnified: Symbol ${symbol} not in configured symbols:`, this.config.symbols);
+      }
       return; // Symbol not in configured symbols
     }
 
     // Find tokens by outcome name using helper method
     if (!unifiedMarket.tokens || unifiedMarket.tokens.length < 2) {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerFromUnified: Market ${unifiedMarket.slug} does not have required tokens`);
+      }
       return; // Market does not have required tokens
     }
 
     const tokens = this.findTokensByOutcome(unifiedMarket.tokens);
     if (!tokens.yes || !tokens.no) {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerFromUnified: Could not get token IDs for ${unifiedMarket.slug}`);
+      }
       return; // Could not get token IDs for market
     }
 
-    // Validate endDate exists
-    const endTime = unifiedMarket.endDate?.getTime();
-    if (!endTime || endTime <= Date.now()) {
+    // Calculate endTime from slug for 15m markets (API returns incorrect parent event endDate)
+    // Slug format: {coin}-updown-15m-{startTimestamp}
+    // endTime = startTimestamp + 900 seconds (15 minutes)
+    let endTime: number;
+    const slugMatch = unifiedMarket.slug.match(/-15m-(\d+)$/);
+    if (slugMatch) {
+      const startTimestamp = parseInt(slugMatch[1], 10);
+      endTime = (startTimestamp + 900) * 1000; // Convert to milliseconds
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerFromUnified: Calculated endTime from slug ${unifiedMarket.slug}: startTs=${startTimestamp}, endTime=${endTime}, now=${Date.now()}`);
+      }
+    } else {
+      // Fallback to API endDate for non-15m markets
+      endTime = unifiedMarket.endDate?.getTime() || 0;
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerFromUnified: Using API endDate for ${unifiedMarket.slug}: ${endTime}`);
+      }
+    }
+
+    const now = Date.now();
+    if (!endTime || endTime <= now) {
+      if (this.config.debug) {
+        console.log(`[DEBUG] addMarketTrackerFromUnified: Market ${unifiedMarket.slug} has invalid or past endDate (endTime=${endTime}, now=${now})`);
+      }
       return; // Market has invalid or past endDate
     }
 
@@ -918,6 +1025,10 @@ export class Crypto15MLStrategyService extends EventEmitter {
       this.trackersBySymbol.set(symbol, symbolSet);
     }
     symbolSet.add(unifiedMarket.conditionId);
+
+    if (this.config.debug) {
+      console.log(`[DEBUG] addMarketTrackerFromUnified: All checks passed for ${unifiedMarket.slug}, creating tracker`);
+    }
 
     this.logger.info(LogEvents.MARKET_ADDED, {
       marketId: unifiedMarket.conditionId,
@@ -1180,7 +1291,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
    * Note: This method is called during initialization to populate the cache.
    * During runtime, onPriceUpdate() uses the cached mapping for O(1) lookup.
    */
-  private parseAssetFromPriceSymbol(symbol: string): CryptoAsset | null {
+  private parseAssetFromPriceSymbol(symbol: string): CryptoAsset | undefined {
     // Handle Chainlink format: "BTC/USD" or "btc/usd"
     const slashIndex = symbol.indexOf('/');
     if (slashIndex > 0) {
@@ -1188,7 +1299,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       if (isCryptoAsset(prefix)) {
         return prefix;
       }
-      return null;
+      return undefined;
     }
 
     // Handle Binance format: "btcusdt", "ethusdt", etc.
@@ -1207,7 +1318,7 @@ export class Crypto15MLStrategyService extends EventEmitter {
       return symbolUpper;
     }
 
-    return null;
+    return undefined;
   }
 
   // ============================================================================
